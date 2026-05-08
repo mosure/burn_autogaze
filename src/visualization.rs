@@ -1,5 +1,6 @@
 use crate::FixationPoint;
 use anyhow::{Result, ensure};
+use std::{fmt, str::FromStr};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AutoGazeVisualization {
@@ -9,6 +10,156 @@ pub struct AutoGazeVisualization {
     pub mask_rgba: Vec<u8>,
     pub blend_rgba: Vec<u8>,
     pub side_by_side_rgba: Vec<u8>,
+}
+
+impl AutoGazeVisualization {
+    pub fn output_rgba(&self) -> &[u8] {
+        &self.blend_rgba
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AutoGazeVisualizationMode {
+    #[default]
+    FullBlend,
+    Interframe,
+}
+
+impl AutoGazeVisualizationMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FullBlend => "full-blend",
+            Self::Interframe => "interframe",
+        }
+    }
+}
+
+impl fmt::Display for AutoGazeVisualizationMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for AutoGazeVisualizationMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "blend" | "full" | "full-blend" | "alphablend" | "alpha-blend" | "alpha" => {
+                Ok(Self::FullBlend)
+            }
+            "interframe" | "inter-frame" | "video" | "video-encoding" | "delta" => {
+                Ok(Self::Interframe)
+            }
+            other => Err(format!("unsupported AutoGaze visualization mode `{other}`")),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AutoGazeVisualizationState {
+    mode: AutoGazeVisualizationMode,
+    keyframe_duration: usize,
+    frame_index: usize,
+    interframe_output_rgba: Vec<u8>,
+    interframe_width: usize,
+    interframe_height: usize,
+}
+
+impl Default for AutoGazeVisualizationState {
+    fn default() -> Self {
+        Self::new(AutoGazeVisualizationMode::FullBlend, 30)
+    }
+}
+
+impl AutoGazeVisualizationState {
+    pub fn new(mode: AutoGazeVisualizationMode, keyframe_duration: usize) -> Self {
+        Self {
+            mode,
+            keyframe_duration: keyframe_duration.max(1),
+            frame_index: 0,
+            interframe_output_rgba: Vec::new(),
+            interframe_width: 0,
+            interframe_height: 0,
+        }
+    }
+
+    pub fn mode(&self) -> AutoGazeVisualizationMode {
+        self.mode
+    }
+
+    pub fn keyframe_duration(&self) -> usize {
+        self.keyframe_duration
+    }
+
+    pub fn configure(&mut self, mode: AutoGazeVisualizationMode, keyframe_duration: usize) {
+        if self.mode != mode {
+            self.reset();
+        }
+        self.mode = mode;
+        self.keyframe_duration = keyframe_duration.max(1);
+    }
+
+    pub fn reset(&mut self) {
+        self.frame_index = 0;
+        self.interframe_output_rgba.clear();
+        self.interframe_width = 0;
+        self.interframe_height = 0;
+    }
+
+    pub fn visualize_rgba(
+        &mut self,
+        rgba: &[u8],
+        width: usize,
+        height: usize,
+        points: &[FixationPoint],
+        cell_scale: f32,
+        blend_alpha: f32,
+    ) -> Result<AutoGazeVisualization> {
+        let (mask_rgba, full_blend_rgba) =
+            mask_and_blend_rgba(rgba, width, height, points, cell_scale, blend_alpha)?;
+        let output_rgba = match self.mode {
+            AutoGazeVisualizationMode::FullBlend => full_blend_rgba.clone(),
+            AutoGazeVisualizationMode::Interframe => {
+                self.interframe_rgba(rgba, width, height, &mask_rgba, &full_blend_rgba)?
+            }
+        };
+        self.frame_index = self.frame_index.saturating_add(1);
+        build_visualization(rgba, width, height, mask_rgba, output_rgba)
+    }
+
+    fn interframe_rgba(
+        &mut self,
+        rgba: &[u8],
+        width: usize,
+        height: usize,
+        mask_rgba: &[u8],
+        full_blend_rgba: &[u8],
+    ) -> Result<Vec<u8>> {
+        let pixels = validate_rgba_dimensions(rgba, width, height)?;
+        let dimensions_changed = self.interframe_width != width || self.interframe_height != height;
+        let keyframe = dimensions_changed
+            || self.interframe_output_rgba.len() != pixels * 4
+            || self.frame_index == 0
+            || self.frame_index.is_multiple_of(self.keyframe_duration);
+
+        if keyframe {
+            self.interframe_output_rgba.clear();
+            self.interframe_output_rgba.extend_from_slice(rgba);
+            self.interframe_width = width;
+            self.interframe_height = height;
+        }
+
+        for pixel in 0..pixels {
+            let offset = pixel * 4;
+            if mask_rgba[offset] > 0 {
+                self.interframe_output_rgba[offset..offset + 4]
+                    .copy_from_slice(&full_blend_rgba[offset..offset + 4]);
+            }
+        }
+
+        Ok(self.interframe_output_rgba.clone())
+    }
 }
 
 pub fn fixation_alpha_mask(
@@ -48,6 +199,12 @@ pub fn visualize_fixations_rgba(
     cell_scale: f32,
     blend_alpha: f32,
 ) -> Result<AutoGazeVisualization> {
+    let (mask_rgba, blend_rgba) =
+        mask_and_blend_rgba(rgba, width, height, points, cell_scale, blend_alpha)?;
+    build_visualization(rgba, width, height, mask_rgba, blend_rgba)
+}
+
+fn validate_rgba_dimensions(rgba: &[u8], width: usize, height: usize) -> Result<usize> {
     let pixels = width
         .checked_mul(height)
         .ok_or_else(|| anyhow::anyhow!("visualization dimensions overflow"))?;
@@ -63,6 +220,57 @@ pub fn visualize_fixations_rgba(
         height,
         rgba.len()
     );
+    Ok(pixels)
+}
+
+fn mask_and_blend_rgba(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    points: &[FixationPoint],
+    cell_scale: f32,
+    blend_alpha: f32,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let pixels = validate_rgba_dimensions(rgba, width, height)?;
+    let alpha = fixation_alpha_mask(width, height, points, cell_scale);
+    let mut mask_rgba = vec![0u8; pixels * 4];
+    let mut blend_rgba = vec![0u8; pixels * 4];
+    let blend_alpha = blend_alpha.clamp(0.0, 1.0);
+
+    for (pixel, mask) in alpha.iter().copied().enumerate() {
+        let src = pixel * 4;
+        mask_rgba[src] = mask;
+        mask_rgba[src + 1] = mask;
+        mask_rgba[src + 2] = mask;
+        mask_rgba[src + 3] = 255;
+
+        let overlay = if mask > 0 { blend_alpha } else { 0.0 };
+        for channel in 0..3 {
+            let base = rgba[src + channel] as f32;
+            blend_rgba[src + channel] = (base * (1.0 - overlay) + 255.0 * overlay).round() as u8;
+        }
+        blend_rgba[src + 3] = rgba[src + 3];
+    }
+
+    Ok((mask_rgba, blend_rgba))
+}
+
+fn build_visualization(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    mask_rgba: Vec<u8>,
+    blend_rgba: Vec<u8>,
+) -> Result<AutoGazeVisualization> {
+    let _ = validate_rgba_dimensions(rgba, width, height)?;
+    ensure!(
+        mask_rgba.len() == rgba.len(),
+        "mask RGBA byte length must match input frame"
+    );
+    ensure!(
+        blend_rgba.len() == rgba.len(),
+        "blend RGBA byte length must match input frame"
+    );
 
     let side_by_side_width = width
         .checked_mul(3)
@@ -71,30 +279,11 @@ pub fn visualize_fixations_rgba(
         .checked_mul(height)
         .and_then(|pixels| pixels.checked_mul(4))
         .ok_or_else(|| anyhow::anyhow!("side-by-side visualization byte length overflow"))?;
-    let alpha = fixation_alpha_mask(width, height, points, cell_scale);
-    let mut mask_rgba = vec![0u8; pixels * 4];
-    let mut blend_rgba = vec![0u8; pixels * 4];
     let mut side_by_side_rgba = vec![0u8; side_by_side_bytes];
-    let blend_alpha = blend_alpha.clamp(0.0, 1.0);
 
     for y in 0..height {
         for x in 0..width {
-            let pixel = y * width + x;
-            let src = pixel * 4;
-            let mask = alpha[pixel];
-            mask_rgba[src] = mask;
-            mask_rgba[src + 1] = mask;
-            mask_rgba[src + 2] = mask;
-            mask_rgba[src + 3] = 255;
-
-            let overlay = if mask > 0 { blend_alpha } else { 0.0 };
-            for channel in 0..3 {
-                let base = rgba[src + channel] as f32;
-                blend_rgba[src + channel] =
-                    (base * (1.0 - overlay) + 255.0 * overlay).round() as u8;
-            }
-            blend_rgba[src + 3] = rgba[src + 3];
-
+            let src = (y * width + x) * 4;
             write_side_by_side(&mut side_by_side_rgba, width, 0, x, y, &rgba[src..src + 4]);
             write_side_by_side(
                 &mut side_by_side_rgba,
@@ -179,5 +368,45 @@ mod tests {
         assert_eq!(&visualization.mask_rgba[4..8], &[0, 0, 0, 255]);
         assert_eq!(&visualization.blend_rgba[0..4], &[178, 153, 128, 255]);
         assert_eq!(&visualization.blend_rgba[4..8], &[10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn interframe_mode_preserves_unmasked_regions_until_keyframe() {
+        let point = FixationPoint::with_extent(0.25, 0.5, 0.5, 1.0, 1.0);
+        let mut state = AutoGazeVisualizationState::new(AutoGazeVisualizationMode::Interframe, 3);
+
+        let first = [10, 0, 0, 255, 20, 0, 0, 255];
+        let first_visualization = state
+            .visualize_rgba(&first, 2, 1, &[point], 1.0, 1.0)
+            .expect("first visualization");
+        assert_eq!(&first_visualization.blend_rgba[0..4], &[255, 255, 255, 255]);
+        assert_eq!(&first_visualization.blend_rgba[4..8], &[20, 0, 0, 255]);
+
+        let second = [30, 0, 0, 255, 40, 0, 0, 255];
+        let second_visualization = state
+            .visualize_rgba(&second, 2, 1, &[point], 1.0, 1.0)
+            .expect("second visualization");
+        assert_eq!(
+            &second_visualization.blend_rgba[0..8],
+            &[255, 255, 255, 255, 20, 0, 0, 255]
+        );
+
+        let third = [50, 0, 0, 255, 60, 0, 0, 255];
+        let third_visualization = state
+            .visualize_rgba(&third, 2, 1, &[], 1.0, 1.0)
+            .expect("third visualization");
+        assert_eq!(
+            &third_visualization.blend_rgba[0..8],
+            &[255, 255, 255, 255, 20, 0, 0, 255]
+        );
+
+        let fourth = [70, 0, 0, 255, 80, 0, 0, 255];
+        let fourth_visualization = state
+            .visualize_rgba(&fourth, 2, 1, &[], 1.0, 1.0)
+            .expect("fourth visualization");
+        assert_eq!(
+            &fourth_visualization.blend_rgba[0..8],
+            &[70, 0, 0, 255, 80, 0, 0, 255]
+        );
     }
 }

@@ -14,6 +14,7 @@ use bevy::{
         Diagnostic, DiagnosticPath, Diagnostics, DiagnosticsStore, FrameTimeDiagnosticsPlugin,
         RegisterDiagnostic,
     },
+    ecs::system::SystemParam,
     ecs::world::CommandQueue,
     image::ImageSampler,
     prelude::*,
@@ -29,8 +30,8 @@ use burn::prelude::Backend;
 #[cfg(target_arch = "wasm32")]
 use burn_autogaze::{AutoGazeConfig, AutoGazeLoadOptions, NativeAutoGazeModel};
 use burn_autogaze::{
-    AutoGazeInferenceMode, AutoGazePipeline, AutoGazeRgbaClipShape, FixationPoint,
-    visualize_fixations_rgba,
+    AutoGazeInferenceMode, AutoGazePipeline, AutoGazeRgbaClipShape, AutoGazeVisualizationMode,
+    AutoGazeVisualizationState, FixationPoint,
 };
 use image::RgbaImage;
 
@@ -51,6 +52,7 @@ pub const DEFAULT_WEIGHTS_URL: &str =
     "https://huggingface.co/nvidia/AutoGaze/resolve/main/model.safetensors";
 const MODEL_INPUT_SIZE: usize = 224;
 const MAX_IN_FLIGHT_TASKS: usize = 1;
+pub const DEFAULT_KEYFRAME_DURATION: usize = 30;
 const INFERENCE_FPS: DiagnosticPath = DiagnosticPath::const_new("autogaze_inference_fps");
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -99,6 +101,8 @@ pub struct BevyBurnAutoGazeConfig {
     pub frames_per_clip: usize,
     pub mask_cell_scale: f32,
     pub blend_alpha: f32,
+    pub visualization_mode: AutoGazeVisualizationMode,
+    pub keyframe_duration: usize,
 }
 
 impl Default for BevyBurnAutoGazeConfig {
@@ -117,6 +121,8 @@ impl Default for BevyBurnAutoGazeConfig {
             frames_per_clip: 2,
             mask_cell_scale: 1.0,
             blend_alpha: 0.72,
+            visualization_mode: AutoGazeVisualizationMode::FullBlend,
+            keyframe_duration: DEFAULT_KEYFRAME_DURATION,
         }
     }
 }
@@ -176,6 +182,14 @@ impl BevyBurnAutoGazeConfig {
             }
             "blend-alpha" => {
                 self.blend_alpha = parse_f32_option(&key, value)?;
+                Ok(())
+            }
+            "visualization-mode" | "visualisation-mode" | "viz-mode" => {
+                self.visualization_mode = value.parse()?;
+                Ok(())
+            }
+            "keyframe-duration" | "keyframe-interval" => {
+                self.keyframe_duration = parse_usize_option(&key, value)?.max(1);
                 Ok(())
             }
             other => Err(format!("unsupported bevy_burn_autogaze option `{other}`")),
@@ -323,6 +337,17 @@ impl FrameQueue {
 #[derive(Resource, Default, Clone)]
 struct StaticFrame(Option<Arc<RgbaImage>>);
 
+#[derive(Resource, Clone, Debug)]
+struct BevyVisualizationState(AutoGazeVisualizationState);
+
+#[derive(SystemParam)]
+struct FrameInputParams<'w> {
+    config: Res<'w, BevyBurnAutoGazeConfig>,
+    static_frame: Res<'w, StaticFrame>,
+    frame_queue: ResMut<'w, FrameQueue>,
+    visualization_state: ResMut<'w, BevyVisualizationState>,
+}
+
 #[derive(Component)]
 struct ProcessAutoGaze(Task<CommandQueue>);
 
@@ -354,6 +379,10 @@ pub fn viewer_app(config: BevyBurnAutoGazeConfig) -> App {
     app.insert_resource(ClearColor(Color::BLACK));
     app.insert_resource(AutoGazeTexture::default());
     app.insert_resource(FrameQueue::default());
+    app.insert_resource(BevyVisualizationState(AutoGazeVisualizationState::new(
+        config.visualization_mode,
+        config.keyframe_duration,
+    )));
     app.insert_resource(AutoGazeModelState {
         config: config.clone(),
         pipeline: None,
@@ -472,7 +501,7 @@ fn setup_ui(
                     ZIndex(2),
                 ))
                 .with_children(|labels| {
-                    for label in ["Input", "Mask", "Blend"] {
+                    for label in ["Input", "Mask", "Output"] {
                         labels.spawn((
                             Text(label.to_string()),
                             TextFont {
@@ -505,7 +534,10 @@ fn begin_model_load(mut state: ResMut<AutoGazeModelState>) {
     state.load_task = Some(spawn_model_load_task(state.config.clone()));
 }
 
-fn finish_model_load(mut state: ResMut<AutoGazeModelState>) {
+fn finish_model_load(
+    mut state: ResMut<AutoGazeModelState>,
+    mut visualization_state: ResMut<BevyVisualizationState>,
+) {
     let Some(task) = state.load_task.as_mut() else {
         return;
     };
@@ -515,6 +547,7 @@ fn finish_model_load(mut state: ResMut<AutoGazeModelState>) {
             Ok(pipeline) => {
                 log("AutoGaze model ready");
                 state.pipeline = Some(Arc::new(Mutex::new(pipeline)));
+                visualization_state.0.reset();
             }
             Err(err) => {
                 log(&format!("failed to load AutoGaze model: {err}"));
@@ -527,10 +560,8 @@ fn finish_model_load(mut state: ResMut<AutoGazeModelState>) {
 fn process_frames(
     mut commands: Commands,
     model: Res<AutoGazeModelState>,
-    config: Res<BevyBurnAutoGazeConfig>,
     texture: Res<AutoGazeTexture>,
-    static_frame: Res<StaticFrame>,
-    mut frame_queue: ResMut<FrameQueue>,
+    mut frame_input: FrameInputParams,
     active_tasks: Query<&ProcessAutoGaze>,
 ) {
     let Some(pipeline) = model.pipeline.as_ref() else {
@@ -543,7 +574,7 @@ fn process_frames(
         return;
     }
 
-    let frame = if let Some(frame) = static_frame.0.as_ref() {
+    let frame = if let Some(frame) = frame_input.static_frame.0.as_ref() {
         Some((**frame).clone())
     } else {
         receive_frame()
@@ -552,20 +583,35 @@ fn process_frames(
     let Some(frame) = frame else {
         return;
     };
-    let Some(clip) = frame_queue.push(frame, config.frames_per_clip) else {
+    let Some(clip) = frame_input
+        .frame_queue
+        .push(frame, frame_input.config.frames_per_clip)
+    else {
         return;
     };
 
     let task_entity = commands.spawn_empty().id();
     let pipeline = pipeline.clone();
-    let mode = config.mode.inference_mode();
-    let top_k = config.top_k.max(1);
-    let cell_scale = config.mask_cell_scale;
-    let blend_alpha = config.blend_alpha;
+    let mode = frame_input.config.mode.inference_mode();
+    let top_k = frame_input.config.top_k.max(1);
+    let cell_scale = frame_input.config.mask_cell_scale;
+    let blend_alpha = frame_input.config.blend_alpha;
+    frame_input.visualization_state.0.configure(
+        frame_input.config.visualization_mode,
+        frame_input.config.keyframe_duration,
+    );
+    let visualization_state = frame_input.visualization_state.0.clone();
 
     let task = AsyncComputeTaskPool::get().spawn(async move {
-        let visualization =
-            run_autogaze_visualization(pipeline, clip, top_k, mode, cell_scale, blend_alpha);
+        let (visualization, visualization_state) = run_autogaze_visualization(
+            pipeline,
+            clip,
+            top_k,
+            mode,
+            cell_scale,
+            blend_alpha,
+            visualization_state,
+        );
 
         let mut queue = CommandQueue::default();
         queue.push(move |world: &mut World| {
@@ -586,6 +632,10 @@ fn process_frames(
                 texture.height = height;
             }
 
+            if let Some(mut state) = world.get_resource_mut::<BevyVisualizationState>() {
+                state.0 = visualization_state;
+            }
+
             if let Ok(mut tracker) = world.get_entity_mut(task_entity) {
                 tracker.remove::<ProcessAutoGaze>();
                 tracker.despawn();
@@ -600,10 +650,8 @@ fn process_frames(
 
 fn preview_frames(
     model: Res<AutoGazeModelState>,
-    config: Res<BevyBurnAutoGazeConfig>,
     mut texture: ResMut<AutoGazeTexture>,
-    static_frame: Res<StaticFrame>,
-    mut frame_queue: ResMut<FrameQueue>,
+    mut frame_input: FrameInputParams,
     image_nodes: Query<&ImageNode>,
     mut images: ResMut<Assets<Image>>,
 ) {
@@ -615,7 +663,7 @@ fn preview_frames(
         return;
     };
 
-    let frame = if let Some(frame) = static_frame.0.as_ref() {
+    let frame = if let Some(frame) = frame_input.static_frame.0.as_ref() {
         Some((**frame).clone())
     } else {
         receive_frame()
@@ -625,18 +673,25 @@ fn preview_frames(
         return;
     };
 
-    frame_queue.push(frame, config.frames_per_clip);
-    let Some(frame) = frame_queue.frames.back() else {
+    frame_input
+        .frame_queue
+        .push(frame, frame_input.config.frames_per_clip);
+    let Some(frame) = frame_input.frame_queue.frames.back() else {
         return;
     };
 
+    frame_input.visualization_state.0.configure(
+        frame_input.config.visualization_mode,
+        frame_input.config.keyframe_duration,
+    );
     let visualization = visualize_points(
         frame,
         frame.width() as usize,
         frame.height() as usize,
         &[],
-        config.mask_cell_scale,
-        config.blend_alpha,
+        frame_input.config.mask_cell_scale,
+        frame_input.config.blend_alpha,
+        &mut frame_input.visualization_state.0,
     );
     apply_visualization_to_texture(
         image_entity,
@@ -738,7 +793,8 @@ fn run_autogaze_visualization(
     mode: AutoGazeInferenceMode,
     cell_scale: f32,
     blend_alpha: f32,
-) -> Visualization {
+    mut visualization_state: AutoGazeVisualizationState,
+) -> (Visualization, AutoGazeVisualizationState) {
     let device = burn_device();
     let width = clip[0].width() as usize;
     let height = clip[0].height() as usize;
@@ -761,14 +817,16 @@ fn run_autogaze_visualization(
         .and_then(|trace| trace.frames.get(frame_index))
         .map(|set| set.points.clone())
         .unwrap_or_default();
-    visualize_points(
+    let visualization = visualize_points(
         clip.last().expect("nonempty clip"),
         width,
         height,
         &points,
         cell_scale,
         blend_alpha,
-    )
+        &mut visualization_state,
+    );
+    (visualization, visualization_state)
 }
 
 struct Visualization {
@@ -784,16 +842,18 @@ fn visualize_points(
     points: &[FixationPoint],
     cell_scale: f32,
     blend_alpha: f32,
+    visualization_state: &mut AutoGazeVisualizationState,
 ) -> Visualization {
-    let visualization = visualize_fixations_rgba(
-        rgba.as_raw(),
-        width,
-        height,
-        points,
-        cell_scale,
-        blend_alpha,
-    )
-    .expect("valid Bevy AutoGaze visualization input");
+    let visualization = visualization_state
+        .visualize_rgba(
+            rgba.as_raw(),
+            width,
+            height,
+            points,
+            cell_scale,
+            blend_alpha,
+        )
+        .expect("valid Bevy AutoGaze visualization input");
     Visualization {
         width: visualization.side_by_side_width as u32,
         height: visualization.height as u32,
@@ -1004,7 +1064,7 @@ mod tests {
     fn applies_url_query_to_viewer_config() {
         let mut config = BevyBurnAutoGazeConfig::default();
         let errors = config.apply_query_string(
-            "?mode=full-res&top_k=2&frames-per-clip=3&show-fps=false&config-url=%2Fconfig.json&weights-url=%2Fmodel.safetensors&load-model=false&mask-cell-scale=2.5&blend-alpha=0.5",
+            "?mode=full-res&top_k=2&frames-per-clip=3&show-fps=false&config-url=%2Fconfig.json&weights-url=%2Fmodel.safetensors&load-model=false&mask-cell-scale=2.5&blend-alpha=0.5&visualization-mode=interframe&keyframe-duration=7",
         );
 
         assert!(errors.is_empty(), "{errors:?}");
@@ -1017,6 +1077,11 @@ mod tests {
         assert!(!config.load_model);
         assert_eq!(config.mask_cell_scale, 2.5);
         assert_eq!(config.blend_alpha, 0.5);
+        assert_eq!(
+            config.visualization_mode,
+            AutoGazeVisualizationMode::Interframe
+        );
+        assert_eq!(config.keyframe_duration, 7);
     }
 
     #[test]
@@ -1033,7 +1098,8 @@ mod tests {
         .expect("frame");
         let point = FixationPoint::with_extent(0.25, 0.25, 0.5, 0.5, 1.0);
 
-        let visualization = visualize_points(&frame, 4, 4, &[point], 1.0, 0.5);
+        let mut state = AutoGazeVisualizationState::new(AutoGazeVisualizationMode::FullBlend, 30);
+        let visualization = visualize_points(&frame, 4, 4, &[point], 1.0, 0.5, &mut state);
 
         assert_eq!(visualization.width, 12);
         assert_eq!(visualization.height, 4);

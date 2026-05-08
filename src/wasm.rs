@@ -1,6 +1,7 @@
 use crate::{
     AutoGazeConfig, AutoGazeInferenceMode, AutoGazeLoadOptions, AutoGazePipeline,
-    AutoGazeRgbaClipShape, NativeAutoGazeModel, rgba_clip_to_tensor, visualize_fixations_rgba,
+    AutoGazeRgbaClipShape, AutoGazeVisualizationMode, AutoGazeVisualizationState,
+    NativeAutoGazeModel, rgba_clip_to_tensor,
 };
 use burn::tensor::backend::Backend;
 use std::sync::OnceLock;
@@ -19,6 +20,9 @@ pub struct WasmAutoGaze {
     top_k: usize,
     mask_cell_scale: f32,
     blend_alpha: f32,
+    visualization_mode: AutoGazeVisualizationMode,
+    keyframe_duration: usize,
+    visualization_state: AutoGazeVisualizationState,
 }
 
 #[wasm_bindgen]
@@ -52,6 +56,12 @@ impl WasmAutoGaze {
             top_k: 4,
             mask_cell_scale: 1.0,
             blend_alpha: 0.72,
+            visualization_mode: AutoGazeVisualizationMode::FullBlend,
+            keyframe_duration: 30,
+            visualization_state: AutoGazeVisualizationState::new(
+                AutoGazeVisualizationMode::FullBlend,
+                30,
+            ),
         })
     }
 
@@ -91,6 +101,42 @@ impl WasmAutoGaze {
         self.blend_alpha = alpha.clamp(0.0, 1.0);
     }
 
+    pub fn visualization_mode(&self) -> String {
+        self.visualization_mode.as_str().to_string()
+    }
+
+    pub fn set_visualization_mode(&mut self, mode: &str) -> Result<(), JsValue> {
+        let mode = mode
+            .parse()
+            .map_err(|err| js_error(format!("failed to parse visualization mode: {err}")))?;
+        self.visualization_mode = mode;
+        self.visualization_state
+            .configure(self.visualization_mode, self.keyframe_duration);
+        Ok(())
+    }
+
+    pub fn set_full_blend_visualization_mode(&mut self) {
+        self.visualization_mode = AutoGazeVisualizationMode::FullBlend;
+        self.visualization_state
+            .configure(self.visualization_mode, self.keyframe_duration);
+    }
+
+    pub fn set_interframe_visualization_mode(&mut self) {
+        self.visualization_mode = AutoGazeVisualizationMode::Interframe;
+        self.visualization_state
+            .configure(self.visualization_mode, self.keyframe_duration);
+    }
+
+    pub fn set_keyframe_duration(&mut self, duration: usize) {
+        self.keyframe_duration = duration.max(1);
+        self.visualization_state
+            .configure(self.visualization_mode, self.keyframe_duration);
+    }
+
+    pub fn reset_visualization_state(&mut self) {
+        self.visualization_state.reset();
+    }
+
     pub fn tile_count(&self, width: usize, height: usize) -> usize {
         match self.mode {
             AutoGazeInferenceMode::ResizeToModelInput => 1,
@@ -101,7 +147,7 @@ impl WasmAutoGaze {
     }
 
     pub fn infer_rgba_clip(
-        &self,
+        &mut self,
         rgba: &[u8],
         width: usize,
         height: usize,
@@ -140,15 +186,19 @@ impl WasmAutoGaze {
         let points_json = serde_json::to_string(&points)
             .map_err(|err| js_error(format!("failed to serialize fixation points: {err}")))?;
         let last_frame = last_rgba_frame(rgba, width, height, frames);
-        let visualization = visualize_fixations_rgba(
-            last_frame,
-            width,
-            height,
-            &points,
-            self.mask_cell_scale,
-            self.blend_alpha,
-        )
-        .map_err(|err| js_error(format!("failed to render AutoGaze visualization: {err:#}")))?;
+        self.visualization_state
+            .configure(self.visualization_mode, self.keyframe_duration);
+        let visualization = self
+            .visualization_state
+            .visualize_rgba(
+                last_frame,
+                width,
+                height,
+                &points,
+                self.mask_cell_scale,
+                self.blend_alpha,
+            )
+            .map_err(|err| js_error(format!("failed to render AutoGaze visualization: {err:#}")))?;
 
         Ok(WasmAutoGazeOutput {
             width,
@@ -159,6 +209,8 @@ impl WasmAutoGaze {
             side_by_side_rgba: visualization.side_by_side_rgba,
             points_json,
             mode: mode_label(self.mode),
+            visualization_mode: self.visualization_mode.as_str().to_string(),
+            keyframe_duration: self.keyframe_duration,
             tile_count: self.tile_count(width, height),
         })
     }
@@ -174,6 +226,8 @@ pub struct WasmAutoGazeOutput {
     side_by_side_rgba: Vec<u8>,
     points_json: String,
     mode: String,
+    visualization_mode: String,
+    keyframe_duration: usize,
     tile_count: usize,
 }
 
@@ -200,6 +254,16 @@ impl WasmAutoGazeOutput {
     }
 
     #[wasm_bindgen(getter)]
+    pub fn visualization_mode(&self) -> String {
+        self.visualization_mode.clone()
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn keyframe_duration(&self) -> usize {
+        self.keyframe_duration
+    }
+
+    #[wasm_bindgen(getter)]
     pub fn tile_count(&self) -> usize {
         self.tile_count
     }
@@ -209,6 +273,10 @@ impl WasmAutoGazeOutput {
     }
 
     pub fn blend_rgba(&self) -> Vec<u8> {
+        self.blend_rgba.clone()
+    }
+
+    pub fn output_rgba(&self) -> Vec<u8> {
         self.blend_rgba.clone()
     }
 

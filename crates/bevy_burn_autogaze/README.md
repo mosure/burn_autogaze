@@ -17,6 +17,11 @@ viewer/inference knobs include `--top-k`, `--frames-per-clip`,
 `--max-gaze-tokens-each-frame`, `--mask-cell-scale`, `--blend-alpha`, and
 `--show-fps`.
 
+`--visualization-mode full-blend` renders the current frame's alpha-blended
+mask. `--visualization-mode interframe --keyframe-duration 30` preserves the
+previous output outside masked cells and redraws a full keyframe every 30
+processed frames.
+
 ## Web
 
 ```sh
@@ -34,7 +39,7 @@ UI is rendered by Bevy into the `#bevy` canvas, matching the native path. Pass
 the same viewer/inference knobs as query parameters:
 
 ```text
-http://localhost:8080/?mode=tile-224&top-k=2&frames-per-clip=2&show-fps=true
+http://localhost:8080/?mode=tile-224&visualization-mode=interframe&keyframe-duration=30&top-k=2&frames-per-clip=2&show-fps=true
 ```
 
 Use `?source=static` for a generated static frame, or `?image-url=./frame.png`

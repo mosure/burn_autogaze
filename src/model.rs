@@ -1162,11 +1162,7 @@ fn generated_to_traces(
     config: &AutoGazeConfig,
     k: usize,
 ) -> Vec<FrameFixationTrace> {
-    let tokens_each_scale = tokens_each_scale(config);
-    let grids: Vec<usize> = tokens_each_scale
-        .iter()
-        .map(|tokens| (*tokens as f64).sqrt().round() as usize)
-        .collect();
+    let scale_layouts = scale_token_layouts(config);
     let mut traces = Vec::with_capacity(generated.gazing_pos.len());
     for batch_idx in 0..generated.gazing_pos.len() {
         let mut cursor = 0usize;
@@ -1185,8 +1181,7 @@ fn generated_to_traces(
                 }
                 if let Some(point) = token_to_fixation_point(
                     token.max(0) as usize,
-                    &tokens_each_scale,
-                    &grids,
+                    &scale_layouts,
                     generated.confidences[batch_idx][global_idx],
                 ) {
                     points.push(point);
@@ -1200,17 +1195,22 @@ fn generated_to_traces(
     traces
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ScaleTokenLayout {
+    token_count: usize,
+    grid: usize,
+}
+
 fn token_to_fixation_point(
     token: usize,
-    tokens_each_scale: &[usize],
-    grids: &[usize],
+    scale_layouts: &[ScaleTokenLayout],
     confidence: f32,
 ) -> Option<FixationPoint> {
     let mut offset = 0usize;
-    for (scale_idx, token_count) in tokens_each_scale.iter().copied().enumerate() {
-        if token < offset + token_count {
+    for layout in scale_layouts {
+        if token < offset + layout.token_count {
             let local = token - offset;
-            let grid = grids.get(scale_idx).copied().unwrap_or(1).max(1);
+            let grid = layout.grid.max(1);
             let row = local / grid;
             let col = local % grid;
             let x = (col as f32 + 0.5) / grid as f32;
@@ -1218,16 +1218,44 @@ fn token_to_fixation_point(
             let cell = (1.0 / grid as f32).clamp(1.0e-6, 1.0);
             return Some(FixationPoint::with_extent(x, y, cell, cell, confidence));
         }
-        offset += token_count;
+        offset += layout.token_count;
     }
     None
 }
 
-fn tokens_each_scale(config: &AutoGazeConfig) -> Vec<usize> {
+fn scale_token_layouts(config: &AutoGazeConfig) -> Vec<ScaleTokenLayout> {
     let scales = config.scale_values();
     if scales.is_empty() {
-        return vec![config.num_vision_tokens_each_frame.max(1)];
+        let token_count = config.num_vision_tokens_each_frame.max(1);
+        return vec![ScaleTokenLayout {
+            token_count,
+            grid: square_grid(token_count),
+        }];
     }
+
+    let patch_size = config
+        .gaze_model_config
+        .vision_model_config
+        .kernel_size
+        .max(1);
+    let direct_layouts = scales
+        .iter()
+        .map(|scale| {
+            let grid = (scale / patch_size).max(1);
+            ScaleTokenLayout {
+                token_count: grid * grid,
+                grid,
+            }
+        })
+        .collect::<Vec<_>>();
+    let direct_tokens = direct_layouts
+        .iter()
+        .map(|layout| layout.token_count)
+        .sum::<usize>();
+    if direct_tokens == config.num_vision_tokens_each_frame {
+        return direct_layouts;
+    }
+
     let sum_sq: usize = scales.iter().map(|scale| scale * scale).sum();
     let mut counts = Vec::with_capacity(scales.len());
     let mut assigned = 0usize;
@@ -1243,6 +1271,16 @@ fn tokens_each_scale(config: &AutoGazeConfig) -> Vec<usize> {
         }
     }
     counts
+        .into_iter()
+        .map(|token_count| ScaleTokenLayout {
+            token_count,
+            grid: square_grid(token_count),
+        })
+        .collect()
+}
+
+fn square_grid(token_count: usize) -> usize {
+    (token_count.max(1) as f64).sqrt().round().max(1.0) as usize
 }
 
 #[cfg(test)]
@@ -1258,33 +1296,73 @@ mod tests {
         };
         config.gaze_model_config.num_vision_tokens_each_frame = 265;
 
-        let tokens_each_scale = tokens_each_scale(&config);
-        assert_eq!(tokens_each_scale, vec![4, 16, 49, 196]);
-        let grids = tokens_each_scale
-            .iter()
-            .map(|tokens| (*tokens as f64).sqrt().round() as usize)
-            .collect::<Vec<_>>();
+        let scale_layouts = scale_token_layouts(&config);
+        assert_eq!(
+            scale_layouts,
+            vec![
+                ScaleTokenLayout {
+                    token_count: 4,
+                    grid: 2
+                },
+                ScaleTokenLayout {
+                    token_count: 16,
+                    grid: 4
+                },
+                ScaleTokenLayout {
+                    token_count: 49,
+                    grid: 7
+                },
+                ScaleTokenLayout {
+                    token_count: 196,
+                    grid: 14
+                }
+            ]
+        );
 
-        let coarse =
-            token_to_fixation_point(0, &tokens_each_scale, &grids, 1.0).expect("coarse token");
+        let coarse = token_to_fixation_point(0, &scale_layouts, 1.0).expect("coarse token");
         assert_eq!(coarse.x, 0.25);
         assert_eq!(coarse.y, 0.25);
         assert_eq!(coarse.cell_width(), 0.5);
         assert_eq!(coarse.cell_height(), 0.5);
 
-        let mid = token_to_fixation_point(4, &tokens_each_scale, &grids, 1.0)
-            .expect("second-scale token");
+        let mid = token_to_fixation_point(4, &scale_layouts, 1.0).expect("second-scale token");
         assert_eq!(mid.x, 0.125);
         assert_eq!(mid.y, 0.125);
         assert_eq!(mid.cell_width(), 0.25);
         assert_eq!(mid.cell_height(), 0.25);
 
-        let fine_offset = tokens_each_scale[..3].iter().sum::<usize>();
-        let fine = token_to_fixation_point(fine_offset + 13, &tokens_each_scale, &grids, 1.0)
-            .expect("fine token");
+        let fine_offset = scale_layouts[..3]
+            .iter()
+            .map(|layout| layout.token_count)
+            .sum::<usize>();
+        let fine =
+            token_to_fixation_point(fine_offset + 13, &scale_layouts, 1.0).expect("fine token");
         assert!((fine.x - 13.5 / 14.0).abs() < 1.0e-6);
         assert!((fine.y - 0.5 / 14.0).abs() < 1.0e-6);
         assert!((fine.cell_width() - 1.0 / 14.0).abs() < 1.0e-6);
         assert!((fine.cell_height() - 1.0 / 14.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn scale_layout_falls_back_to_proportional_counts_for_mismatched_totals() {
+        let mut config = AutoGazeConfig {
+            scales: "32+64+224".to_string(),
+            num_vision_tokens_each_frame: 10,
+            ..Default::default()
+        };
+        config.gaze_model_config.vision_model_config.kernel_size = 16;
+
+        let layouts = scale_token_layouts(&config);
+        assert_eq!(
+            layouts
+                .iter()
+                .map(|layout| layout.token_count)
+                .sum::<usize>(),
+            10
+        );
+        assert_eq!(
+            layouts.iter().map(|layout| layout.grid).collect::<Vec<_>>(),
+            vec![1, 1, 3]
+        );
     }
 }

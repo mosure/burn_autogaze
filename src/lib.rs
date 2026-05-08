@@ -22,7 +22,10 @@ pub use pipeline::{
 pub use safetensors_io::AutoGazeTraceStore;
 pub use teacher::AutoGazeTeacher;
 pub use trace::{FixationBounds, FixationPoint, FixationSet, FrameFixationTrace};
-pub use visualization::{AutoGazeVisualization, fixation_alpha_mask, visualize_fixations_rgba};
+pub use visualization::{
+    AutoGazeVisualization, AutoGazeVisualizationMode, AutoGazeVisualizationState,
+    fixation_alpha_mask, visualize_fixations_rgba,
+};
 #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
 pub use wasm::*;
 

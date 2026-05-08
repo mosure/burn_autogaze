@@ -8,9 +8,11 @@ const DEFAULT_WEIGHTS =
 const configUrl = document.getElementById("config-url");
 const weightsUrl = document.getElementById("weights-url");
 const mode = document.getElementById("mode");
+const visualizationMode = document.getElementById("visualization-mode");
 const resolution = document.getElementById("resolution");
 const clipFrames = document.getElementById("clip-frames");
 const topK = document.getElementById("top-k");
+const keyframeDuration = document.getElementById("keyframe-duration");
 const loadModel = document.getElementById("load-model");
 const startCamera = document.getElementById("start-camera");
 const status = document.getElementById("status");
@@ -37,7 +39,9 @@ weightsUrl.value = DEFAULT_WEIGHTS;
 loadModel.addEventListener("click", () => loadAutogazeModel());
 startCamera.addEventListener("click", () => toggleCamera());
 mode.addEventListener("change", applyModelOptions);
+visualizationMode.addEventListener("change", applyModelOptions);
 topK.addEventListener("change", applyModelOptions);
+keyframeDuration.addEventListener("change", applyModelOptions);
 
 function setStatus(message) {
   status.textContent = message;
@@ -175,7 +179,7 @@ function runInference(width, height, frames) {
         smoothedFps = smoothedFps ? smoothedFps * 0.85 + fps * 0.15 : fps;
       }
       lastInferenceAt = now;
-      stats.textContent = `${width}x${height} ${output.mode}, ${output.tile_count} tile(s), ${elapsed.toFixed(1)} ms, ${smoothedFps.toFixed(1)} fps`;
+      stats.textContent = `${width}x${height} ${output.mode}, ${output.visualization_mode}, ${output.tile_count} tile(s), ${elapsed.toFixed(1)} ms, ${smoothedFps.toFixed(1)} fps`;
       output.free();
     } catch (error) {
       console.error(error);
@@ -206,6 +210,8 @@ function applyModelOptions() {
   }
   model.set_top_k(clampInteger(topK.value, 1, 16));
   model.set_max_gaze_tokens_each_frame(clampInteger(topK.value, 1, 16));
+  model.set_keyframe_duration(clampInteger(keyframeDuration.value, 1, 300));
+  model.set_visualization_mode(visualizationMode.value);
   if (mode.value === "tile") {
     model.set_tiled_mode(224, 224);
   } else {

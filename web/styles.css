@@ -31,7 +31,7 @@ select {
 
 .toolbar {
   display: grid;
-  grid-template-columns: minmax(180px, 1.4fr) minmax(180px, 1.4fr) 120px 120px 88px 88px 84px 84px;
+  grid-template-columns: minmax(180px, 1.2fr) minmax(180px, 1.2fr) 120px 132px 120px 88px 88px 92px 84px 84px;
   gap: 8px;
   align-items: end;
   padding: 10px;

@@ -43,12 +43,22 @@ struct NativeArgs {
 
     #[arg(long, default_value_t = 0.72)]
     blend_alpha: f32,
+
+    #[arg(long, default_value = "full-blend")]
+    visualization_mode: String,
+
+    #[arg(long, default_value_t = bevy_burn_autogaze::DEFAULT_KEYFRAME_DURATION)]
+    keyframe_duration: usize,
 }
 
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 impl From<NativeArgs> for BevyBurnAutoGazeConfig {
     fn from(args: NativeArgs) -> Self {
         let mode = args.mode.parse().unwrap_or_else(|err| panic!("{err}"));
+        let visualization_mode = args
+            .visualization_mode
+            .parse()
+            .unwrap_or_else(|err| panic!("{err}"));
         Self {
             press_esc_to_close: args.press_esc_to_close,
             show_fps: args.show_fps,
@@ -61,6 +71,8 @@ impl From<NativeArgs> for BevyBurnAutoGazeConfig {
             frames_per_clip: args.frames_per_clip,
             mask_cell_scale: args.mask_cell_scale,
             blend_alpha: args.blend_alpha,
+            visualization_mode,
+            keyframe_duration: args.keyframe_duration.max(1),
             ..Default::default()
         }
     }

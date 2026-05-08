@@ -6,7 +6,7 @@
 [![docs.rs](https://docs.rs/burn_autogaze/badge.svg)](https://docs.rs/burn_autogaze)
 
 burn-native [nvidia autogaze](https://huggingface.co/nvidia/AutoGaze) model
-inference, fixation traces, crisp token-cell mask visualization, and
+inference, fixation traces, crisp multi-scale token-cell mask visualization, and
 bevy/webgpu demos.
 
 | input | mask | output |
@@ -20,6 +20,10 @@ bevy/webgpu demos.
 - default fast path downsamples frames to the model's `224` input
 - optional tiled full-resolution mode remaps local 224px tile predictions and
   token-cell extents back into source-frame coordinates
+- white mask and output visualizations preserve the model's multi-scale
+  `2x2`/`4x4`/`7x7`/`14x14` token cells with nearest sampling
+- optional `interframe` visualization updates only masked cells between
+  configurable keyframes, emulating an interframe video-encoding preview
 - runs on ndarray, webgpu, cuda, and wasm/webgpu
 - ships a plain wasm-bindgen api plus a symmetric native/wasm bevy viewer
 
@@ -100,12 +104,16 @@ npm run serve
 `WasmAutoGaze.create(configJson, safetensors)` loads `config.json` plus
 `model.safetensors` bytes through async WebGPU setup, accepts RGBA video clips,
 and returns white binary token-cell mask, alpha-blended, and `input | mask |
-blend` RGBA buffers. this is the low-level wasm-bindgen api demo.
+output` RGBA buffers (`output_rgba()` is the preferred accessor, with
+`blend_rgba()` kept for compatibility). use `set_visualization_mode("interframe")` and
+`set_keyframe_duration(n)` to enable stateful interframe output. this is the
+low-level wasm-bindgen api demo.
 
 ## bevy
 
 ```sh
-cargo run -p bevy_burn_autogaze --features native -- --mode resize-224
+cargo run -p bevy_burn_autogaze --features native -- --mode resize-224 --visualization-mode full-blend
+cargo run -p bevy_burn_autogaze --features native -- --mode tile-224 --visualization-mode interframe --keyframe-duration 30
 
 cd crates/bevy_burn_autogaze
 npm run build:wasm
@@ -115,14 +123,14 @@ npm run serve
 `bevy_burn_autogaze` is the primary UI demo on both native and wasm. native and
 browser builds render the same bevy app: the only platform split is camera/model
 I/O (`nokhwa` or `--image-path` natively, browser camera plus `frame_input` on
-wasm). both modes show the same bevy-rendered `input | mask | blend`
+wasm). both modes show the same bevy-rendered `input | mask | output`
 visualization and FPS overlay.
 
 The native app accepts CLI flags; the wasm app accepts the same viewer/inference
 knobs through query parameters:
 
 ```text
-http://localhost:8080/?mode=tile-224&top-k=2&frames-per-clip=2&show-fps=true
+http://localhost:8080/?mode=tile-224&visualization-mode=interframe&keyframe-duration=30&top-k=2&frames-per-clip=2&show-fps=true
 ```
 
 For headless browsers or machines without a webcam, run the same Bevy UI from a
