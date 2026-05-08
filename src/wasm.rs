@@ -1,6 +1,6 @@
 use crate::{
     AutoGazeConfig, AutoGazeInferenceMode, AutoGazeLoadOptions, AutoGazePipeline, FixationPoint,
-    NativeAutoGazeModel,
+    NativeAutoGazeModel, visualize_fixations_rgba,
 };
 use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, TensorData};
@@ -10,7 +10,7 @@ use wasm_bindgen::prelude::*;
 type WasmBackend = burn::backend::WebGpu<f32, i32>;
 type WasmDevice = burn::backend::wgpu::WgpuDevice;
 
-static WEBGPU_INIT: OnceLock<()> = OnceLock::new();
+static WEBGPU_DEVICE: OnceLock<WasmDevice> = OnceLock::new();
 
 #[wasm_bindgen]
 pub struct WasmAutoGaze {
@@ -26,10 +26,18 @@ pub struct WasmAutoGaze {
 impl WasmAutoGaze {
     #[wasm_bindgen(constructor)]
     pub fn new(config_json: &str, safetensors: &[u8]) -> Result<WasmAutoGaze, JsValue> {
+        let _ = (config_json, safetensors);
+        Err(js_error(
+            "synchronous WebGPU setup is unsupported on wasm; use WasmAutoGaze.create(configJson, safetensors)",
+        ))
+    }
+
+    #[wasm_bindgen(js_name = create)]
+    pub async fn create(config_json: &str, safetensors: &[u8]) -> Result<WasmAutoGaze, JsValue> {
         console_error_panic_hook::set_once();
         let config: AutoGazeConfig = serde_json::from_str(config_json)
             .map_err(|err| js_error(format!("failed to parse AutoGaze config: {err}")))?;
-        let device = webgpu_device();
+        let device = webgpu_device().await;
         let model = NativeAutoGazeModel::<WasmBackend>::from_config_and_safetensors_bytes(
             &config,
             safetensors.to_vec(),
@@ -74,6 +82,10 @@ impl WasmAutoGaze {
 
     pub fn set_mask_radius_scale(&mut self, scale: f32) {
         self.mask_radius_scale = scale.clamp(0.25, 12.0);
+    }
+
+    pub fn set_mask_cell_scale(&mut self, scale: f32) {
+        self.set_mask_radius_scale(scale);
     }
 
     pub fn set_blend_alpha(&mut self, alpha: f32) {
@@ -134,12 +146,12 @@ impl WasmAutoGaze {
             &points,
             self.mask_radius_scale,
             self.blend_alpha,
-        );
+        )?;
 
         Ok(WasmAutoGazeOutput {
             width,
             height,
-            side_by_side_width: width * 3,
+            side_by_side_width: visualization.side_by_side_width,
             mask_rgba: visualization.mask_rgba,
             blend_rgba: visualization.blend_rgba,
             side_by_side_rgba: visualization.side_by_side_rgba,
@@ -208,19 +220,24 @@ impl WasmAutoGazeOutput {
 }
 
 struct Visualization {
+    side_by_side_width: usize,
     mask_rgba: Vec<u8>,
     blend_rgba: Vec<u8>,
     side_by_side_rgba: Vec<u8>,
 }
 
-fn webgpu_device() -> WasmDevice {
+async fn webgpu_device() -> WasmDevice {
+    if let Some(device) = WEBGPU_DEVICE.get() {
+        return device.clone();
+    }
+
     let device = burn::backend::wgpu::WgpuDevice::default();
-    WEBGPU_INIT.get_or_init(|| {
-        burn::backend::wgpu::init_setup::<burn::backend::wgpu::graphics::AutoGraphicsApi>(
-            &device,
-            Default::default(),
-        );
-    });
+    burn::backend::wgpu::init_setup_async::<burn::backend::wgpu::graphics::WebGpu>(
+        &device,
+        Default::default(),
+    )
+    .await;
+    let _ = WEBGPU_DEVICE.set(device.clone());
     device
 }
 
@@ -258,124 +275,18 @@ fn visualize_points(
     width: usize,
     height: usize,
     points: &[FixationPoint],
-    radius_scale: f32,
+    cell_scale: f32,
     blend_alpha: f32,
-) -> Visualization {
-    let pixels = width * height;
-    let mut alpha = vec![0.0f32; pixels];
-    let frame_extent = width.max(height) as f32;
-
-    for point in points {
-        if point.confidence <= 0.0 {
-            continue;
-        }
-        let cx = point.x * (width.saturating_sub(1) as f32);
-        let cy = point.y * (height.saturating_sub(1) as f32);
-        let radius = (point.scale * frame_extent * radius_scale).max(12.0);
-        let sigma = (radius * 0.45).max(1.0);
-        let search = (radius * 2.0).ceil() as isize;
-        let min_x = ((cx as isize) - search).max(0) as usize;
-        let max_x = ((cx as isize) + search).min(width.saturating_sub(1) as isize) as usize;
-        let min_y = ((cy as isize) - search).max(0) as usize;
-        let max_y = ((cy as isize) + search).min(height.saturating_sub(1) as isize) as usize;
-        let denom = 2.0 * sigma * sigma;
-
-        for y in min_y..=max_y {
-            let dy = y as f32 - cy;
-            for x in min_x..=max_x {
-                let dx = x as f32 - cx;
-                let weight = (-(dx * dx + dy * dy) / denom).exp() * point.confidence;
-                let idx = y * width + x;
-                alpha[idx] = alpha[idx].max(weight.clamp(0.0, 1.0));
-            }
-        }
-    }
-
-    normalize_alpha(&mut alpha);
-
-    let mut mask_rgba = vec![0u8; pixels * 4];
-    let mut blend_rgba = vec![0u8; pixels * 4];
-    let mut side_by_side_rgba = vec![0u8; width * 3 * height * 4];
-
-    for y in 0..height {
-        for x in 0..width {
-            let pixel = y * width + x;
-            let src = pixel * 4;
-            let a = alpha[pixel].clamp(0.0, 1.0);
-            let mask = (a * 255.0).round() as u8;
-            mask_rgba[src] = mask;
-            mask_rgba[src + 1] = mask;
-            mask_rgba[src + 2] = mask;
-            mask_rgba[src + 3] = 255;
-
-            let overlay = (a * blend_alpha).clamp(0.0, 1.0);
-            for channel in 0..3 {
-                let base = rgba[src + channel] as f32;
-                blend_rgba[src + channel] =
-                    (base * (1.0 - overlay) + 255.0 * overlay).round() as u8;
-            }
-            blend_rgba[src + 3] = rgba[src + 3];
-
-            write_side_by_side(
-                &mut side_by_side_rgba,
-                width,
-                height,
-                0,
-                x,
-                y,
-                &rgba[src..src + 4],
-            );
-            write_side_by_side(
-                &mut side_by_side_rgba,
-                width,
-                height,
-                1,
-                x,
-                y,
-                &mask_rgba[src..src + 4],
-            );
-            write_side_by_side(
-                &mut side_by_side_rgba,
-                width,
-                height,
-                2,
-                x,
-                y,
-                &blend_rgba[src..src + 4],
-            );
-        }
-    }
-
-    Visualization {
-        mask_rgba,
-        blend_rgba,
-        side_by_side_rgba,
-    }
-}
-
-fn write_side_by_side(
-    out: &mut [u8],
-    width: usize,
-    height: usize,
-    column: usize,
-    x: usize,
-    y: usize,
-    rgba: &[u8],
-) {
-    let out_width = width * 3;
-    let out_x = column * width + x;
-    let dst = (y.min(height - 1) * out_width + out_x) * 4;
-    out[dst..dst + 4].copy_from_slice(rgba);
-}
-
-fn normalize_alpha(alpha: &mut [f32]) {
-    let max_alpha = alpha.iter().copied().fold(0.0, f32::max);
-    if max_alpha <= 0.0 {
-        return;
-    }
-    for value in alpha {
-        *value = (*value / max_alpha).clamp(0.0, 1.0);
-    }
+) -> Result<Visualization, JsValue> {
+    let visualization =
+        visualize_fixations_rgba(rgba, width, height, points, cell_scale, blend_alpha)
+            .map_err(|err| js_error(format!("failed to render AutoGaze visualization: {err:#}")))?;
+    Ok(Visualization {
+        side_by_side_width: visualization.side_by_side_width,
+        mask_rgba: visualization.mask_rgba,
+        blend_rgba: visualization.blend_rgba,
+        side_by_side_rgba: visualization.side_by_side_rgba,
+    })
 }
 
 fn mode_label(mode: AutoGazeInferenceMode) -> String {

@@ -6,7 +6,8 @@
 [![docs.rs](https://docs.rs/burn_autogaze/badge.svg)](https://docs.rs/burn_autogaze)
 
 burn-native [nvidia autogaze](https://huggingface.co/nvidia/AutoGaze) model
-inference, fixation traces, white-mask visualization, and bevy/webgpu demos.
+inference, fixation traces, crisp token-cell mask visualization, and
+bevy/webgpu demos.
 
 | input | mask | output |
 |---|---|---|
@@ -17,8 +18,8 @@ inference, fixation traces, white-mask visualization, and bevy/webgpu demos.
 - lowercase, small, practical burn crate for gaze inference
 - loads hugging face `config.json` + `model.safetensors`
 - default fast path downsamples frames to the model's `224` input
-- optional tiled full-resolution mode remaps local 224px tile predictions back
-  into source-frame coordinates
+- optional tiled full-resolution mode remaps local 224px tile predictions and
+  token-cell extents back into source-frame coordinates
 - runs on ndarray, webgpu, cuda, and wasm/webgpu
 - ships a plain wasm-bindgen api plus a symmetric native/wasm bevy viewer
 
@@ -85,9 +86,10 @@ npm run build:wasm
 npm run serve
 ```
 
-`WasmAutoGaze` loads `config.json` plus `model.safetensors` bytes, accepts RGBA
-video clips, and returns white mask, alpha-blended, and `input | mask | blend`
-RGBA buffers. this is the low-level wasm-bindgen api demo.
+`WasmAutoGaze.create(configJson, safetensors)` loads `config.json` plus
+`model.safetensors` bytes through async WebGPU setup, accepts RGBA video clips,
+and returns white binary token-cell mask, alpha-blended, and `input | mask |
+blend` RGBA buffers. this is the low-level wasm-bindgen api demo.
 
 ## bevy
 

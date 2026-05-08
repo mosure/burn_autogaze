@@ -98,7 +98,7 @@ button:disabled {
   max-width: 100%;
   max-height: calc(100vh - 122px);
   display: block;
-  image-rendering: auto;
+  image-rendering: pixelated;
 }
 
 .labels {

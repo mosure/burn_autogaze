@@ -15,6 +15,7 @@ use bevy::{
         RegisterDiagnostic,
     },
     ecs::world::CommandQueue,
+    image::ImageSampler,
     prelude::*,
     render::{
         RenderPlugin,
@@ -30,7 +31,9 @@ use burn::{
 };
 #[cfg(target_arch = "wasm32")]
 use burn_autogaze::{AutoGazeConfig, AutoGazeLoadOptions, NativeAutoGazeModel};
-use burn_autogaze::{AutoGazeInferenceMode, AutoGazePipeline, FixationPoint};
+use burn_autogaze::{
+    AutoGazeInferenceMode, AutoGazePipeline, FixationPoint, visualize_fixations_rgba,
+};
 use image::RgbaImage;
 
 pub mod platform;
@@ -169,7 +172,7 @@ impl BevyBurnAutoGazeConfig {
                 self.frames_per_clip = parse_usize_option(&key, value)?;
                 Ok(())
             }
-            "mask-radius-scale" => {
+            "mask-cell-scale" | "mask-radius-scale" => {
                 self.mask_radius_scale = parse_f32_option(&key, value)?;
                 Ok(())
             }
@@ -568,29 +571,21 @@ fn process_frames(
 
         let mut queue = CommandQueue::default();
         queue.push(move |world: &mut World| {
+            let width = visualization.width;
+            let height = visualization.height;
             if let Ok(entity) = world.get_entity_mut(image_entity)
                 && let Some(image_node) = entity.get::<ImageNode>()
             {
                 let handle = image_node.image.clone();
                 if let Some(mut images) = world.get_resource_mut::<Assets<Image>>() {
-                    let image = Image::new(
-                        Extent3d {
-                            width: visualization.width,
-                            height: visualization.height,
-                            depth_or_array_layers: 1,
-                        },
-                        TextureDimension::D2,
-                        visualization.rgba,
-                        TextureFormat::Rgba8UnormSrgb,
-                        RenderAssetUsages::default(),
-                    );
+                    let image = visualization_image(visualization);
                     let _ = images.insert(handle.id(), image);
                 }
             }
 
             if let Some(mut texture) = world.get_resource_mut::<AutoGazeTexture>() {
-                texture.width = visualization.width;
-                texture.height = visualization.height;
+                texture.width = width;
+                texture.height = height;
             }
 
             if let Ok(mut tracker) = world.get_entity_mut(task_entity) {
@@ -808,75 +803,23 @@ fn visualize_points(
     width: usize,
     height: usize,
     points: &[FixationPoint],
-    radius_scale: f32,
+    cell_scale: f32,
     blend_alpha: f32,
 ) -> Visualization {
-    let pixels = width * height;
-    let mut alpha = vec![0.0f32; pixels];
-    let frame_extent = width.max(height) as f32;
-
-    for point in points {
-        if point.confidence <= 0.0 {
-            continue;
-        }
-        let cx = point.x * width.saturating_sub(1) as f32;
-        let cy = point.y * height.saturating_sub(1) as f32;
-        let radius = (point.scale * frame_extent * radius_scale).max(12.0);
-        let sigma = (radius * 0.45).max(1.0);
-        let search = (radius * 2.0).ceil() as isize;
-        let min_x = ((cx as isize) - search).max(0) as usize;
-        let max_x = ((cx as isize) + search).min(width.saturating_sub(1) as isize) as usize;
-        let min_y = ((cy as isize) - search).max(0) as usize;
-        let max_y = ((cy as isize) + search).min(height.saturating_sub(1) as isize) as usize;
-        let denom = 2.0 * sigma * sigma;
-
-        for y in min_y..=max_y {
-            let dy = y as f32 - cy;
-            for x in min_x..=max_x {
-                let dx = x as f32 - cx;
-                let weight = (-(dx * dx + dy * dy) / denom).exp() * point.confidence;
-                let idx = y * width + x;
-                alpha[idx] = alpha[idx].max(weight.clamp(0.0, 1.0));
-            }
-        }
-    }
-
-    normalize_alpha(&mut alpha);
-
-    let input = rgba.as_raw();
-    let out_width = width * 3;
-    let mut out = vec![0u8; out_width * height * 4];
-
-    for y in 0..height {
-        for x in 0..width {
-            let pixel = y * width + x;
-            let src = pixel * 4;
-            let a = alpha[pixel].clamp(0.0, 1.0);
-            let mask = (a * 255.0).round() as u8;
-            let overlay = (a * blend_alpha).clamp(0.0, 1.0);
-            let mut blended = [0u8; 4];
-            for channel in 0..3 {
-                let base = input[src + channel] as f32;
-                blended[channel] = (base * (1.0 - overlay) + 255.0 * overlay).round() as u8;
-            }
-            blended[3] = input[src + 3];
-
-            write_pixel(&mut out, out_width, 0, x, y, &input[src..src + 4]);
-            write_pixel(&mut out, out_width, width, x, y, &[mask, mask, mask, 255]);
-            write_pixel(&mut out, out_width, width * 2, x, y, &blended);
-        }
-    }
-
+    let visualization = visualize_fixations_rgba(
+        rgba.as_raw(),
+        width,
+        height,
+        points,
+        cell_scale,
+        blend_alpha,
+    )
+    .expect("valid Bevy AutoGaze visualization input");
     Visualization {
-        width: out_width as u32,
-        height: height as u32,
-        rgba: out,
+        width: visualization.side_by_side_width as u32,
+        height: visualization.height as u32,
+        rgba: visualization.side_by_side_rgba,
     }
-}
-
-fn write_pixel(out: &mut [u8], out_width: usize, x_offset: usize, x: usize, y: usize, rgba: &[u8]) {
-    let dst = (y * out_width + x_offset + x) * 4;
-    out[dst..dst + 4].copy_from_slice(rgba);
 }
 
 fn apply_visualization_to_texture(
@@ -890,7 +833,16 @@ fn apply_visualization_to_texture(
         return;
     };
 
-    let image = Image::new(
+    let width = visualization.width;
+    let height = visualization.height;
+    let image = visualization_image(visualization);
+    let _ = images.insert(image_node.image.id(), image);
+    texture.width = width;
+    texture.height = height;
+}
+
+fn visualization_image(visualization: Visualization) -> Image {
+    let mut image = Image::new(
         Extent3d {
             width: visualization.width,
             height: visualization.height,
@@ -901,19 +853,8 @@ fn apply_visualization_to_texture(
         TextureFormat::Rgba8UnormSrgb,
         RenderAssetUsages::default(),
     );
-    let _ = images.insert(image_node.image.id(), image);
-    texture.width = visualization.width;
-    texture.height = visualization.height;
-}
-
-fn normalize_alpha(alpha: &mut [f32]) {
-    let max_alpha = alpha.iter().copied().fold(0.0, f32::max);
-    if max_alpha <= 0.0 {
-        return;
-    }
-    for value in alpha {
-        *value = (*value / max_alpha).clamp(0.0, 1.0);
-    }
+    image.sampler = ImageSampler::nearest();
+    image
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1084,7 +1025,7 @@ mod tests {
     fn applies_url_query_to_viewer_config() {
         let mut config = BevyBurnAutoGazeConfig::default();
         let errors = config.apply_query_string(
-            "?mode=full-res&top_k=2&frames-per-clip=3&show-fps=false&config-url=%2Fconfig.json&weights-url=%2Fmodel.safetensors&load-model=false&mask-radius-scale=2.5&blend-alpha=0.5",
+            "?mode=full-res&top_k=2&frames-per-clip=3&show-fps=false&config-url=%2Fconfig.json&weights-url=%2Fmodel.safetensors&load-model=false&mask-cell-scale=2.5&blend-alpha=0.5",
         );
 
         assert!(errors.is_empty(), "{errors:?}");
@@ -1097,5 +1038,34 @@ mod tests {
         assert!(!config.load_model);
         assert_eq!(config.mask_radius_scale, 2.5);
         assert_eq!(config.blend_alpha, 0.5);
+    }
+
+    #[test]
+    fn bevy_visualization_uses_crisp_cell_mask() {
+        let frame = RgbaImage::from_raw(
+            4,
+            4,
+            vec![
+                0, 0, 0, 255, 10, 0, 0, 255, 20, 0, 0, 255, 30, 0, 0, 255, 0, 10, 0, 255, 10, 10,
+                0, 255, 20, 10, 0, 255, 30, 10, 0, 255, 0, 20, 0, 255, 10, 20, 0, 255, 20, 20, 0,
+                255, 30, 20, 0, 255, 0, 30, 0, 255, 10, 30, 0, 255, 20, 30, 0, 255, 30, 30, 0, 255,
+            ],
+        )
+        .expect("frame");
+        let point = FixationPoint::with_extent(0.25, 0.25, 0.5, 0.5, 1.0);
+
+        let visualization = visualize_points(&frame, 4, 4, &[point], 1.0, 0.5);
+
+        assert_eq!(visualization.width, 12);
+        assert_eq!(visualization.height, 4);
+        for y in 0..4 {
+            for x in 0..4 {
+                let mask_src = (y * 12 + 4 + x) * 4;
+                let expected = if x < 2 && y < 2 { 255 } else { 0 };
+                assert_eq!(visualization.rgba[mask_src], expected, "mask {x},{y}");
+                assert_eq!(visualization.rgba[mask_src + 1], expected, "mask {x},{y}");
+                assert_eq!(visualization.rgba[mask_src + 2], expected, "mask {x},{y}");
+            }
+        }
     }
 }

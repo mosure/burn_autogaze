@@ -14,7 +14,7 @@ cargo run -p bevy_burn_autogaze --features native -- \
 Use `--image-path path/to/frame.png` to run from a static image instead of the
 native camera. `--mode tile-224` runs the tiled full-resolution path. Common
 viewer/inference knobs include `--top-k`, `--frames-per-clip`,
-`--max-gaze-tokens-each-frame`, `--mask-radius-scale`, `--blend-alpha`, and
+`--max-gaze-tokens-each-frame`, `--mask-cell-scale`, `--blend-alpha`, and
 `--show-fps`.
 
 ## Web
@@ -42,4 +42,5 @@ to drive the Bevy UI from an image without requesting a webcam. `load-model=fals
 keeps the viewer in preview mode for browser smoke tests.
 
 Use `config-url` and `weights-url` query parameters to point the wasm build at
-alternate model assets.
+alternate model assets. `mask-radius-scale` remains accepted as a compatibility
+alias for `mask-cell-scale`.

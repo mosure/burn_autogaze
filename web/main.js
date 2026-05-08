@@ -72,7 +72,7 @@ async function loadAutogazeModel() {
     });
 
     setStatus("loading model");
-    model = new WasmAutoGaze(configText, weights);
+    model = await WasmAutoGaze.create(configText, weights);
     applyModelOptions();
     setStatus(`model ready (${WasmAutoGaze.version()})`);
   } catch (error) {

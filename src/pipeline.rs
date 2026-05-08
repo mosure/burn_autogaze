@@ -452,12 +452,30 @@ fn remap_tile_point(
 ) -> FixationPoint {
     let source_width = layout.source_width.max(1) as f32;
     let source_height = layout.source_height.max(1) as f32;
-    let source_max = layout.source_width.max(layout.source_height).max(1) as f32;
-    let tile_max = tile.width.max(tile.height).max(1) as f32;
-    FixationPoint::new(
+    FixationPoint::with_extent(
         (tile.x as f32 + point.x * tile.width as f32) / source_width,
         (tile.y as f32 + point.y * tile.height as f32) / source_height,
-        point.scale * tile_max / source_max,
+        point.cell_width() * tile.width.max(1) as f32 / source_width,
+        point.cell_height() * tile.height.max(1) as f32 / source_height,
         point.confidence,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remap_tile_point_preserves_source_space_cell_extent() {
+        let point = FixationPoint::with_extent(0.5, 0.5, 1.0 / 14.0, 1.0 / 14.0, 1.0);
+        let tile = AutoGazeTile::new(224, 112, 224, 224);
+        let layout = AutoGazeTileLayout::tiled(1080, 1920, 224, 224);
+
+        let remapped = remap_tile_point(point, tile, &layout);
+
+        assert!((remapped.x - 336.0 / 1920.0).abs() < 1.0e-6);
+        assert!((remapped.y - 224.0 / 1080.0).abs() < 1.0e-6);
+        assert!((remapped.cell_width() - (224.0 / 14.0) / 1920.0).abs() < 1.0e-6);
+        assert!((remapped.cell_height() - (224.0 / 14.0) / 1080.0).abs() < 1.0e-6);
+    }
 }
