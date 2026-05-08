@@ -219,6 +219,12 @@ pub struct AutoGazeGenerateOutput {
 
 type GreedyTokenSelection = (Vec<Vec<i64>>, Vec<Vec<bool>>, Vec<Vec<f32>>);
 
+#[derive(Clone, Copy, Debug)]
+struct TaskLossStop {
+    requirement: Option<f32>,
+    is_first_token: bool,
+}
+
 #[derive(Debug)]
 pub struct AutoGazeCausalLmOutput<B: Backend> {
     pub logits: Tensor<B, 3>,
@@ -579,6 +585,7 @@ impl<B: Backend> AutoGazeGazingModel<B> {
         &self,
         video: Tensor<B, 5>,
         max_gaze_tokens_each_frame: usize,
+        task_loss_requirement: Option<f32>,
     ) -> AutoGazeGenerateOutput {
         let video = self.resize_video(video);
         let (video_embeds, _) = self.embed_video(video, false, None);
@@ -611,6 +618,7 @@ impl<B: Backend> AutoGazeGazingModel<B> {
             let mut frame_padded = vec![Vec::<bool>::new(); batch];
             let mut frame_confidences = vec![Vec::<f32>::new(); batch];
             let mut finished = vec![false; batch];
+            let mut is_first_token = true;
             let max_tokens = max_gaze_tokens_each_frame.max(1);
 
             while frame_tokens.iter().map(Vec::len).max().unwrap_or(0) < max_tokens
@@ -645,6 +653,10 @@ impl<B: Backend> AutoGazeGazingModel<B> {
                     &finished,
                     self.eos_token_id,
                     max_tokens,
+                    TaskLossStop {
+                        requirement: task_loss_requirement,
+                        is_first_token,
+                    },
                 );
 
                 let new_tokens = next_tokens.first().map(Vec::len).unwrap_or(0);
@@ -676,6 +688,7 @@ impl<B: Backend> AutoGazeGazingModel<B> {
                         }
                     }
                 }
+                is_first_token = false;
             }
 
             let frame_count = frame_tokens.first().map(Vec::len).unwrap_or(0);
@@ -848,15 +861,40 @@ impl<B: Backend> NativeAutoGazeModel<B> {
         max_gaze_tokens_each_frame: usize,
     ) -> AutoGazeGenerateOutput {
         self.gazing_model
-            .generate(video, max_gaze_tokens_each_frame)
+            .generate(video, max_gaze_tokens_each_frame, None)
+    }
+
+    pub fn generate_with_task_loss_requirement(
+        &self,
+        video: Tensor<B, 5>,
+        max_gaze_tokens_each_frame: usize,
+        task_loss_requirement: Option<f32>,
+    ) -> AutoGazeGenerateOutput {
+        self.gazing_model
+            .generate(video, max_gaze_tokens_each_frame, task_loss_requirement)
     }
 
     pub fn default_max_gaze_tokens_each_frame(&self) -> usize {
-        self.gazing_model.num_multi_token_pred.max(1)
+        self.config
+            .inference_gazing_ratio()
+            .map(|ratio| {
+                (ratio.clamp(0.0, 1.0) * self.config.num_vision_tokens_each_frame.max(1) as f32)
+                    .floor()
+                    .max(1.0) as usize
+            })
+            .unwrap_or_else(|| self.gazing_model.num_multi_token_pred.max(1))
+    }
+
+    pub fn default_task_loss_requirement(&self) -> Option<f32> {
+        self.config.inference_task_loss_requirement()
     }
 
     pub fn infer(&self, video: Tensor<B, 5>) -> AutoGazeGenerateOutput {
-        self.generate(video, self.default_max_gaze_tokens_each_frame())
+        self.generate_with_task_loss_requirement(
+            video,
+            self.default_max_gaze_tokens_each_frame(),
+            self.default_task_loss_requirement(),
+        )
     }
 
     pub fn trace_video(
@@ -865,7 +903,26 @@ impl<B: Backend> NativeAutoGazeModel<B> {
         k: usize,
         max_gaze_tokens_each_frame: usize,
     ) -> Vec<FrameFixationTrace> {
-        let generated = self.generate(video, max_gaze_tokens_each_frame.max(k.max(1)));
+        self.trace_video_with_task_loss_requirement(
+            video,
+            k,
+            max_gaze_tokens_each_frame,
+            self.default_task_loss_requirement(),
+        )
+    }
+
+    pub fn trace_video_with_task_loss_requirement(
+        &self,
+        video: Tensor<B, 5>,
+        k: usize,
+        max_gaze_tokens_each_frame: usize,
+        task_loss_requirement: Option<f32>,
+    ) -> Vec<FrameFixationTrace> {
+        let generated = self.generate_with_task_loss_requirement(
+            video,
+            max_gaze_tokens_each_frame.max(k.max(1)),
+            task_loss_requirement,
+        );
         generated_to_traces(&generated, &self.config, k)
     }
 
@@ -1079,17 +1136,22 @@ fn position_ids_from_attention_mask<B: Backend>(
 
 fn greedy_select_multi_tokens<B: Backend>(
     logits: Tensor<B, 3>,
-    _task_loss: Tensor<B, 2>,
+    task_loss: Tensor<B, 2>,
     prior_tokens: &[Vec<i64>],
     finished: &[bool],
     eos_token_id: i64,
     max_tokens: usize,
+    task_loss_stop: TaskLossStop,
 ) -> GreedyTokenSelection {
     let [batch, num_multi, vocab] = logits.shape().dims::<3>();
     let scores = logits
         .into_data()
         .to_vec::<f32>()
         .expect("convert logits to f32 vec");
+    let task_losses = task_loss
+        .into_data()
+        .to_vec::<f32>()
+        .expect("convert task loss predictions to f32 vec");
     let mut per_batch_tokens = vec![Vec::new(); batch];
     let mut per_batch_valid = vec![Vec::new(); batch];
     let mut per_batch_confidences = vec![Vec::new(); batch];
@@ -1123,9 +1185,20 @@ fn greedy_select_multi_tokens<B: Backend>(
 
             if let Some(token) = best_index {
                 disallowed.push(token);
-                per_batch_tokens[batch_idx].push(token);
-                per_batch_valid[batch_idx].push(true);
-                per_batch_confidences[batch_idx].push(if exp_sum > 0.0 {
+                let meets_task_loss_requirement =
+                    task_loss_stop.requirement.is_some_and(|threshold| {
+                        !(task_loss_stop.is_first_token && multi_idx == 0)
+                            && task_losses[batch_idx * num_multi + multi_idx] <= threshold
+                    });
+                per_batch_tokens[batch_idx].push(if meets_task_loss_requirement {
+                    eos_token_id
+                } else {
+                    token
+                });
+                per_batch_valid[batch_idx].push(!meets_task_loss_requirement);
+                per_batch_confidences[batch_idx].push(if meets_task_loss_requirement {
+                    0.0
+                } else if exp_sum > 0.0 {
                     best_score.exp() / exp_sum
                 } else {
                     1.0
@@ -1346,6 +1419,42 @@ mod tests {
         assert!((fine.cell_width() - 1.0 / 14.0).abs() < 1.0e-6);
         assert!((fine.cell_height() - 1.0 / 14.0).abs() < 1.0e-6);
         assert_eq!(fine.cell_grid(), Some(14));
+    }
+
+    #[cfg(feature = "ndarray")]
+    #[test]
+    fn greedy_selection_applies_task_loss_requirement_after_first_token() {
+        type B = burn::backend::NdArray<f32>;
+        let device = Default::default();
+        let logits = Tensor::<B, 3>::from_data(
+            TensorData::new(
+                vec![
+                    10.0, 1.0, 0.0, -1.0, //
+                    0.0, 9.0, 1.0, -1.0,
+                ],
+                [1, 2, 4],
+            ),
+            &device,
+        );
+        let task_loss = Tensor::<B, 2>::from_data(TensorData::new(vec![0.1, 0.2], [1, 2]), &device);
+
+        let (tokens, valid, confidences) = greedy_select_multi_tokens(
+            logits,
+            task_loss,
+            &[Vec::new()],
+            &[false],
+            3,
+            2,
+            TaskLossStop {
+                requirement: Some(0.5),
+                is_first_token: true,
+            },
+        );
+
+        assert_eq!(tokens, vec![vec![0, 3]]);
+        assert_eq!(valid, vec![vec![true, false]]);
+        assert!(confidences[0][0] > 0.0);
+        assert_eq!(confidences[0][1], 0.0);
     }
 
     #[test]

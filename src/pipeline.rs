@@ -4,6 +4,7 @@ use crate::{
 };
 use anyhow::{Result, ensure};
 use burn::tensor::backend::Backend;
+use burn::tensor::ops::PadMode;
 use burn::tensor::{Tensor, TensorData};
 use std::path::Path;
 
@@ -154,17 +155,12 @@ impl AutoGazeTileLayout {
         let source_width = source_width.max(1);
         let tile_size = tile_size.max(1);
         let stride = stride.max(1).min(tile_size);
-        let y_origins = tile_origins(source_height, tile_size, stride);
-        let x_origins = tile_origins(source_width, tile_size, stride);
+        let y_origins = tile_origins(source_height, stride);
+        let x_origins = tile_origins(source_width, stride);
         let mut tiles = Vec::with_capacity(y_origins.len() * x_origins.len());
         for y in y_origins {
             for &x in x_origins.iter() {
-                tiles.push(AutoGazeTile::new(
-                    x,
-                    y,
-                    tile_size.min(source_width - x),
-                    tile_size.min(source_height - y),
-                ));
+                tiles.push(AutoGazeTile::new(x, y, tile_size, tile_size));
             }
         }
         Self {
@@ -233,14 +229,17 @@ pub fn rgba_clip_to_tensor<B: Backend>(
 pub struct AutoGazePipeline<B: Backend> {
     model: NativeAutoGazeModel<B>,
     max_gaze_tokens_each_frame: usize,
+    task_loss_requirement: Option<f32>,
 }
 
 impl<B: Backend> AutoGazePipeline<B> {
     pub fn new(model: NativeAutoGazeModel<B>) -> Self {
         let max_gaze_tokens_each_frame = model.default_max_gaze_tokens_each_frame();
+        let task_loss_requirement = model.default_task_loss_requirement();
         Self {
             model,
             max_gaze_tokens_each_frame,
+            task_loss_requirement,
         }
     }
 
@@ -270,13 +269,26 @@ impl<B: Backend> AutoGazePipeline<B> {
         self.max_gaze_tokens_each_frame
     }
 
+    pub const fn task_loss_requirement(&self) -> Option<f32> {
+        self.task_loss_requirement
+    }
+
     pub fn with_max_gaze_tokens_each_frame(mut self, max_gaze_tokens_each_frame: usize) -> Self {
         self.max_gaze_tokens_each_frame = max_gaze_tokens_each_frame.max(1);
         self
     }
 
+    pub fn with_task_loss_requirement(mut self, task_loss_requirement: Option<f32>) -> Self {
+        self.task_loss_requirement = task_loss_requirement.map(|value| value.max(0.0));
+        self
+    }
+
     pub fn set_max_gaze_tokens_each_frame(&mut self, max_gaze_tokens_each_frame: usize) {
         self.max_gaze_tokens_each_frame = max_gaze_tokens_each_frame.max(1);
+    }
+
+    pub fn set_task_loss_requirement(&mut self, task_loss_requirement: Option<f32>) {
+        self.task_loss_requirement = task_loss_requirement.map(|value| value.max(0.0));
     }
 
     pub const fn model(&self) -> &NativeAutoGazeModel<B> {
@@ -342,7 +354,11 @@ impl<B: Backend> AutoGazePipeline<B> {
     }
 
     pub fn generate(&self, video: Tensor<B, 5>) -> AutoGazeGenerateOutput {
-        self.model.generate(video, self.max_gaze_tokens_each_frame)
+        self.model.generate_with_task_loss_requirement(
+            video,
+            self.max_gaze_tokens_each_frame,
+            self.task_loss_requirement,
+        )
     }
 
     pub fn generate_with_limit(
@@ -350,8 +366,11 @@ impl<B: Backend> AutoGazePipeline<B> {
         video: Tensor<B, 5>,
         max_gaze_tokens_each_frame: usize,
     ) -> AutoGazeGenerateOutput {
-        self.model
-            .generate(video, max_gaze_tokens_each_frame.max(1))
+        self.model.generate_with_task_loss_requirement(
+            video,
+            max_gaze_tokens_each_frame.max(1),
+            self.task_loss_requirement,
+        )
     }
 
     pub fn infer(&self, video: Tensor<B, 5>, k: usize) -> Vec<FrameFixationTrace> {
@@ -403,7 +422,7 @@ impl<B: Backend> AutoGazePipeline<B> {
                                     .iter()
                                     .copied()
                                     .filter(|point| point.confidence > 0.0)
-                                    .map(|point| remap_tile_point(point, tile, &layout)),
+                                    .filter_map(|point| remap_tile_point(point, tile, &layout)),
                             );
                         }
                     }
@@ -430,8 +449,12 @@ impl<B: Backend> AutoGazePipeline<B> {
     }
 
     fn trace_video_resize(&self, video: Tensor<B, 5>, k: usize) -> Vec<FrameFixationTrace> {
-        self.model
-            .trace_video(video, k, self.max_gaze_tokens_each_frame.max(k.max(1)))
+        self.model.trace_video_with_task_loss_requirement(
+            video,
+            k,
+            self.max_gaze_tokens_each_frame.max(k.max(1)),
+            self.task_loss_requirement,
+        )
     }
 
     pub fn trace_clip_from_frames(
@@ -521,47 +544,59 @@ impl<B: Backend> AutoGazePipeline<B> {
     }
 }
 
-fn tile_origins(length: usize, tile_size: usize, stride: usize) -> Vec<usize> {
+fn tile_origins(length: usize, stride: usize) -> Vec<usize> {
     let length = length.max(1);
-    let tile_size = tile_size.max(1);
     let stride = stride.max(1);
-    if length <= tile_size {
-        return vec![0];
-    }
-
     let mut origins = Vec::new();
-    let last = length - tile_size;
     let mut origin = 0usize;
-    while origin < last {
+    while origin < length {
         origins.push(origin);
-        origin = (origin + stride).min(last);
+        origin = origin.saturating_add(stride);
     }
-    origins.push(last);
-    origins.dedup();
     origins
 }
 
 fn crop_video_tile<B: Backend>(video: Tensor<B, 5>, tile: AutoGazeTile) -> Tensor<B, 5> {
-    video
-        .slice_dim(3, tile.y..(tile.y + tile.height))
-        .slice_dim(4, tile.x..(tile.x + tile.width))
+    let [_batch, _time, _channels, source_height, source_width] = video.shape().dims::<5>();
+    let y_end = tile.y.saturating_add(tile.height).min(source_height);
+    let x_end = tile.x.saturating_add(tile.width).min(source_width);
+    let crop_height = y_end.saturating_sub(tile.y).max(1);
+    let crop_width = x_end.saturating_sub(tile.x).max(1);
+    let crop = video
+        .slice_dim(3, tile.y..(tile.y + crop_height))
+        .slice_dim(4, tile.x..(tile.x + crop_width));
+    let pad_height = tile.height.saturating_sub(crop_height);
+    let pad_width = tile.width.saturating_sub(crop_width);
+    if pad_height == 0 && pad_width == 0 {
+        crop
+    } else {
+        crop.pad(
+            [(0, 0), (0, 0), (0, 0), (0, pad_height), (0, pad_width)],
+            PadMode::Constant(0.0),
+        )
+    }
 }
 
 fn remap_tile_point(
     point: FixationPoint,
     tile: AutoGazeTile,
     layout: &AutoGazeTileLayout,
-) -> FixationPoint {
+) -> Option<FixationPoint> {
     let source_width = layout.source_width.max(1) as f32;
     let source_height = layout.source_height.max(1) as f32;
-    FixationPoint::with_grid_extent(
-        (tile.x as f32 + point.x * tile.width as f32) / source_width,
-        (tile.y as f32 + point.y * tile.height as f32) / source_height,
+    let center_x = tile.x as f32 + point.x * tile.width as f32;
+    let center_y = tile.y as f32 + point.y * tile.height as f32;
+    if center_x >= source_width || center_y >= source_height {
+        return None;
+    }
+    Some(FixationPoint::with_grid_extent(
+        center_x / source_width,
+        center_y / source_height,
         point.cell_width() * tile.width.max(1) as f32 / source_width,
         point.cell_height() * tile.height.max(1) as f32 / source_height,
         point.confidence,
         point.cell_grid().unwrap_or(0),
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -597,13 +632,47 @@ mod tests {
         let tile = AutoGazeTile::new(224, 112, 224, 224);
         let layout = AutoGazeTileLayout::tiled(1080, 1920, 224, 224);
 
-        let remapped = remap_tile_point(point, tile, &layout);
+        let remapped = remap_tile_point(point, tile, &layout).expect("valid tile point");
 
         assert!((remapped.x - 336.0 / 1920.0).abs() < 1.0e-6);
         assert!((remapped.y - 224.0 / 1080.0).abs() < 1.0e-6);
         assert!((remapped.cell_width() - (224.0 / 14.0) / 1920.0).abs() < 1.0e-6);
         assert!((remapped.cell_height() - (224.0 / 14.0) / 1080.0).abs() < 1.0e-6);
         assert_eq!(remapped.cell_grid(), Some(14));
+    }
+
+    #[test]
+    fn tiled_layout_pads_edges_instead_of_overlapping_them() {
+        let layout = AutoGazeTileLayout::tiled(1080, 1920, 224, 224);
+
+        assert_eq!(layout.tile_count(), 45);
+        assert_eq!(layout.tiles[8], AutoGazeTile::new(1792, 0, 224, 224));
+        assert_eq!(layout.tiles[44], AutoGazeTile::new(1792, 896, 224, 224));
+    }
+
+    #[cfg(feature = "ndarray")]
+    #[test]
+    fn crop_video_tile_pads_edge_chunks_to_model_tile_size() {
+        type B = burn::backend::NdArray<f32>;
+        let device = Default::default();
+        let video = Tensor::<B, 5>::from_data(
+            TensorData::new(vec![1.0, 2.0, 3.0, 4.0], [1, 1, 1, 2, 2]),
+            &device,
+        );
+
+        let crop = crop_video_tile(video, AutoGazeTile::new(1, 1, 2, 2));
+        let values = crop.into_data().to_vec::<f32>().expect("f32 tensor");
+
+        assert_eq!(values, vec![4.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn remap_tile_point_discards_padded_edge_cells() {
+        let layout = AutoGazeTileLayout::tiled(3, 3, 2, 2);
+        let tile = AutoGazeTile::new(2, 2, 2, 2);
+        let padded = FixationPoint::with_grid_extent(0.75, 0.75, 0.5, 0.5, 1.0, 2);
+
+        assert!(remap_tile_point(padded, tile, &layout).is_none());
     }
 
     #[test]

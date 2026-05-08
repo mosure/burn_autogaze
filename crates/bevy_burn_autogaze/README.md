@@ -15,12 +15,13 @@ Use `--image-path path/to/frame.png` to run from a static image instead of the
 native camera. `--mode tile-224` runs the tiled full-resolution path. Common
 viewer/inference knobs include `--top-k`, `--frames-per-clip`,
 `--max-gaze-tokens-each-frame`, `--inference-width`, `--inference-height`,
+`--task-loss-requirement`, `--disable-task-loss-requirement`,
 `--mask-cell-scale`, `--blend-alpha`, and `--show-fps`. `--show-gaze-ratio`
 toggles the text overlay for per-frame and EMA output update ratio.
 `--show-psnr` toggles PSNR in dB between the current input and rendered output;
 the pixel comparison is skipped when this overlay is disabled. In `tile-224`
-mode, `--top-k` is a per-tile budget, so the frame budget is
-`top-k * tile-count`.
+mode, source frames are padded to a non-overlapping 224px chunk grid and
+`--top-k` is a per-tile budget, so the frame budget is `top-k * tile-count`.
 Use `--load-model=false` to verify camera/preview rendering without waiting for
 model load or inference.
 
@@ -53,7 +54,7 @@ UI is rendered by Bevy into the `#bevy` canvas, matching the native path. Pass
 the same viewer/inference knobs as query parameters:
 
 ```text
-http://localhost:8080/?mode=tile-224&visualization-mode=interframe&keyframe-duration=30&top-k=2&frames-per-clip=2&inference-width=1920&inference-height=1080&show-fps=true&show-gaze-ratio=true&show-psnr=true
+http://localhost:8080/?mode=tile-224&visualization-mode=interframe&keyframe-duration=30&top-k=2&frames-per-clip=2&inference-width=1920&inference-height=1080&task-loss-requirement=0.7&show-fps=true&show-gaze-ratio=true&show-psnr=true
 ```
 
 Use `?source=static` for a generated static frame, or `?image-url=./frame.png`

@@ -24,7 +24,7 @@ pub use teacher::AutoGazeTeacher;
 pub use trace::{FixationBounds, FixationPoint, FixationSet, FrameFixationTrace};
 pub use visualization::{
     AutoGazeVisualization, AutoGazeVisualizationMode, AutoGazeVisualizationState,
-    fixation_alpha_mask, visualize_fixations_rgba,
+    fixation_alpha_mask, fixation_scale_mask_rgba, visualize_fixations_rgba,
 };
 #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
 pub use wasm::*;

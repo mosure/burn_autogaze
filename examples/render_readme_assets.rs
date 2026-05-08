@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail, ensure};
 use burn::tensor::backend::Backend;
 use burn_autogaze::{
     AutoGazeInferenceMode, AutoGazePipeline, AutoGazeRgbaClipShape, AutoGazeTileLayout,
-    AutoGazeVisualizationMode, AutoGazeVisualizationState, FixationPoint,
+    AutoGazeVisualizationMode, AutoGazeVisualizationState, FixationPoint, fixation_scale_mask_rgba,
 };
 use serde::Serialize;
 use std::{
@@ -65,7 +65,8 @@ struct Args {
     frames: usize,
     clip_len: usize,
     top_k: usize,
-    max_gaze_tokens_each_frame: usize,
+    max_gaze_tokens_each_frame: Option<usize>,
+    task_loss_requirement: Option<Option<f32>>,
     tile_size: usize,
     stride: usize,
     mask_cell_scale: f32,
@@ -86,8 +87,9 @@ impl Default for Args {
             fps: 8,
             frames: 16,
             clip_len: 2,
-            top_k: 16,
-            max_gaze_tokens_each_frame: 16,
+            top_k: 4,
+            max_gaze_tokens_each_frame: None,
+            task_loss_requirement: None,
             tile_size: 224,
             stride: 224,
             mask_cell_scale: 1.0,
@@ -124,7 +126,10 @@ impl Args {
                 "--clip-len" | "--frames-per-clip" => args.clip_len = parse_usize(&key, &value)?,
                 "--top-k" => args.top_k = parse_usize(&key, &value)?,
                 "--max-gaze-tokens-each-frame" => {
-                    args.max_gaze_tokens_each_frame = parse_usize(&key, &value)?;
+                    args.max_gaze_tokens_each_frame = Some(parse_usize(&key, &value)?);
+                }
+                "--task-loss-requirement" | "--task-loss" => {
+                    args.task_loss_requirement = Some(parse_optional_f32(&key, &value)?);
                 }
                 "--tile-size" => args.tile_size = parse_usize(&key, &value)?,
                 "--stride" => args.stride = parse_usize(&key, &value)?,
@@ -146,6 +151,18 @@ impl Args {
         ensure!(args.frames > 0, "frames must be nonzero");
         ensure!(args.clip_len > 0, "clip length must be nonzero");
         ensure!(args.top_k > 0, "top-k must be nonzero");
+        if let Some(max_gaze_tokens_each_frame) = args.max_gaze_tokens_each_frame {
+            ensure!(
+                max_gaze_tokens_each_frame > 0,
+                "max-gaze-tokens-each-frame must be nonzero"
+            );
+        }
+        ensure!(args.tile_size > 0, "tile size must be nonzero");
+        ensure!(args.stride > 0, "stride must be nonzero");
+        ensure!(
+            args.keyframe_duration > 0,
+            "keyframe duration must be nonzero"
+        );
         Ok(args)
     }
 }
@@ -166,6 +183,7 @@ struct RenderMetrics {
     clip_len: usize,
     top_k: usize,
     max_gaze_tokens_each_frame: usize,
+    task_loss_requirement: Option<f32>,
     tile_count: usize,
     fixation_budget_each_frame: usize,
     scales: String,
@@ -213,7 +231,12 @@ where
     let mode = AutoGazeInferenceMode::tiled_full_resolution(args.tile_size, args.stride);
     let mut pipeline = AutoGazePipeline::<B>::from_hf_dir(&args.model_dir, &device)
         .with_context(|| format!("load AutoGaze model from {}", args.model_dir.display()))?;
-    pipeline.set_max_gaze_tokens_each_frame(args.max_gaze_tokens_each_frame);
+    if let Some(max_gaze_tokens_each_frame) = args.max_gaze_tokens_each_frame {
+        pipeline.set_max_gaze_tokens_each_frame(max_gaze_tokens_each_frame);
+    }
+    if let Some(task_loss_requirement) = args.task_loss_requirement {
+        pipeline.set_task_loss_requirement(task_loss_requirement);
+    }
     let config = pipeline.model().config.clone();
 
     let input_rgba = decode_source_video(&args)?;
@@ -259,12 +282,11 @@ where
             args.mask_cell_scale,
             args.blend_alpha,
         )?;
-        let scale_mask = scale_colored_mask_rgba(
+        let scale_mask = fixation_scale_mask_rgba(
             args.inference_width,
             args.inference_height,
             &points,
             args.mask_cell_scale,
-            args.tile_size,
         );
         stats.record_ratios(visualization.mask_ratio(), visualization.update_ratio());
         mask_rgba.extend_from_slice(&scale_mask);
@@ -294,9 +316,19 @@ where
     let input_gif = args.output_dir.join("autogaze_birds_input.gif");
     let mask_gif = args.output_dir.join("autogaze_birds_mask.gif");
     let output_gif = args.output_dir.join("autogaze_birds_output.gif");
-    encode_gif(&input_raw_path, &input_gif, &args, ScaleFilter::Lanczos)?;
-    encode_gif(&mask_raw_path, &mask_gif, &args, ScaleFilter::Nearest)?;
-    encode_gif(&output_raw_path, &output_gif, &args, ScaleFilter::Lanczos)?;
+    encode_gif(
+        &input_raw_path,
+        &input_gif,
+        &args,
+        GifScale::LanczosDithered,
+    )?;
+    encode_gif(&mask_raw_path, &mask_gif, &args, GifScale::NearestExact)?;
+    encode_gif(
+        &output_raw_path,
+        &output_gif,
+        &args,
+        GifScale::LanczosDithered,
+    )?;
 
     let output_files = BTreeMap::from([
         ("input", display_path(&input_gif)),
@@ -317,7 +349,8 @@ where
         frames: args.frames,
         clip_len: args.clip_len,
         top_k: args.top_k,
-        max_gaze_tokens_each_frame: args.max_gaze_tokens_each_frame,
+        max_gaze_tokens_each_frame: pipeline.max_gaze_tokens_each_frame(),
+        task_loss_requirement: pipeline.task_loss_requirement(),
         tile_count: AutoGazeTileLayout::tiled(
             args.inference_height,
             args.inference_width,
@@ -412,32 +445,39 @@ fn decode_source_video(args: &Args) -> Result<Vec<u8>> {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum ScaleFilter {
-    Lanczos,
-    Nearest,
+enum GifScale {
+    LanczosDithered,
+    NearestExact,
 }
 
-impl ScaleFilter {
+impl GifScale {
     const fn as_str(self) -> &'static str {
         match self {
-            Self::Lanczos => "lanczos",
-            Self::Nearest => "neighbor",
+            Self::LanczosDithered => "lanczos",
+            Self::NearestExact => "neighbor",
+        }
+    }
+
+    const fn dither(self) -> &'static str {
+        match self {
+            Self::LanczosDithered => "bayer:bayer_scale=3",
+            Self::NearestExact => "none",
         }
     }
 }
 
-fn encode_gif(
-    raw_path: &Path,
-    gif_path: &Path,
-    args: &Args,
-    scale_filter: ScaleFilter,
-) -> Result<()> {
+fn encode_gif(raw_path: &Path, gif_path: &Path, args: &Args, scale: GifScale) -> Result<()> {
+    if matches!(scale, GifScale::NearestExact) {
+        return encode_nearest_exact_gif(raw_path, gif_path, args);
+    }
+
     let size = format!("{}x{}", args.inference_width, args.inference_height);
     let filter = format!(
-        "scale={}x{}:flags={},split[s0][s1];[s0]palettegen=max_colors=128:reserve_transparent=0[p];[s1][p]paletteuse=dither=bayer:bayer_scale=3",
+        "scale={}x{}:flags={},split[s0][s1];[s0]palettegen=max_colors=128:reserve_transparent=0[p];[s1][p]paletteuse=dither={}",
         args.gif_width,
         args.gif_height,
-        scale_filter.as_str()
+        scale.as_str(),
+        scale.dither()
     );
     let status = Command::new("ffmpeg")
         .args([
@@ -469,6 +509,103 @@ fn encode_gif(
         gif_path.display()
     );
     Ok(())
+}
+
+fn encode_nearest_exact_gif(raw_path: &Path, gif_path: &Path, args: &Args) -> Result<()> {
+    ensure!(
+        args.gif_width <= u16::MAX as usize && args.gif_height <= u16::MAX as usize,
+        "GIF dimensions exceed u16 limits"
+    );
+    let raw = fs::read(raw_path).with_context(|| format!("read {}", raw_path.display()))?;
+    let source_frame_bytes = args.inference_width * args.inference_height * 4;
+    ensure!(
+        raw.len() == source_frame_bytes * args.frames,
+        "expected {} mask bytes, got {}",
+        source_frame_bytes * args.frames,
+        raw.len()
+    );
+
+    let mut file =
+        fs::File::create(gif_path).with_context(|| format!("create {}", gif_path.display()))?;
+    let mut encoder = gif::Encoder::new(
+        &mut file,
+        args.gif_width as u16,
+        args.gif_height as u16,
+        &[],
+    )
+    .with_context(|| format!("create GIF encoder for {}", gif_path.display()))?;
+    encoder
+        .set_repeat(gif::Repeat::Infinite)
+        .with_context(|| format!("set GIF repeat for {}", gif_path.display()))?;
+    let delay = ((100.0 / args.fps as f32).round() as u16).max(1);
+
+    for frame_idx in 0..args.frames {
+        let source = &raw[frame_idx * source_frame_bytes..(frame_idx + 1) * source_frame_bytes];
+        let mut pixels = Vec::with_capacity(args.gif_width * args.gif_height);
+        for y in 0..args.gif_height {
+            let source_y = y * args.inference_height / args.gif_height;
+            for x in 0..args.gif_width {
+                let source_x = x * args.inference_width / args.gif_width;
+                let offset = (source_y * args.inference_width + source_x) * 4;
+                pixels.push(mask_palette_index([
+                    source[offset],
+                    source[offset + 1],
+                    source[offset + 2],
+                ]));
+            }
+        }
+        let mut frame = gif::Frame::from_palette_pixels(
+            args.gif_width as u16,
+            args.gif_height as u16,
+            pixels,
+            mask_gif_palette().to_vec(),
+            None,
+        );
+        frame.delay = delay;
+        encoder
+            .write_frame(&frame)
+            .with_context(|| format!("write GIF frame {frame_idx} to {}", gif_path.display()))?;
+    }
+    Ok(())
+}
+
+fn mask_gif_palette() -> &'static [u8] {
+    &[
+        0, 0, 0, //
+        255, 180, 0, //
+        60, 220, 120, //
+        0, 185, 255, //
+        230, 110, 255, //
+    ]
+}
+
+fn mask_palette_index(rgb: [u8; 3]) -> u8 {
+    match rgb {
+        [0, 0, 0] => 0,
+        [255, 180, 0] => 1,
+        [60, 220, 120] => 2,
+        [0, 185, 255] => 3,
+        [230, 110, 255] => 4,
+        _ => nearest_mask_palette_index(rgb),
+    }
+}
+
+fn nearest_mask_palette_index(rgb: [u8; 3]) -> u8 {
+    mask_gif_palette()
+        .chunks_exact(3)
+        .enumerate()
+        .min_by_key(|(_, color)| {
+            color
+                .iter()
+                .zip(rgb)
+                .map(|(left, right)| {
+                    let diff = *left as i32 - right as i32;
+                    diff * diff
+                })
+                .sum::<i32>()
+        })
+        .map(|(index, _)| index as u8)
+        .unwrap_or(0)
 }
 
 fn clip_for_frame(frames: &[u8], frame_idx: usize, clip_len: usize, frame_bytes: usize) -> Vec<u8> {
@@ -504,59 +641,6 @@ fn record_points(points: &[FixationPoint], stats: &mut RatioStats, args: &Args) 
             .cell_grid_histogram
             .entry(format!("{grid}x{grid}"))
             .or_default() += 1;
-    }
-}
-
-fn scale_colored_mask_rgba(
-    width: usize,
-    height: usize,
-    points: &[FixationPoint],
-    cell_scale: f32,
-    tile_size: usize,
-) -> Vec<u8> {
-    let mut out = vec![0u8; width * height * 4];
-    for pixel in out.chunks_exact_mut(4) {
-        pixel[3] = 255;
-    }
-
-    let mut ordered = points
-        .iter()
-        .copied()
-        .filter(|point| point.confidence > 0.0)
-        .collect::<Vec<_>>();
-    ordered.sort_by(|left, right| {
-        right
-            .cell_width()
-            .total_cmp(&left.cell_width())
-            .then_with(|| right.cell_height().total_cmp(&left.cell_height()))
-    });
-
-    for point in ordered {
-        let color = color_for_point(point, width, height, tile_size);
-        let alpha = (0.45 + 0.40 * point.confidence).clamp(0.0, 0.88);
-        let bounds = point.scaled_bounds(cell_scale);
-        let (x0, x1) = pixel_range(bounds.x_min, bounds.x_max, width);
-        let (y0, y1) = pixel_range(bounds.y_min, bounds.y_max, height);
-        for y in y0..y1 {
-            for x in x0..x1 {
-                let offset = (y * width + x) * 4;
-                for channel in 0..3 {
-                    let base = out[offset + channel] as f32;
-                    out[offset + channel] =
-                        (base * (1.0 - alpha) + color[channel] as f32 * alpha).round() as u8;
-                }
-            }
-        }
-    }
-    out
-}
-
-fn color_for_point(point: FixationPoint, width: usize, height: usize, tile_size: usize) -> [u8; 3] {
-    match point_grid(point, width, height, tile_size) {
-        0..=2 => [255, 180, 0],
-        3..=4 => [60, 220, 120],
-        5..=7 => [0, 185, 255],
-        _ => [230, 110, 255],
     }
 }
 
@@ -597,18 +681,6 @@ fn nearest_grid(value: f32) -> usize {
         .unwrap_or(14)
 }
 
-fn pixel_range(min: f32, max: f32, extent: usize) -> (usize, usize) {
-    let extent_f = extent as f32;
-    let mut start = (min.clamp(0.0, 1.0) * extent_f).floor() as usize;
-    let mut end = (max.clamp(0.0, 1.0) * extent_f).ceil() as usize;
-    start = start.min(extent.saturating_sub(1));
-    end = end.min(extent);
-    if end <= start {
-        end = (start + 1).min(extent);
-    }
-    (start, end)
-}
-
 fn average(values: &[f64]) -> f64 {
     if values.is_empty() {
         0.0
@@ -627,6 +699,13 @@ fn parse_f32(key: &str, value: &str) -> Result<f32> {
     value
         .parse()
         .with_context(|| format!("parse {key} value `{value}` as f32"))
+}
+
+fn parse_optional_f32(key: &str, value: &str) -> Result<Option<f32>> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "none" | "off" | "false" => Ok(None),
+        _ => parse_f32(key, value).map(Some),
+    }
 }
 
 fn display_path(path: &Path) -> String {

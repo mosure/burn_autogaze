@@ -89,6 +89,15 @@ impl WasmAutoGaze {
         self.pipeline.set_max_gaze_tokens_each_frame(max_tokens);
     }
 
+    pub fn set_task_loss_requirement(&mut self, task_loss_requirement: f32) {
+        self.pipeline
+            .set_task_loss_requirement(Some(task_loss_requirement));
+    }
+
+    pub fn disable_task_loss_requirement(&mut self) {
+        self.pipeline.set_task_loss_requirement(None);
+    }
+
     pub fn set_mask_radius_scale(&mut self, scale: f32) {
         self.set_mask_cell_scale(scale);
     }

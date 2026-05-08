@@ -217,6 +217,48 @@ pub fn fixation_alpha_mask(
     alpha
 }
 
+pub fn fixation_scale_mask_rgba(
+    width: usize,
+    height: usize,
+    points: &[FixationPoint],
+    cell_scale: f32,
+) -> Vec<u8> {
+    let width = width.max(1);
+    let height = height.max(1);
+    let mut rgba = vec![0u8; width * height * 4];
+    for pixel in rgba.chunks_exact_mut(4) {
+        pixel[3] = 255;
+    }
+
+    let mut ordered = points
+        .iter()
+        .copied()
+        .filter(|point| point.confidence > 0.0)
+        .collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        right
+            .cell_width()
+            .total_cmp(&left.cell_width())
+            .then_with(|| right.cell_height().total_cmp(&left.cell_height()))
+    });
+
+    for point in ordered {
+        let color = scale_color_for_point(point);
+        let bounds = point.scaled_bounds(cell_scale);
+        let (x0, x1) = pixel_range(bounds.x_min, bounds.x_max, width);
+        let (y0, y1) = pixel_range(bounds.y_min, bounds.y_max, height);
+        for y in y0..y1 {
+            let row = y * width;
+            for x in x0..x1 {
+                let offset = (row + x) * 4;
+                rgba[offset..offset + 3].copy_from_slice(&color);
+            }
+        }
+    }
+
+    rgba
+}
+
 pub fn visualize_fixations_rgba(
     rgba: &[u8],
     width: usize,
@@ -397,6 +439,28 @@ fn ratio(count: usize, total: usize) -> f64 {
     }
 }
 
+fn scale_color_for_point(point: FixationPoint) -> [u8; 3] {
+    match point
+        .cell_grid()
+        .unwrap_or_else(|| nearest_scale_grid(point))
+    {
+        0..=2 => [255, 180, 0],
+        3..=4 => [60, 220, 120],
+        5..=7 => [0, 185, 255],
+        _ => [230, 110, 255],
+    }
+}
+
+fn nearest_scale_grid(point: FixationPoint) -> usize {
+    let recovered = 1.0 / point.cell_width().max(point.cell_height()).max(1.0e-6);
+    [2usize, 4, 7, 14]
+        .into_iter()
+        .min_by(|left, right| {
+            ((*left as f32 - recovered).abs()).total_cmp(&(*right as f32 - recovered).abs())
+        })
+        .unwrap_or(14)
+}
+
 fn pixel_range(min: f32, max: f32, extent: usize) -> (usize, usize) {
     let extent_f = extent as f32;
     let mut start = (min.clamp(0.0, 1.0) * extent_f).floor() as usize;
@@ -438,6 +502,17 @@ mod tests {
                 assert_eq!(alpha[y * 8 + x], expected, "pixel {x},{y}");
             }
         }
+    }
+
+    #[test]
+    fn draws_crisp_scale_colored_cells_with_fine_cells_on_top() {
+        let coarse = FixationPoint::with_grid_extent(0.5, 0.5, 1.0, 1.0, 0.9, 2);
+        let fine = FixationPoint::with_grid_extent(0.625, 0.625, 0.25, 0.25, 0.9, 4);
+        let rgba = fixation_scale_mask_rgba(8, 8, &[fine, coarse], 1.0);
+
+        assert_eq!(&rgba[0..4], &[255, 180, 0, 255]);
+        let fine_offset = (5 * 8 + 5) * 4;
+        assert_eq!(&rgba[fine_offset..fine_offset + 4], &[60, 220, 120, 255]);
     }
 
     #[test]

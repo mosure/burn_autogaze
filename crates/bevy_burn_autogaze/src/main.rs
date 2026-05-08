@@ -37,6 +37,12 @@ struct NativeArgs {
     #[arg(long, default_value_t = 4)]
     max_gaze_tokens_each_frame: usize,
 
+    #[arg(long)]
+    task_loss_requirement: Option<f32>,
+
+    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    disable_task_loss_requirement: bool,
+
     #[arg(long, default_value_t = 2)]
     frames_per_clip: usize,
 
@@ -82,6 +88,8 @@ impl From<NativeArgs> for BevyBurnAutoGazeConfig {
             mode,
             top_k: args.top_k,
             max_gaze_tokens_each_frame: args.max_gaze_tokens_each_frame,
+            task_loss_requirement: args.task_loss_requirement,
+            disable_task_loss_requirement: args.disable_task_loss_requirement,
             frames_per_clip: args.frames_per_clip,
             inference_width: args.inference_width,
             inference_height: args.inference_height,

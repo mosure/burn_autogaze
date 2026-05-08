@@ -104,6 +104,8 @@ pub struct BevyBurnAutoGazeConfig {
     pub mode: BevyAutoGazeMode,
     pub top_k: usize,
     pub max_gaze_tokens_each_frame: usize,
+    pub task_loss_requirement: Option<f32>,
+    pub disable_task_loss_requirement: bool,
     pub frames_per_clip: usize,
     pub inference_width: Option<u32>,
     pub inference_height: Option<u32>,
@@ -128,6 +130,8 @@ impl Default for BevyBurnAutoGazeConfig {
             mode: BevyAutoGazeMode::Resize224,
             top_k: 4,
             max_gaze_tokens_each_frame: 4,
+            task_loss_requirement: None,
+            disable_task_loss_requirement: false,
             frames_per_clip: 2,
             inference_width: None,
             inference_height: None,
@@ -190,6 +194,30 @@ impl BevyBurnAutoGazeConfig {
             }
             "max-gaze-tokens-each-frame" => {
                 self.max_gaze_tokens_each_frame = parse_usize_option(&key, value)?;
+                Ok(())
+            }
+            "task-loss-requirement" | "task-loss" => {
+                match value.trim().to_ascii_lowercase().as_str() {
+                    "" | "default" | "model" => {
+                        self.task_loss_requirement = None;
+                        self.disable_task_loss_requirement = false;
+                    }
+                    "none" | "off" | "false" | "disabled" => {
+                        self.task_loss_requirement = None;
+                        self.disable_task_loss_requirement = true;
+                    }
+                    _ => {
+                        self.task_loss_requirement = Some(parse_f32_option(&key, value)?);
+                        self.disable_task_loss_requirement = false;
+                    }
+                }
+                Ok(())
+            }
+            "disable-task-loss-requirement" | "disable-task-loss" => {
+                self.disable_task_loss_requirement = parse_bool_option(&key, value)?;
+                if self.disable_task_loss_requirement {
+                    self.task_loss_requirement = None;
+                }
                 Ok(())
             }
             "frames-per-clip" => {
@@ -929,6 +957,7 @@ async fn load_model(
     let mut pipeline = AutoGazePipeline::from_hf_dir(&config.model_dir, device)
         .map_err(|err| format!("{err:#}"))?;
     pipeline.set_max_gaze_tokens_each_frame(config.max_gaze_tokens_each_frame);
+    apply_task_loss_requirement_config(&mut pipeline, &config);
     Ok(pipeline)
 }
 
@@ -950,7 +979,19 @@ async fn load_model(
     .map_err(|err| format!("{err:#}"))?;
     let mut pipeline = AutoGazePipeline::new(model);
     pipeline.set_max_gaze_tokens_each_frame(config.max_gaze_tokens_each_frame);
+    apply_task_loss_requirement_config(&mut pipeline, &config);
     Ok(pipeline)
+}
+
+fn apply_task_loss_requirement_config<B: burn::tensor::backend::Backend>(
+    pipeline: &mut AutoGazePipeline<B>,
+    config: &BevyBurnAutoGazeConfig,
+) {
+    if config.disable_task_loss_requirement {
+        pipeline.set_task_loss_requirement(None);
+    } else if let Some(task_loss_requirement) = config.task_loss_requirement {
+        pipeline.set_task_loss_requirement(Some(task_loss_requirement));
+    }
 }
 
 fn run_autogaze_visualization(
@@ -1465,7 +1506,7 @@ mod tests {
     fn applies_url_query_to_viewer_config() {
         let mut config = BevyBurnAutoGazeConfig::default();
         let errors = config.apply_query_string(
-            "?mode=full-res&top_k=2&frames-per-clip=3&inference-width=1920&inference-height=1080&show-fps=false&show-psnr=false&config-url=%2Fconfig.json&weights-url=%2Fmodel.safetensors&load-model=false&mask-cell-scale=2.5&blend-alpha=0.5&visualization-mode=interframe&keyframe-duration=7",
+            "?mode=full-res&top_k=2&frames-per-clip=3&inference-width=1920&inference-height=1080&show-fps=false&show-psnr=false&task-loss-requirement=0.65&config-url=%2Fconfig.json&weights-url=%2Fmodel.safetensors&load-model=false&mask-cell-scale=2.5&blend-alpha=0.5&visualization-mode=interframe&keyframe-duration=7",
         );
 
         assert!(errors.is_empty(), "{errors:?}");
@@ -1477,6 +1518,8 @@ mod tests {
         assert!(!config.show_fps);
         assert!(config.show_gaze_ratio);
         assert!(!config.show_psnr);
+        assert_eq!(config.task_loss_requirement, Some(0.65));
+        assert!(!config.disable_task_loss_requirement);
         assert_eq!(config.config_url, "/config.json");
         assert_eq!(config.weights_url, "/model.safetensors");
         assert!(!config.load_model);
@@ -1495,6 +1538,11 @@ mod tests {
         let errors = config.apply_query_string("?show-psnr=true");
         assert!(errors.is_empty(), "{errors:?}");
         assert!(config.show_psnr);
+
+        let errors = config.apply_query_string("?task-loss-requirement=none");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(config.task_loss_requirement, None);
+        assert!(config.disable_task_loss_requirement);
     }
 
     #[test]

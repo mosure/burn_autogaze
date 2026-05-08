@@ -54,6 +54,32 @@ impl AutoGazeConfig {
             .filter_map(|part| part.trim().parse::<usize>().ok())
             .collect()
     }
+
+    pub fn inference_gazing_ratio(&self) -> Option<f32> {
+        fixed_inference_value(&self.gazing_ratio_config, "gazing_ratio")
+    }
+
+    pub fn inference_task_loss_requirement(&self) -> Option<f32> {
+        if self.has_task_loss_requirement_during_inference {
+            fixed_inference_value(&self.task_loss_requirement_config, "task_loss_requirement")
+        } else {
+            None
+        }
+    }
+}
+
+fn fixed_inference_value(config: &serde_json::Value, value_key: &str) -> Option<f32> {
+    let strategy = config
+        .get("sample_strategy_during_inference")
+        .and_then(serde_json::Value::as_str)?;
+    if strategy != "fixed" {
+        return None;
+    }
+    config
+        .get("fixed")
+        .and_then(|fixed| fixed.get(value_key))
+        .and_then(serde_json::Value::as_f64)
+        .map(|value| value as f32)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -209,5 +235,7 @@ mod tests {
             4
         );
         assert_eq!(config.scale_values(), vec![32, 64, 112, 224]);
+        assert_eq!(config.inference_gazing_ratio(), Some(0.75));
+        assert_eq!(config.inference_task_loss_requirement(), Some(0.7));
     }
 }

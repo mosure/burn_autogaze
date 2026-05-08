@@ -11,10 +11,12 @@ The gaze ratio metric is `updated output pixels / full-frame pixels`. Full-blend
 frames and interframe keyframes count as `100%`; interframe delta frames count
 only masked cells.
 
-The checked-in render uses full `1920x1080` inference, `45` non-overlapping or
-edge-overlapping `224px` tiles, and `top_k=16` per tile (`720` fixation budget
-per frame). The GIFs are downsampled only after the tiled model trace and
-interframe output stream are produced.
+The checked-in render uses full `1920x1080` inference, `45` padded
+non-overlapping `224px` chunks, `top_k=4` per tile, and the NVIDIA default
+`task_loss_requirement=0.7`. The maximum fixation budget is `180` tokens per
+frame before task-loss stopping and padded-edge filtering. The GIFs are
+downsampled only after the tiled model trace and interframe output stream are
+produced.
 
 Regenerate these assets with:
 
