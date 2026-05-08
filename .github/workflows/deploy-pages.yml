@@ -72,13 +72,13 @@ jobs:
           test -f crates/bevy_burn_autogaze/www/out/bevy_burn_autogaze_bg.wasm
 
       - name: configure github pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
 
       - name: upload pages artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: crates/bevy_burn_autogaze/www
 
       - name: deploy to github pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
