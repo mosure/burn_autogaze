@@ -70,6 +70,23 @@ impl AutoGazeClipShape {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AutoGazeRgbaClipShape {
+    pub clip_len: usize,
+    pub height: usize,
+    pub width: usize,
+}
+
+impl AutoGazeRgbaClipShape {
+    pub const fn new(clip_len: usize, height: usize, width: usize) -> Self {
+        Self {
+            clip_len,
+            height,
+            width,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AutoGazeTile {
     pub x: usize,
     pub y: usize,
@@ -154,6 +171,48 @@ pub struct AutoGazeEmbedOutput<B: Backend> {
     pub embeddings: Tensor<B, 4>,
     pub past_conv_values: Vec<Tensor<B, 5>>,
     pub layout: AutoGazeTileLayout,
+}
+
+pub fn rgba_clip_to_tensor<B: Backend>(
+    rgba: &[u8],
+    shape: AutoGazeRgbaClipShape,
+    device: &B::Device,
+) -> Result<Tensor<B, 5>> {
+    ensure!(
+        shape.width > 0 && shape.height > 0 && shape.clip_len > 0,
+        "RGBA clip dimensions must be nonzero"
+    );
+    let pixels_per_frame = shape
+        .width
+        .checked_mul(shape.height)
+        .ok_or_else(|| anyhow::anyhow!("RGBA clip dimensions overflow"))?;
+    let expected_len = pixels_per_frame
+        .checked_mul(4)
+        .and_then(|bytes| bytes.checked_mul(shape.clip_len))
+        .ok_or_else(|| anyhow::anyhow!("RGBA clip byte length overflow"))?;
+    ensure!(
+        rgba.len() == expected_len,
+        "expected {expected_len} RGBA bytes for {} frame(s) at {}x{}, got {}",
+        shape.clip_len,
+        shape.width,
+        shape.height,
+        rgba.len()
+    );
+
+    let mut values = Vec::with_capacity(shape.clip_len * 3 * pixels_per_frame);
+    for frame in 0..shape.clip_len {
+        let frame_offset = frame * pixels_per_frame * 4;
+        for channel in 0..3 {
+            for pixel in 0..pixels_per_frame {
+                values.push(rgba[frame_offset + pixel * 4 + channel] as f32 / 255.0);
+            }
+        }
+    }
+
+    Ok(Tensor::from_data(
+        TensorData::new(values, [1, shape.clip_len, 3, shape.height, shape.width]),
+        device,
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -417,6 +476,34 @@ impl<B: Backend> AutoGazePipeline<B> {
             .next()
             .unwrap_or_else(|| FrameFixationTrace::new(vec![])))
     }
+
+    pub fn trace_rgba_clip(
+        &self,
+        rgba: &[u8],
+        shape: AutoGazeRgbaClipShape,
+        k: usize,
+        device: &B::Device,
+    ) -> Result<Vec<FrameFixationTrace>> {
+        self.trace_rgba_clip_with_mode(
+            rgba,
+            shape,
+            k,
+            AutoGazeInferenceMode::ResizeToModelInput,
+            device,
+        )
+    }
+
+    pub fn trace_rgba_clip_with_mode(
+        &self,
+        rgba: &[u8],
+        shape: AutoGazeRgbaClipShape,
+        k: usize,
+        mode: AutoGazeInferenceMode,
+        device: &B::Device,
+    ) -> Result<Vec<FrameFixationTrace>> {
+        let video = rgba_clip_to_tensor::<B>(rgba, shape, device)?;
+        Ok(self.trace_video_with_mode(video, k, mode))
+    }
 }
 
 fn tile_origins(length: usize, tile_size: usize, stride: usize) -> Vec<usize> {
@@ -464,6 +551,29 @@ fn remap_tile_point(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "ndarray")]
+    #[test]
+    fn rgba_clip_to_tensor_converts_rgba_to_channel_first_rgb() {
+        let device = Default::default();
+        let rgba = [10, 20, 30, 255, 40, 50, 60, 255];
+        let shape = AutoGazeRgbaClipShape::new(1, 1, 2);
+        let tensor = rgba_clip_to_tensor::<burn::backend::NdArray<f32>>(&rgba, shape, &device)
+            .expect("rgba tensor");
+        let values = tensor.into_data().to_vec::<f32>().expect("f32 tensor");
+
+        assert_eq!(
+            values,
+            vec![
+                10.0 / 255.0,
+                40.0 / 255.0,
+                20.0 / 255.0,
+                50.0 / 255.0,
+                30.0 / 255.0,
+                60.0 / 255.0,
+            ]
+        );
+    }
 
     #[test]
     fn remap_tile_point_preserves_source_space_cell_extent() {

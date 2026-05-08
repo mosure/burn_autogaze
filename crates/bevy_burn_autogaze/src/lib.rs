@@ -25,14 +25,12 @@ use bevy::{
     tasks::{AsyncComputeTaskPool, Task, block_on, futures_lite::future},
     ui::widget::ImageNode,
 };
-use burn::{
-    prelude::Backend,
-    tensor::{Tensor, TensorData},
-};
+use burn::prelude::Backend;
 #[cfg(target_arch = "wasm32")]
 use burn_autogaze::{AutoGazeConfig, AutoGazeLoadOptions, NativeAutoGazeModel};
 use burn_autogaze::{
-    AutoGazeInferenceMode, AutoGazePipeline, FixationPoint, visualize_fixations_rgba,
+    AutoGazeInferenceMode, AutoGazePipeline, AutoGazeRgbaClipShape, FixationPoint,
+    visualize_fixations_rgba,
 };
 use image::RgbaImage;
 
@@ -99,7 +97,7 @@ pub struct BevyBurnAutoGazeConfig {
     pub top_k: usize,
     pub max_gaze_tokens_each_frame: usize,
     pub frames_per_clip: usize,
-    pub mask_radius_scale: f32,
+    pub mask_cell_scale: f32,
     pub blend_alpha: f32,
 }
 
@@ -117,7 +115,7 @@ impl Default for BevyBurnAutoGazeConfig {
             top_k: 4,
             max_gaze_tokens_each_frame: 4,
             frames_per_clip: 2,
-            mask_radius_scale: 1.0,
+            mask_cell_scale: 1.0,
             blend_alpha: 0.72,
         }
     }
@@ -173,7 +171,7 @@ impl BevyBurnAutoGazeConfig {
                 Ok(())
             }
             "mask-cell-scale" | "mask-radius-scale" => {
-                self.mask_radius_scale = parse_f32_option(&key, value)?;
+                self.mask_cell_scale = parse_f32_option(&key, value)?;
                 Ok(())
             }
             "blend-alpha" => {
@@ -562,12 +560,12 @@ fn process_frames(
     let pipeline = pipeline.clone();
     let mode = config.mode.inference_mode();
     let top_k = config.top_k.max(1);
-    let radius_scale = config.mask_radius_scale;
+    let cell_scale = config.mask_cell_scale;
     let blend_alpha = config.blend_alpha;
 
     let task = AsyncComputeTaskPool::get().spawn(async move {
         let visualization =
-            run_autogaze_visualization(pipeline, clip, top_k, mode, radius_scale, blend_alpha);
+            run_autogaze_visualization(pipeline, clip, top_k, mode, cell_scale, blend_alpha);
 
         let mut queue = CommandQueue::default();
         queue.push(move |world: &mut World| {
@@ -637,7 +635,7 @@ fn preview_frames(
         frame.width() as usize,
         frame.height() as usize,
         &[],
-        config.mask_radius_scale,
+        config.mask_cell_scale,
         config.blend_alpha,
     );
     apply_visualization_to_texture(
@@ -738,16 +736,22 @@ fn run_autogaze_visualization(
     clip: Vec<RgbaImage>,
     top_k: usize,
     mode: AutoGazeInferenceMode,
-    radius_scale: f32,
+    cell_scale: f32,
     blend_alpha: f32,
 ) -> Visualization {
     let device = burn_device();
     let width = clip[0].width() as usize;
     let height = clip[0].height() as usize;
-    let video = rgba_clip_to_tensor(&clip, &device);
+    let mut rgba = Vec::with_capacity(clip.len() * width * height * 4);
+    for frame in &clip {
+        rgba.extend_from_slice(frame.as_raw());
+    }
     let traces = {
         let pipeline = pipeline.lock().expect("AutoGaze model poisoned");
-        pipeline.trace_video_with_mode(video, top_k, mode)
+        let shape = AutoGazeRgbaClipShape::new(clip.len(), height, width);
+        pipeline
+            .trace_rgba_clip_with_mode(&rgba, shape, top_k, mode, &device)
+            .expect("valid Bevy AutoGaze RGBA clip")
     };
     AutoGazeBevyBackend::sync(&device).expect("failed to sync Burn WebGPU backend");
 
@@ -762,33 +766,8 @@ fn run_autogaze_visualization(
         width,
         height,
         &points,
-        radius_scale,
+        cell_scale,
         blend_alpha,
-    )
-}
-
-fn rgba_clip_to_tensor(
-    clip: &[RgbaImage],
-    device: &AutoGazeBevyDevice,
-) -> Tensor<AutoGazeBevyBackend, 5> {
-    let frames = clip.len();
-    let width = clip[0].width() as usize;
-    let height = clip[0].height() as usize;
-    let pixels_per_frame = width * height;
-    let mut values = Vec::with_capacity(frames * 3 * pixels_per_frame);
-
-    for frame in clip {
-        let rgba = frame.as_raw();
-        for channel in 0..3 {
-            for pixel in 0..pixels_per_frame {
-                values.push(rgba[pixel * 4 + channel] as f32 / 255.0);
-            }
-        }
-    }
-
-    Tensor::from_data(
-        TensorData::new(values, [1, frames, 3, height, width]),
-        device,
     )
 }
 
@@ -1036,7 +1015,7 @@ mod tests {
         assert_eq!(config.config_url, "/config.json");
         assert_eq!(config.weights_url, "/model.safetensors");
         assert!(!config.load_model);
-        assert_eq!(config.mask_radius_scale, 2.5);
+        assert_eq!(config.mask_cell_scale, 2.5);
         assert_eq!(config.blend_alpha, 0.5);
     }
 

@@ -32,10 +32,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: test
-        run: cargo test
+        run: cargo test --workspace
 
       - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: package
+        run: cargo package -p burn_autogaze
 
       - name: check wasm api
         run: cargo check --target wasm32-unknown-unknown --no-default-features --features wasm

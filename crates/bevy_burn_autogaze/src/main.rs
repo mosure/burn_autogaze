@@ -59,7 +59,7 @@ impl From<NativeArgs> for BevyBurnAutoGazeConfig {
             top_k: args.top_k,
             max_gaze_tokens_each_frame: args.max_gaze_tokens_each_frame,
             frames_per_clip: args.frames_per_clip,
-            mask_radius_scale: args.mask_cell_scale,
+            mask_cell_scale: args.mask_cell_scale,
             blend_alpha: args.blend_alpha,
             ..Default::default()
         }

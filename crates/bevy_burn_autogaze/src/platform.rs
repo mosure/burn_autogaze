@@ -22,48 +22,91 @@ pub mod camera {
 
     pub fn native_camera_thread() {
         let (sample_sender, sample_receiver) = mpsc::sync_channel(1);
-        SAMPLE_RECEIVER
+        if SAMPLE_RECEIVER
             .set(Arc::new(Mutex::new(sample_receiver)))
-            .unwrap();
-        SAMPLE_SENDER.set(sample_sender).unwrap();
+            .is_err()
+        {
+            crate::log("camera sample receiver already initialized");
+            return;
+        }
+        if SAMPLE_SENDER.set(sample_sender).is_err() {
+            crate::log("camera sample sender already initialized");
+            return;
+        }
 
         let (app_run_sender, app_run_receiver) = mpsc::channel();
-        APP_RUN_RECEIVER
+        if APP_RUN_RECEIVER
             .set(Arc::new(Mutex::new(app_run_receiver)))
-            .unwrap();
-        APP_RUN_SENDER.set(app_run_sender).unwrap();
+            .is_err()
+        {
+            crate::log("camera stop receiver already initialized");
+            return;
+        }
+        if APP_RUN_SENDER.set(app_run_sender).is_err() {
+            crate::log("camera stop sender already initialized");
+            return;
+        }
 
         nokhwa_initialize(|granted| {
             if !granted {
-                panic!("failed to initialize camera");
+                crate::log("camera permission was not granted");
             }
         });
 
-        let devices = query(ApiBackend::Auto).expect("failed to query cameras");
-        let index = devices.first().expect("no camera found").index();
+        let devices = match query(ApiBackend::Auto) {
+            Ok(devices) => devices,
+            Err(err) => {
+                crate::log(&format!("failed to query cameras: {err}"));
+                return;
+            }
+        };
+        let Some(index) = devices.first().map(|device| device.index()) else {
+            crate::log("no camera found");
+            return;
+        };
 
         let format = RequestedFormat::new::<RgbFormat>(RequestedFormatType::None);
-        let mut camera = CallbackCamera::new(index.clone(), format, |buffer| {
-            let image = buffer.decode_image::<RgbFormat>().unwrap();
-            let sender = SAMPLE_SENDER.get().unwrap();
-            sender.send(rgb_to_rgba(image)).unwrap();
-        })
-        .expect("failed to open camera");
+        let camera = CallbackCamera::new(index.clone(), format, |buffer| {
+            let Ok(image) = buffer.decode_image::<RgbFormat>() else {
+                return;
+            };
+            if let Some(sender) = SAMPLE_SENDER.get() {
+                let _ = sender.try_send(rgb_to_rgba(image));
+            }
+        });
+        let Ok(mut camera) = camera else {
+            crate::log("failed to open camera");
+            return;
+        };
 
-        camera.open_stream().expect("failed to open camera stream");
+        if let Err(err) = camera.open_stream() {
+            crate::log(&format!("failed to open camera stream: {err}"));
+            return;
+        }
 
         loop {
-            camera.poll_frame().expect("failed to poll camera frame");
+            if let Err(err) = camera.poll_frame() {
+                crate::log(&format!("failed to poll camera frame: {err}"));
+                break;
+            }
 
-            let receiver = APP_RUN_RECEIVER.get().unwrap();
-            match receiver.lock().unwrap().try_recv() {
+            let Some(receiver) = APP_RUN_RECEIVER.get() else {
+                break;
+            };
+            let Ok(receiver) = receiver.lock() else {
+                crate::log("camera stop receiver was poisoned");
+                break;
+            };
+            match receiver.try_recv() {
                 Ok(_) => break,
                 Err(TryRecvError::Empty) => continue,
                 Err(TryRecvError::Disconnected) => break,
             };
         }
 
-        camera.stop_stream().expect("failed to stop camera stream");
+        if let Err(err) = camera.stop_stream() {
+            crate::log(&format!("failed to stop camera stream: {err}"));
+        }
     }
 
     pub fn receive_image() -> Option<RgbaImage> {
@@ -71,7 +114,9 @@ pub mod camera {
         let mut last_image = None;
 
         {
-            let receiver = receiver.lock().unwrap();
+            let Ok(receiver) = receiver.lock() else {
+                return None;
+            };
             while let Ok(image) = receiver.try_recv() {
                 last_image = Some(image);
             }
@@ -103,8 +148,10 @@ pub mod camera {
 
     #[wasm_bindgen]
     pub fn frame_input(pixel_data: &[u8], width: u32, height: u32) {
-        let image = RgbaImage::from_raw(width, height, pixel_data.to_vec())
-            .expect("failed to create RGBA frame");
+        let Some(image) = RgbaImage::from_raw(width, height, pixel_data.to_vec()) else {
+            crate::log("ignoring invalid RGBA frame input");
+            return;
+        };
         SAMPLE_RECEIVER.with(|receiver| {
             *receiver.borrow_mut() = Some(image);
         });

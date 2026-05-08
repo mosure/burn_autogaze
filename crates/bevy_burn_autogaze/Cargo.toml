@@ -4,6 +4,10 @@ version = "0.21.0"
 edition = "2024"
 authors = ["mosure <mitchell@mosure.me>"]
 license = "MIT OR Apache-2.0"
+description = "Bevy native and wasm viewer for burn_autogaze"
+homepage = "https://github.com/mosure/burn_autogaze"
+repository = "https://github.com/mosure/burn_autogaze"
+readme = "README.md"
 publish = false
 
 [features]

@@ -45,7 +45,9 @@ bevy/webgpu demos.
 
 ```rust,no_run
 use burn::backend::{wgpu, WebGpu};
-use burn_autogaze::{AutoGazeClipShape, AutoGazeInferenceMode, AutoGazePipeline};
+use burn_autogaze::{
+    AutoGazeClipShape, AutoGazeInferenceMode, AutoGazePipeline, AutoGazeRgbaClipShape,
+};
 
 let device = wgpu::WgpuDevice::default();
 wgpu::init_setup::<wgpu::graphics::AutoGraphicsApi>(&device, Default::default());
@@ -69,6 +71,15 @@ let tiled_trace = pipeline.trace_clip_from_frames_with_mode(
     shape,
     4,
     AutoGazeInferenceMode::tiled_model_input(224),
+)?;
+
+let rgba = vec![0_u8; shape.clip_len * shape.height * shape.width * 4];
+let rgba_trace = pipeline.trace_rgba_clip_with_mode(
+    &rgba,
+    AutoGazeRgbaClipShape::new(shape.clip_len, shape.height, shape.width),
+    4,
+    AutoGazeInferenceMode::ResizeToModelInput,
+    &device,
 )?;
 
 # Ok::<(), anyhow::Error>(())

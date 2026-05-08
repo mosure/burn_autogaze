@@ -64,11 +64,17 @@ pub fn visualize_fixations_rgba(
         rgba.len()
     );
 
+    let side_by_side_width = width
+        .checked_mul(3)
+        .ok_or_else(|| anyhow::anyhow!("side-by-side visualization width overflow"))?;
+    let side_by_side_bytes = side_by_side_width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| anyhow::anyhow!("side-by-side visualization byte length overflow"))?;
     let alpha = fixation_alpha_mask(width, height, points, cell_scale);
     let mut mask_rgba = vec![0u8; pixels * 4];
     let mut blend_rgba = vec![0u8; pixels * 4];
-    let side_by_side_width = width * 3;
-    let mut side_by_side_rgba = vec![0u8; side_by_side_width * height * 4];
+    let mut side_by_side_rgba = vec![0u8; side_by_side_bytes];
     let blend_alpha = blend_alpha.clamp(0.0, 1.0);
 
     for y in 0..height {

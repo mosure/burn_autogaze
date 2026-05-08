@@ -1,9 +1,8 @@
 use crate::{
-    AutoGazeConfig, AutoGazeInferenceMode, AutoGazeLoadOptions, AutoGazePipeline, FixationPoint,
-    NativeAutoGazeModel, visualize_fixations_rgba,
+    AutoGazeConfig, AutoGazeInferenceMode, AutoGazeLoadOptions, AutoGazePipeline,
+    AutoGazeRgbaClipShape, NativeAutoGazeModel, rgba_clip_to_tensor, visualize_fixations_rgba,
 };
 use burn::tensor::backend::Backend;
-use burn::tensor::{Tensor, TensorData};
 use std::sync::OnceLock;
 use wasm_bindgen::prelude::*;
 
@@ -18,7 +17,7 @@ pub struct WasmAutoGaze {
     device: WasmDevice,
     mode: AutoGazeInferenceMode,
     top_k: usize,
-    mask_radius_scale: f32,
+    mask_cell_scale: f32,
     blend_alpha: f32,
 }
 
@@ -51,7 +50,7 @@ impl WasmAutoGaze {
             device,
             mode: AutoGazeInferenceMode::ResizeToModelInput,
             top_k: 4,
-            mask_radius_scale: 1.0,
+            mask_cell_scale: 1.0,
             blend_alpha: 0.72,
         })
     }
@@ -81,11 +80,11 @@ impl WasmAutoGaze {
     }
 
     pub fn set_mask_radius_scale(&mut self, scale: f32) {
-        self.mask_radius_scale = scale.clamp(0.25, 12.0);
+        self.set_mask_cell_scale(scale);
     }
 
     pub fn set_mask_cell_scale(&mut self, scale: f32) {
-        self.set_mask_radius_scale(scale);
+        self.mask_cell_scale = scale.clamp(0.25, 12.0);
     }
 
     pub fn set_blend_alpha(&mut self, alpha: f32) {
@@ -123,7 +122,9 @@ impl WasmAutoGaze {
             )));
         }
 
-        let video = rgba_clip_to_tensor::<WasmBackend>(rgba, width, height, frames, &self.device);
+        let shape = AutoGazeRgbaClipShape::new(frames, height, width);
+        let video = rgba_clip_to_tensor::<WasmBackend>(rgba, shape, &self.device)
+            .map_err(|err| js_error(format!("failed to build RGBA clip tensor: {err:#}")))?;
         let traces = self
             .pipeline
             .trace_video_with_mode(video, self.top_k, self.mode);
@@ -139,14 +140,15 @@ impl WasmAutoGaze {
         let points_json = serde_json::to_string(&points)
             .map_err(|err| js_error(format!("failed to serialize fixation points: {err}")))?;
         let last_frame = last_rgba_frame(rgba, width, height, frames);
-        let visualization = visualize_points(
+        let visualization = visualize_fixations_rgba(
             last_frame,
             width,
             height,
             &points,
-            self.mask_radius_scale,
+            self.mask_cell_scale,
             self.blend_alpha,
-        )?;
+        )
+        .map_err(|err| js_error(format!("failed to render AutoGaze visualization: {err:#}")))?;
 
         Ok(WasmAutoGazeOutput {
             width,
@@ -219,13 +221,6 @@ impl WasmAutoGazeOutput {
     }
 }
 
-struct Visualization {
-    side_by_side_width: usize,
-    mask_rgba: Vec<u8>,
-    blend_rgba: Vec<u8>,
-    side_by_side_rgba: Vec<u8>,
-}
-
 async fn webgpu_device() -> WasmDevice {
     if let Some(device) = WEBGPU_DEVICE.get() {
         return device.clone();
@@ -241,52 +236,10 @@ async fn webgpu_device() -> WasmDevice {
     device
 }
 
-fn rgba_clip_to_tensor<B: Backend>(
-    rgba: &[u8],
-    width: usize,
-    height: usize,
-    frames: usize,
-    device: &B::Device,
-) -> Tensor<B, 5> {
-    let pixels_per_frame = width * height;
-    let mut values = Vec::with_capacity(frames * 3 * pixels_per_frame);
-    for frame in 0..frames {
-        let frame_offset = frame * pixels_per_frame * 4;
-        for channel in 0..3 {
-            for pixel in 0..pixels_per_frame {
-                values.push(rgba[frame_offset + pixel * 4 + channel] as f32 / 255.0);
-            }
-        }
-    }
-    Tensor::from_data(
-        TensorData::new(values, [1, frames, 3, height, width]),
-        device,
-    )
-}
-
 fn last_rgba_frame(rgba: &[u8], width: usize, height: usize, frames: usize) -> &[u8] {
     let frame_bytes = width * height * 4;
     let start = frames.saturating_sub(1) * frame_bytes;
     &rgba[start..start + frame_bytes]
-}
-
-fn visualize_points(
-    rgba: &[u8],
-    width: usize,
-    height: usize,
-    points: &[FixationPoint],
-    cell_scale: f32,
-    blend_alpha: f32,
-) -> Result<Visualization, JsValue> {
-    let visualization =
-        visualize_fixations_rgba(rgba, width, height, points, cell_scale, blend_alpha)
-            .map_err(|err| js_error(format!("failed to render AutoGaze visualization: {err:#}")))?;
-    Ok(Visualization {
-        side_by_side_width: visualization.side_by_side_width,
-        mask_rgba: visualization.mask_rgba,
-        blend_rgba: visualization.blend_rgba,
-        side_by_side_rgba: visualization.side_by_side_rgba,
-    })
 }
 
 fn mode_label(mode: AutoGazeInferenceMode) -> String {
