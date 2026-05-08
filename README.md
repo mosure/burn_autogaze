@@ -9,9 +9,11 @@ burn-native [nvidia autogaze](https://huggingface.co/nvidia/AutoGaze) model
 inference, fixation traces, crisp multi-scale token-cell mask visualization, and
 bevy/webgpu demos.
 
-| input | mask | output |
+| input | multi-scale mask | alpha-blended output |
 |---|---|---|
-| <img src="./docs/autogaze_birds_input.gif" alt="birds input clip" title="https://www.vecteezy.com/free-videos Wildlife Stock Videos by Vecteezy"> | <img src="./docs/autogaze_birds_mask.gif" alt="autogaze white mask"> | <img src="./docs/autogaze_birds_output.gif" alt="autogaze alpha-blended output"> |
+| <img src="./docs/autogaze_birds_input.gif" alt="birds input clip" title="https://www.vecteezy.com/free-videos Wildlife Stock Videos by Vecteezy"> | <img src="./docs/autogaze_birds_mask.gif" alt="crisp multi-scale autogaze white mask"> | <img src="./docs/autogaze_birds_output.gif" alt="autogaze alpha-blended output"> |
+
+<img src="./docs/autogaze_capabilities.svg" alt="burn_autogaze multi-scale mask, interframe output, and gaze ratio capability overview">
 
 ## vibes
 
@@ -95,6 +97,22 @@ let rgba_trace = pipeline.trace_rgba_clip_with_mode(
 keeps local full-res evidence, but it is much slower because every covered tile
 runs through the model.
 
+## visualization
+
+| mode | output behavior | update ratio |
+|---|---|---|
+| `full-blend` | redraws the current input with a white alpha-blended mask | `100%` |
+| `interframe` | keeps prior output outside the current mask and redraws a full keyframe every `keyframe-duration` frames | masked-cell pixels / full-frame pixels, or `100%` on keyframes |
+
+AutoGaze emits multi-scale token positions. For the NVIDIA config, the Rust
+trace decoder maps those tokens back to `2x2`, `4x4`, `7x7`, and `14x14`
+source-frame cells, then renders the mask with nearest sampling so the
+quad-tree-like cell structure stays crisp.
+
+The gaze ratio metric reports how much of the output frame changed compared to
+a full-frame redraw. The Bevy overlay shows the current frame ratio plus an EMA
+across processed frames.
+
 ## wasm
 
 ```sh
@@ -128,6 +146,8 @@ browser builds render the same bevy app: the only platform split is camera/model
 I/O (`nokhwa` or `--image-path` natively, browser camera plus `frame_input` on
 wasm). both modes show the same bevy-rendered `input | mask | output`
 visualization plus toggleable FPS and gaze/update-ratio overlays.
+
+Set `--show-fps=false` or `--show-gaze-ratio=false` to hide either text overlay.
 
 The native app accepts CLI flags; the wasm app accepts the same viewer/inference
 knobs through query parameters:

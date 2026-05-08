@@ -21,7 +21,12 @@ EMA output update ratio.
 `--visualization-mode full-blend` renders the current frame's alpha-blended
 mask. `--visualization-mode interframe --keyframe-duration 30` preserves the
 previous output outside masked cells and redraws a full keyframe every 30
-processed frames.
+processed frames. The gaze-ratio overlay reports the percentage of output pixels
+updated on the current frame plus an EMA across processed frames.
+
+In `full-blend` mode every processed frame is a full redraw, so the update ratio
+is `100%`. In `interframe` mode keyframes are also `100%`; intermediate frames
+report masked-cell coverage as a percentage of the full source frame.
 
 ## Web
 
