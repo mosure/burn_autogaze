@@ -1,0 +1,44 @@
+name: test
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: checkout repository
+        uses: actions/checkout@v4
+
+      - name: setup nightly rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+
+      - name: cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: test
+        run: cargo test
+
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: check wasm api
+        run: cargo check --target wasm32-unknown-unknown --no-default-features --features wasm
+
+      - name: check bevy wasm
+        run: cargo check -p bevy_burn_autogaze --target wasm32-unknown-unknown --no-default-features --features web

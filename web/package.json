@@ -1,0 +1,10 @@
+{
+  "name": "burn-autogaze-web-demo",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:wasm": "cd .. && cargo build --target wasm32-unknown-unknown --no-default-features --features wasm --release && wasm-bindgen --target web --out-dir web/pkg --out-name burn_autogaze target/wasm32-unknown-unknown/release/burn_autogaze.wasm",
+    "check:bevy-wgpu": "cd bevy_wgpu_anchor && cargo tree --target wasm32-unknown-unknown -i wgpu && cargo check --target wasm32-unknown-unknown",
+    "serve": "python3 -m http.server 8080"
+  }
+}

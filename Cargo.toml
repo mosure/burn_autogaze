@@ -1,0 +1,64 @@
+[workspace]
+members = [".", "crates/bevy_burn_autogaze"]
+default-members = ["."]
+resolver = "3"
+
+[package]
+name = "burn_autogaze"
+description = "AutoGaze-style fixation traces and teacher hooks for burn dragon"
+version = "0.21.0"
+edition = "2024"
+rust-version = "1.92"
+authors = ["mosure <mitchell@mosure.me>"]
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/mosure/burn_autogaze"
+repository = "https://github.com/mosure/burn_autogaze"
+readme = "README.md"
+exclude = ["/web/pkg/", "/crates/bevy_burn_autogaze/"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["ndarray", "webgpu"]
+ndarray = ["burn/ndarray"]
+webgpu = ["burn/webgpu", "burn-store/wgpu"]
+wgpu = ["burn/wgpu", "burn-store/wgpu"]
+cuda = ["burn/cuda", "burn-store/cuda"]
+wasm = [
+  "webgpu",
+  "dep:console_error_panic_hook",
+  "dep:js-sys",
+  "dep:wasm-bindgen",
+  "dep:web-sys",
+]
+bevy-web-demo = ["wasm"]
+
+[dependencies]
+anyhow = "1"
+burn = { version = "0.21.0", default-features = false, features = ["fusion", "std"] }
+burn-store = { version = "0.21.0", default-features = false, features = ["pytorch", "safetensors", "std"] }
+half = "2"
+safetensors = "0.7"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = { version = "0.1", optional = true }
+js-sys = { version = "0.3", optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
+version = "0.3"
+optional = true
+features = [
+  "console",
+]
+
+[dev-dependencies]
+criterion = "0.8.2"
+tempfile = "3"
+
+[[bench]]
+name = "backend_pipeline"
+harness = false

@@ -1,0 +1,75 @@
+[package]
+name = "bevy_burn_autogaze"
+version = "0.21.0"
+edition = "2024"
+authors = ["mosure <mitchell@mosure.me>"]
+license = "MIT OR Apache-2.0"
+publish = false
+
+[features]
+default = ["native"]
+native = ["dep:clap", "dep:nokhwa"]
+web = ["dep:console_error_panic_hook", "dep:js-sys", "dep:wasm-bindgen", "dep:wasm-bindgen-futures"]
+
+[dependencies]
+anyhow = "1"
+burn = { version = "0.21.0", default-features = false, features = ["fusion", "std", "webgpu"] }
+burn_autogaze = { path = "../..", default-features = false, features = ["webgpu"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+once_cell = "1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dependencies.bevy]
+git = "https://github.com/bevyengine/bevy"
+rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce"
+default-features = false
+features = [
+  "bevy_asset",
+  "bevy_camera",
+  "bevy_core_pipeline",
+  "bevy_image",
+  "bevy_log",
+  "bevy_render",
+  "bevy_sprite",
+  "bevy_text",
+  "bevy_ui",
+  "bevy_ui_render",
+  "bevy_window",
+  "bevy_winit",
+  "debug",
+  "default_font",
+  "png",
+  "std",
+  "webgpu",
+  "x11",
+  "zstd_rust",
+]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+clap = { version = "4.5", features = ["derive"], optional = true }
+nokhwa = { version = "0.10", features = ["input-native", "output-threaded"], optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = { version = "0.1", optional = true }
+js-sys = { version = "0.3", optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
+version = "0.3"
+features = [
+  "Request",
+  "RequestInit",
+  "RequestMode",
+  "Response",
+  "Window",
+  "console",
+]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "bevy_burn_autogaze"
+path = "src/main.rs"

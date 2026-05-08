@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 540" role="img" aria-label="example autogaze masked output">
+  <defs>
+    <linearGradient id="scene" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#16202a"/>
+      <stop offset="0.48" stop-color="#243746"/>
+      <stop offset="1" stop-color="#101215"/>
+    </linearGradient>
+    <radialGradient id="screen" cx="0.48" cy="0.38" r="0.62">
+      <stop offset="0" stop-color="#f0f6ff"/>
+      <stop offset="0.38" stop-color="#5fd1c3"/>
+      <stop offset="1" stop-color="#22303a"/>
+    </radialGradient>
+    <radialGradient id="gaze" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.96"/>
+      <stop offset="0.35" stop-color="#ffffff" stop-opacity="0.68"/>
+      <stop offset="0.68" stop-color="#ffffff" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="960" height="540" fill="url(#scene)"/>
+  <rect x="92" y="74" width="560" height="348" rx="18" fill="#0b0d10" stroke="#3e5968" stroke-width="8"/>
+  <rect x="120" y="102" width="504" height="292" rx="8" fill="url(#screen)"/>
+  <path d="M140 356 C260 306 346 338 456 272 C520 236 570 232 612 250 L612 394 L140 394 Z" fill="#22383f" opacity="0.75"/>
+  <circle cx="746" cy="176" r="58" fill="#d6b07a"/>
+  <circle cx="742" cy="166" r="18" fill="#1f2429"/>
+  <rect x="694" y="238" width="108" height="176" rx="42" fill="#2b4551"/>
+  <path d="M724 234 C724 270 770 270 770 234" fill="none" stroke="#f1d0a0" stroke-width="22" stroke-linecap="round"/>
+  <rect x="212" y="426" width="322" height="24" rx="12" fill="#0b0d10"/>
+  <rect x="700" y="412" width="132" height="32" rx="16" fill="#141a1f"/>
+  <circle cx="742" cy="166" r="178" fill="url(#gaze)"/>
+  <circle cx="488" cy="228" r="84" fill="url(#gaze)" opacity="0.72"/>
+  <circle cx="742" cy="166" r="18" fill="#ffffff"/>
+  <circle cx="488" cy="228" r="10" fill="#ffffff" opacity="0.82"/>
+</svg>

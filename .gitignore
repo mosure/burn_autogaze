@@ -1,0 +1,5 @@
+/target/
+/crates/bevy_burn_autogaze/target/
+/crates/bevy_burn_autogaze/www/out/
+/web/bevy_wgpu_anchor/target/
+/web/pkg/

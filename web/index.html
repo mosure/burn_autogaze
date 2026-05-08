@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>burn_autogaze</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app">
+      <section class="toolbar" aria-label="AutoGaze controls">
+        <div class="field wide">
+          <label for="config-url">config</label>
+          <input id="config-url" spellcheck="false" />
+        </div>
+        <div class="field wide">
+          <label for="weights-url">weights</label>
+          <input id="weights-url" spellcheck="false" />
+        </div>
+        <div class="field">
+          <label for="mode">mode</label>
+          <select id="mode">
+            <option value="resize">resize-224</option>
+            <option value="tile">tile-224</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="resolution">camera</label>
+          <select id="resolution">
+            <option value="720">720p</option>
+            <option value="1080">1080p</option>
+            <option value="native">native</option>
+          </select>
+        </div>
+        <div class="field short">
+          <label for="clip-frames">frames</label>
+          <input id="clip-frames" type="number" min="1" max="16" step="1" value="2" />
+        </div>
+        <div class="field short">
+          <label for="top-k">top k</label>
+          <input id="top-k" type="number" min="1" max="16" step="1" value="4" />
+        </div>
+        <button id="load-model" type="button">Load</button>
+        <button id="start-camera" type="button">Start</button>
+      </section>
+
+      <section class="viewport" aria-label="AutoGaze visualization">
+        <canvas id="triptych"></canvas>
+        <div class="labels" aria-hidden="true">
+          <span>Input</span>
+          <span>Mask</span>
+          <span>Blend</span>
+        </div>
+      </section>
+
+      <section class="statusbar" aria-live="polite">
+        <span id="status">idle</span>
+        <span id="stats"></span>
+      </section>
+    </main>
+
+    <video id="video" autoplay muted playsinline></video>
+    <canvas id="capture"></canvas>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

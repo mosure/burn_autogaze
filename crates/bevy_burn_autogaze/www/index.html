@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>bevy_burn_autogaze</title>
+    <style>
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+        background: #050607;
+      }
+
+      #bevy {
+        width: 100% !important;
+        height: 100% !important;
+        display: block;
+      }
+
+      #webcam {
+        display: none;
+      }
+
+      .loading {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        width: 32px;
+        height: 32px;
+        margin: -16px 0 0 -16px;
+        border: 2px solid #d7dde2;
+        border-left-color: #00a884;
+        border-radius: 50%;
+        animation: rotate 900ms linear infinite;
+      }
+
+      @keyframes rotate {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="loading"></div>
+    <video id="webcam" autoplay muted playsinline></video>
+    <canvas id="bevy"></canvas>
+    <script type="module">
+      import init, { frame_input } from "./out/bevy_burn_autogaze.js";
+
+      await init();
+      document.querySelector(".loading").style.display = "none";
+
+      const video = document.getElementById("webcam");
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          frameRate: { ideal: 30, max: 30 },
+        },
+        audio: false,
+      });
+      video.srcObject = stream;
+      await video.play();
+
+      if ("MediaStreamTrackProcessor" in window) {
+        const [track] = stream.getVideoTracks();
+        const processor = new MediaStreamTrackProcessor(track);
+        const reader = processor.readable.getReader();
+        readVideoFrames(reader);
+      } else {
+        const capture = document.createElement("canvas");
+        const context = capture.getContext("2d", { willReadFrequently: true });
+        captureWithCanvas(capture, context);
+      }
+
+      async function readVideoFrames(reader) {
+        const { value: frame, done } = await reader.read();
+        if (done) {
+          return;
+        }
+
+        const format = "RGBA";
+        const pixelBuffer = new Uint8Array(frame.allocationSize({ format }));
+        try {
+          await frame.copyTo(pixelBuffer, { format });
+          frame_input(pixelBuffer, frame.displayWidth, frame.displayHeight);
+        } finally {
+          frame.close();
+        }
+        requestAnimationFrame(() => readVideoFrames(reader));
+      }
+
+      function captureWithCanvas(canvas, context) {
+        if (video.videoWidth > 0 && video.videoHeight > 0) {
+          if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+          }
+          context.drawImage(video, 0, 0, canvas.width, canvas.height);
+          const image = context.getImageData(0, 0, canvas.width, canvas.height);
+          frame_input(new Uint8Array(image.data), canvas.width, canvas.height);
+        }
+        requestAnimationFrame(() => captureWithCanvas(canvas, context));
+      }
+
+      document.addEventListener("contextmenu", (event) => event.preventDefault());
+    </script>
+  </body>
+</html>

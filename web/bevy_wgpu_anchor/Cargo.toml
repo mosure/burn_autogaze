@@ -1,0 +1,30 @@
+[package]
+name = "burn_autogaze_bevy_wgpu_anchor"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+burn_autogaze = { path = "../..", default-features = false, features = ["wasm"] }
+
+[dependencies.bevy]
+git = "https://github.com/bevyengine/bevy"
+rev = "ae2fcc0353d95e887470f0f6fc8a7e434e5549ce"
+default-features = false
+features = [
+  "bevy_asset",
+  "bevy_camera",
+  "bevy_core_pipeline",
+  "bevy_image",
+  "bevy_log",
+  "bevy_render",
+  "bevy_sprite",
+  "bevy_ui",
+  "bevy_ui_render",
+  "bevy_window",
+  "bevy_winit",
+  "default_font",
+  "png",
+  "std",
+  "webgpu",
+]
