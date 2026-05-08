@@ -672,7 +672,7 @@ fn process_frames(
     let visualization_state = frame_input.visualization_state.0.clone();
 
     let task = AsyncComputeTaskPool::get().spawn(async move {
-        let (visualization, visualization_state) = run_autogaze_visualization(
+        let result = run_autogaze_visualization(
             pipeline,
             clip,
             top_k,
@@ -684,30 +684,37 @@ fn process_frames(
 
         let mut queue = CommandQueue::default();
         queue.push(move |world: &mut World| {
-            let width = visualization.width;
-            let height = visualization.height;
-            let gaze_update_ratio = visualization.gaze_update_ratio;
-            if let Ok(entity) = world.get_entity_mut(image_entity)
-                && let Some(image_node) = entity.get::<ImageNode>()
-            {
-                let handle = image_node.image.clone();
-                if let Some(mut images) = world.get_resource_mut::<Assets<Image>>() {
-                    let image = visualization_image(visualization);
-                    let _ = images.insert(handle.id(), image);
+            match result {
+                Ok((visualization, visualization_state)) => {
+                    let width = visualization.width;
+                    let height = visualization.height;
+                    let gaze_update_ratio = visualization.gaze_update_ratio;
+                    if let Ok(entity) = world.get_entity_mut(image_entity)
+                        && let Some(image_node) = entity.get::<ImageNode>()
+                    {
+                        let handle = image_node.image.clone();
+                        if let Some(mut images) = world.get_resource_mut::<Assets<Image>>() {
+                            let image = visualization_image(visualization);
+                            let _ = images.insert(handle.id(), image);
+                        }
+                    }
+
+                    if let Some(mut texture) = world.get_resource_mut::<AutoGazeTexture>() {
+                        texture.width = width;
+                        texture.height = height;
+                    }
+
+                    if let Some(mut state) = world.get_resource_mut::<BevyVisualizationState>() {
+                        state.0 = visualization_state;
+                    }
+
+                    if let Some(mut stats) = world.get_resource_mut::<GazeRatioStats>() {
+                        stats.record(gaze_update_ratio);
+                    }
                 }
-            }
-
-            if let Some(mut texture) = world.get_resource_mut::<AutoGazeTexture>() {
-                texture.width = width;
-                texture.height = height;
-            }
-
-            if let Some(mut state) = world.get_resource_mut::<BevyVisualizationState>() {
-                state.0 = visualization_state;
-            }
-
-            if let Some(mut stats) = world.get_resource_mut::<GazeRatioStats>() {
-                stats.record(gaze_update_ratio);
+                Err(err) => {
+                    log(&format!("AutoGaze inference failed: {err}"));
+                }
             }
 
             if let Ok(mut tracker) = world.get_entity_mut(task_entity) {
@@ -727,9 +734,12 @@ fn preview_frames(
     mut texture: ResMut<AutoGazeTexture>,
     mut frame_input: FrameInputParams,
     image_nodes: Query<&ImageNode>,
+    active_tasks: Query<&ProcessAutoGaze>,
     mut images: ResMut<Assets<Image>>,
 ) {
-    if model.pipeline.is_some() {
+    let model_ready = model.pipeline.is_some();
+    let inference_busy = active_tasks.iter().count() >= MAX_IN_FLIGHT_TASKS;
+    if model_ready && !inference_busy {
         return;
     }
 
@@ -755,11 +765,23 @@ fn preview_frames(
         return;
     };
 
+    if model_ready {
+        let visualization = live_preview_visualization(frame);
+        apply_visualization_to_texture(
+            image_entity,
+            visualization,
+            &mut texture,
+            &image_nodes,
+            &mut images,
+        );
+        return;
+    }
+
     frame_input.visualization_state.0.configure(
         frame_input.config.visualization_mode,
         frame_input.config.keyframe_duration,
     );
-    let visualization = visualize_points(
+    let visualization = match visualize_points(
         frame,
         frame.width() as usize,
         frame.height() as usize,
@@ -767,7 +789,13 @@ fn preview_frames(
         frame_input.config.mask_cell_scale,
         frame_input.config.blend_alpha,
         &mut frame_input.visualization_state.0,
-    );
+    ) {
+        Ok(visualization) => visualization,
+        Err(err) => {
+            log(&format!("failed to draw AutoGaze preview: {err}"));
+            return;
+        }
+    };
     frame_input
         .gaze_ratio_stats
         .record(visualization.gaze_update_ratio);
@@ -872,22 +900,31 @@ fn run_autogaze_visualization(
     cell_scale: f32,
     blend_alpha: f32,
     mut visualization_state: AutoGazeVisualizationState,
-) -> (Visualization, AutoGazeVisualizationState) {
+) -> Result<(Visualization, AutoGazeVisualizationState), String> {
     let device = burn_device();
-    let width = clip[0].width() as usize;
-    let height = clip[0].height() as usize;
+    let first_frame = clip
+        .first()
+        .ok_or_else(|| "AutoGaze clip must contain at least one frame".to_string())?;
+    let width = first_frame.width() as usize;
+    let height = first_frame.height() as usize;
     let mut rgba = Vec::with_capacity(clip.len() * width * height * 4);
     for frame in &clip {
+        if frame.width() as usize != width || frame.height() as usize != height {
+            return Err("AutoGaze clip frame dimensions changed".to_string());
+        }
         rgba.extend_from_slice(frame.as_raw());
     }
     let traces = {
-        let pipeline = pipeline.lock().expect("AutoGaze model poisoned");
+        let pipeline = pipeline
+            .lock()
+            .map_err(|_| "AutoGaze model lock was poisoned".to_string())?;
         let shape = AutoGazeRgbaClipShape::new(clip.len(), height, width);
         pipeline
             .trace_rgba_clip_with_mode(&rgba, shape, top_k, mode, &device)
-            .expect("valid Bevy AutoGaze RGBA clip")
+            .map_err(|err| format!("{err:#}"))?
     };
-    AutoGazeBevyBackend::sync(&device).expect("failed to sync Burn WebGPU backend");
+    AutoGazeBevyBackend::sync(&device)
+        .map_err(|err| format!("failed to sync Burn WebGPU backend: {err}"))?;
 
     let frame_index = clip.len().saturating_sub(1);
     let points = traces
@@ -896,15 +933,16 @@ fn run_autogaze_visualization(
         .map(|set| set.points.clone())
         .unwrap_or_default();
     let visualization = visualize_points(
-        clip.last().expect("nonempty clip"),
+        clip.last()
+            .ok_or_else(|| "AutoGaze clip must contain at least one frame".to_string())?,
         width,
         height,
         &points,
         cell_scale,
         blend_alpha,
         &mut visualization_state,
-    );
-    (visualization, visualization_state)
+    )?;
+    Ok((visualization, visualization_state))
 }
 
 struct Visualization {
@@ -922,7 +960,7 @@ fn visualize_points(
     cell_scale: f32,
     blend_alpha: f32,
     visualization_state: &mut AutoGazeVisualizationState,
-) -> Visualization {
+) -> Result<Visualization, String> {
     let visualization = visualization_state
         .visualize_rgba(
             rgba.as_raw(),
@@ -932,14 +970,52 @@ fn visualize_points(
             cell_scale,
             blend_alpha,
         )
-        .expect("valid Bevy AutoGaze visualization input");
+        .map_err(|err| format!("{err:#}"))?;
     let gaze_update_ratio = visualization.update_ratio();
-    Visualization {
+    Ok(Visualization {
         width: visualization.side_by_side_width as u32,
         height: visualization.height as u32,
         rgba: visualization.side_by_side_rgba,
         gaze_update_ratio,
+    })
+}
+
+fn live_preview_visualization(rgba: &RgbaImage) -> Visualization {
+    let width = rgba.width().max(1);
+    let height = rgba.height().max(1);
+    let side_by_side_width = width.saturating_mul(3).max(1);
+    let mut out = vec![0u8; side_by_side_width as usize * height as usize * 4];
+
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            let src = (y * width as usize + x) * 4;
+            let pixel = &rgba.as_raw()[src..src + 4];
+            write_preview_column(&mut out, width as usize, 0, x, y, pixel);
+            write_preview_column(&mut out, width as usize, 1, x, y, &[0, 0, 0, 255]);
+            write_preview_column(&mut out, width as usize, 2, x, y, pixel);
+        }
     }
+
+    Visualization {
+        width: side_by_side_width,
+        height,
+        rgba: out,
+        gaze_update_ratio: 0.0,
+    }
+}
+
+fn write_preview_column(
+    out: &mut [u8],
+    width: usize,
+    column: usize,
+    x: usize,
+    y: usize,
+    rgba: &[u8],
+) {
+    let out_width = width * 3;
+    let out_x = column * width + x;
+    let dst = (y * out_width + out_x) * 4;
+    out[dst..dst + 4].copy_from_slice(rgba);
 }
 
 fn apply_visualization_to_texture(
@@ -1287,6 +1363,19 @@ mod tests {
     }
 
     #[test]
+    fn live_preview_keeps_input_visible_while_inference_is_busy() {
+        let frame =
+            RgbaImage::from_raw(2, 1, vec![10, 20, 30, 255, 40, 50, 60, 255]).expect("frame");
+        let visualization = live_preview_visualization(&frame);
+
+        assert_eq!(visualization.width, 6);
+        assert_eq!(visualization.height, 1);
+        assert_eq!(&visualization.rgba[0..4], &[10, 20, 30, 255]);
+        assert_eq!(&visualization.rgba[8..12], &[0, 0, 0, 255]);
+        assert_eq!(&visualization.rgba[16..20], &[10, 20, 30, 255]);
+    }
+
+    #[test]
     fn bevy_visualization_uses_crisp_cell_mask() {
         let frame = RgbaImage::from_raw(
             4,
@@ -1301,7 +1390,8 @@ mod tests {
         let point = FixationPoint::with_extent(0.25, 0.25, 0.5, 0.5, 1.0);
 
         let mut state = AutoGazeVisualizationState::new(AutoGazeVisualizationMode::FullBlend, 30);
-        let visualization = visualize_points(&frame, 4, 4, &[point], 1.0, 0.5, &mut state);
+        let visualization =
+            visualize_points(&frame, 4, 4, &[point], 1.0, 0.5, &mut state).expect("visualize");
 
         assert_eq!(visualization.width, 12);
         assert_eq!(visualization.height, 4);

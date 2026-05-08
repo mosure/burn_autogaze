@@ -4,15 +4,22 @@ pub mod camera {
         Arc, Mutex,
         mpsc::{self, Receiver, Sender, SyncSender, TryRecvError},
     };
+    use std::time::Duration;
 
     use image::{RgbImage, RgbaImage};
     use nokhwa::{
-        CallbackCamera, nokhwa_initialize,
+        Camera, nokhwa_initialize,
         pixel_format::RgbFormat,
         query,
-        utils::{ApiBackend, RequestedFormat, RequestedFormatType},
+        utils::{
+            ApiBackend, CameraFormat, CameraInfo, FrameFormat, RequestedFormat, RequestedFormatType,
+        },
     };
     use once_cell::sync::OnceCell;
+
+    const CAMERA_WIDTH: u32 = 1280;
+    const CAMERA_HEIGHT: u32 = 720;
+    const CAMERA_FPS: u32 = 30;
 
     pub static SAMPLE_RECEIVER: OnceCell<Arc<Mutex<Receiver<RgbaImage>>>> = OnceCell::new();
     pub static SAMPLE_SENDER: OnceCell<SyncSender<RgbaImage>> = OnceCell::new();
@@ -53,6 +60,7 @@ pub mod camera {
             }
         });
 
+        crate::log("querying native cameras...");
         let devices = match query(ApiBackend::Auto) {
             Ok(devices) => devices,
             Err(err) => {
@@ -60,53 +68,49 @@ pub mod camera {
                 return;
             }
         };
-        let Some(index) = devices.first().map(|device| device.index()) else {
+        crate::log(&format!("found {} native camera(s)", devices.len()));
+        if devices.is_empty() {
             crate::log("no camera found");
-            return;
-        };
-
-        let format = RequestedFormat::new::<RgbFormat>(RequestedFormatType::None);
-        let camera = CallbackCamera::new(index.clone(), format, |buffer| {
-            let Ok(image) = buffer.decode_image::<RgbFormat>() else {
-                return;
-            };
-            if let Some(sender) = SAMPLE_SENDER.get() {
-                let _ = sender.try_send(rgb_to_rgba(image));
-            }
-        });
-        let Ok(mut camera) = camera else {
-            crate::log("failed to open camera");
-            return;
-        };
-
-        if let Err(err) = camera.open_stream() {
-            crate::log(&format!("failed to open camera stream: {err}"));
             return;
         }
 
+        let Some(mut camera) = open_first_camera(&devices) else {
+            crate::log("failed to open any native camera");
+            return;
+        };
+
+        let mut error_count = 0usize;
+
         loop {
-            if let Err(err) = camera.poll_frame() {
-                crate::log(&format!("failed to poll camera frame: {err}"));
+            if should_stop() {
                 break;
             }
 
-            let Some(receiver) = APP_RUN_RECEIVER.get() else {
-                break;
-            };
-            let Ok(receiver) = receiver.lock() else {
-                crate::log("camera stop receiver was poisoned");
-                break;
-            };
-            match receiver.try_recv() {
-                Ok(_) => break,
-                Err(TryRecvError::Empty) => continue,
-                Err(TryRecvError::Disconnected) => break,
-            };
+            match camera.frame() {
+                Ok(buffer) => match buffer.decode_image::<RgbFormat>() {
+                    Ok(image) => {
+                        error_count = 0;
+                        if let Some(sender) = SAMPLE_SENDER.get() {
+                            let _ = sender.try_send(rgb_to_rgba(image));
+                        }
+                    }
+                    Err(err) => {
+                        error_count += 1;
+                        log_capture_error("decode camera frame", err, error_count);
+                    }
+                },
+                Err(err) => {
+                    error_count += 1;
+                    log_capture_error("capture camera frame", err, error_count);
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
         }
 
         if let Err(err) = camera.stop_stream() {
             crate::log(&format!("failed to stop camera stream: {err}"));
         }
+        crate::log("camera stream stopped");
     }
 
     pub fn receive_image() -> Option<RgbaImage> {
@@ -132,6 +136,95 @@ pub mod camera {
             rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
         }
         RgbaImage::from_raw(width, height, rgba).expect("valid rgba frame")
+    }
+
+    fn open_first_camera(devices: &[CameraInfo]) -> Option<Camera> {
+        let requested_formats = [
+            (
+                "closest 1280x720 MJPEG",
+                RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(
+                    CameraFormat::new_from(
+                        CAMERA_WIDTH,
+                        CAMERA_HEIGHT,
+                        FrameFormat::MJPEG,
+                        CAMERA_FPS,
+                    ),
+                )),
+            ),
+            (
+                "closest 1280x720 YUYV",
+                RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(
+                    CameraFormat::new_from(
+                        CAMERA_WIDTH,
+                        CAMERA_HEIGHT,
+                        FrameFormat::YUYV,
+                        CAMERA_FPS,
+                    ),
+                )),
+            ),
+            (
+                "backend default",
+                RequestedFormat::new::<RgbFormat>(RequestedFormatType::None),
+            ),
+        ];
+
+        for camera_info in devices {
+            for (label, requested_format) in requested_formats {
+                let index = camera_info.index().clone();
+                crate::log(&format!(
+                    "opening camera `{}` ({index}) with {label}",
+                    camera_info.human_name()
+                ));
+                let mut camera = match Camera::new(index, requested_format) {
+                    Ok(camera) => camera,
+                    Err(err) => {
+                        crate::log(&format!("failed to create camera with {label}: {err}"));
+                        continue;
+                    }
+                };
+
+                let format = camera.camera_format();
+                crate::log(&format!(
+                    "camera format: {}x{} {}fps {}",
+                    format.width(),
+                    format.height(),
+                    format.frame_rate(),
+                    format.format()
+                ));
+
+                match camera.open_stream() {
+                    Ok(()) => {
+                        crate::log("camera stream open");
+                        return Some(camera);
+                    }
+                    Err(err) => {
+                        crate::log(&format!("failed to open camera stream with {label}: {err}"));
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    fn should_stop() -> bool {
+        let Some(receiver) = APP_RUN_RECEIVER.get() else {
+            return true;
+        };
+        let Ok(receiver) = receiver.lock() else {
+            crate::log("camera stop receiver was poisoned");
+            return true;
+        };
+        match receiver.try_recv() {
+            Ok(_) | Err(TryRecvError::Disconnected) => true,
+            Err(TryRecvError::Empty) => false,
+        }
+    }
+
+    fn log_capture_error(action: &str, err: impl std::fmt::Display, error_count: usize) {
+        if error_count == 1 || error_count.is_multiple_of(120) {
+            crate::log(&format!("failed to {action}: {err}"));
+        }
     }
 }
 

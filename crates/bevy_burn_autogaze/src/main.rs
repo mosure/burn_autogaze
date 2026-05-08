@@ -1,19 +1,19 @@
 use bevy_burn_autogaze::{BevyBurnAutoGazeConfig, run_app};
 
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
-use clap::Parser;
+use clap::{ArgAction, Parser};
 
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 #[derive(Debug, Parser)]
 #[command(about = "bevy_burn_autogaze", version, long_about = None)]
 struct NativeArgs {
-    #[arg(long, default_value = "true")]
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
     press_esc_to_close: bool,
 
-    #[arg(long, default_value = "true")]
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
     show_fps: bool,
 
-    #[arg(long, default_value = "true")]
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
     show_gaze_ratio: bool,
 
     #[arg(long, default_value = bevy_burn_autogaze::DEFAULT_NATIVE_MODEL_DIR)]
@@ -22,7 +22,7 @@ struct NativeArgs {
     #[arg(long)]
     image_path: Option<std::path::PathBuf>,
 
-    #[arg(long, default_value = "true")]
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
     load_model: bool,
 
     #[arg(long, default_value = "resize-224")]

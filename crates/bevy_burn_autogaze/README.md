@@ -17,6 +17,8 @@ viewer/inference knobs include `--top-k`, `--frames-per-clip`,
 `--max-gaze-tokens-each-frame`, `--inference-width`, `--inference-height`,
 `--mask-cell-scale`, `--blend-alpha`, and `--show-fps`. `--show-gaze-ratio`
 toggles the text overlay for per-frame and EMA output update ratio.
+Use `--load-model=false` to verify camera/preview rendering without waiting for
+model load or inference.
 
 `--visualization-mode full-blend` renders the current frame's alpha-blended
 mask. `--visualization-mode interframe --keyframe-duration 30` preserves the
