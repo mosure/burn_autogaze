@@ -26,6 +26,10 @@ impl AutoGazeVisualization {
     pub fn update_ratio(&self) -> f64 {
         ratio(self.updated_pixel_count, self.width * self.height)
     }
+
+    pub fn output_psnr_db(&self, input_rgba: &[u8]) -> Result<f64> {
+        rgba_psnr_db(input_rgba, &self.blend_rgba)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -233,6 +237,38 @@ pub fn visualize_fixations_rgba(
         mask_pixel_count,
         pixels,
     )
+}
+
+pub fn rgba_psnr_db(reference_rgba: &[u8], candidate_rgba: &[u8]) -> Result<f64> {
+    ensure!(
+        reference_rgba.len() == candidate_rgba.len(),
+        "PSNR inputs must have the same byte length"
+    );
+    ensure!(
+        reference_rgba.len().is_multiple_of(4),
+        "PSNR inputs must be RGBA buffers"
+    );
+    ensure!(!reference_rgba.is_empty(), "PSNR inputs must be nonempty");
+
+    let mut squared_error = 0.0f64;
+    let mut samples = 0usize;
+    for (reference, candidate) in reference_rgba
+        .chunks_exact(4)
+        .zip(candidate_rgba.chunks_exact(4))
+    {
+        for channel in 0..3 {
+            let diff = reference[channel] as f64 - candidate[channel] as f64;
+            squared_error += diff * diff;
+            samples += 1;
+        }
+    }
+
+    if squared_error == 0.0 {
+        return Ok(f64::INFINITY);
+    }
+
+    let mse = squared_error / samples.max(1) as f64;
+    Ok(10.0 * ((255.0 * 255.0) / mse).log10())
 }
 
 fn validate_rgba_dimensions(rgba: &[u8], width: usize, height: usize) -> Result<usize> {
@@ -467,5 +503,22 @@ mod tests {
         );
         assert_eq!(fourth_visualization.mask_ratio(), 0.0);
         assert_eq!(fourth_visualization.update_ratio(), 1.0);
+    }
+
+    #[test]
+    fn psnr_is_infinite_for_identical_rgba_buffers() {
+        let rgba = [10, 20, 30, 255, 40, 50, 60, 255];
+
+        assert!(rgba_psnr_db(&rgba, &rgba).expect("psnr").is_infinite());
+    }
+
+    #[test]
+    fn psnr_uses_rgb_channels() {
+        let reference = [10, 20, 30, 0];
+        let candidate = [20, 20, 30, 255];
+        let psnr = rgba_psnr_db(&reference, &candidate).expect("psnr");
+        let expected = 10.0f64 * ((255.0f64 * 255.0f64) / (100.0f64 / 3.0f64)).log10();
+
+        assert!((psnr - expected).abs() < 1.0e-12);
     }
 }

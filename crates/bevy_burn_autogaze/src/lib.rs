@@ -54,6 +54,9 @@ const MODEL_INPUT_SIZE: usize = 224;
 const MAX_IN_FLIGHT_TASKS: usize = 1;
 pub const DEFAULT_KEYFRAME_DURATION: usize = 30;
 const GAZE_RATIO_EMA_ALPHA: f64 = 0.15;
+const PSNR_EMA_ALPHA: f64 = 0.15;
+const METRIC_OVERLAY_BOTTOM: f32 = 8.0;
+const METRIC_OVERLAY_STEP: f32 = 34.0;
 const INFERENCE_FPS: DiagnosticPath = DiagnosticPath::const_new("autogaze_inference_fps");
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -92,6 +95,7 @@ pub struct BevyBurnAutoGazeConfig {
     pub press_esc_to_close: bool,
     pub show_fps: bool,
     pub show_gaze_ratio: bool,
+    pub show_psnr: bool,
     pub model_dir: PathBuf,
     pub config_url: String,
     pub weights_url: String,
@@ -115,6 +119,7 @@ impl Default for BevyBurnAutoGazeConfig {
             press_esc_to_close: true,
             show_fps: true,
             show_gaze_ratio: true,
+            show_psnr: true,
             model_dir: PathBuf::from(DEFAULT_NATIVE_MODEL_DIR),
             config_url: DEFAULT_CONFIG_URL.to_string(),
             weights_url: DEFAULT_WEIGHTS_URL.to_string(),
@@ -149,6 +154,10 @@ impl BevyBurnAutoGazeConfig {
             }
             "show-gaze-ratio" | "show-gaze" | "show-update-ratio" => {
                 self.show_gaze_ratio = parse_bool_option(&key, value)?;
+                Ok(())
+            }
+            "show-psnr" | "show-output-psnr" => {
+                self.show_psnr = parse_bool_option(&key, value)?;
                 Ok(())
             }
             "model-dir" => {
@@ -401,6 +410,35 @@ impl GazeRatioStats {
     }
 }
 
+#[derive(Resource, Clone, Debug)]
+struct PsnrStats {
+    current: f64,
+    ema: f64,
+    initialized: bool,
+}
+
+impl Default for PsnrStats {
+    fn default() -> Self {
+        Self {
+            current: 0.0,
+            ema: 0.0,
+            initialized: false,
+        }
+    }
+}
+
+impl PsnrStats {
+    fn record(&mut self, psnr_db: f64) {
+        self.current = psnr_db;
+        self.ema = if self.initialized {
+            ema_metric(self.ema, self.current, PSNR_EMA_ALPHA)
+        } else {
+            self.initialized = true;
+            self.current
+        };
+    }
+}
+
 #[derive(SystemParam)]
 struct FrameInputParams<'w> {
     config: Res<'w, BevyBurnAutoGazeConfig>,
@@ -408,6 +446,7 @@ struct FrameInputParams<'w> {
     frame_queue: ResMut<'w, FrameQueue>,
     visualization_state: ResMut<'w, BevyVisualizationState>,
     gaze_ratio_stats: ResMut<'w, GazeRatioStats>,
+    psnr_stats: ResMut<'w, PsnrStats>,
 }
 
 #[derive(Component)]
@@ -446,6 +485,7 @@ pub fn viewer_app(config: BevyBurnAutoGazeConfig) -> App {
         config.keyframe_duration,
     )));
     app.insert_resource(GazeRatioStats::default());
+    app.insert_resource(PsnrStats::default());
     app.insert_resource(AutoGazeModelState {
         config: config.clone(),
         pipeline: None,
@@ -483,6 +523,11 @@ pub fn viewer_app(config: BevyBurnAutoGazeConfig) -> App {
     if config.show_gaze_ratio {
         app.add_systems(Startup, gaze_ratio_display_setup);
         app.add_systems(Update, gaze_ratio_update_system);
+    }
+
+    if config.show_psnr {
+        app.add_systems(Startup, psnr_display_setup);
+        app.add_systems(Update, psnr_update_system);
     }
 
     app.add_systems(
@@ -663,8 +708,11 @@ fn process_frames(
     let pipeline = pipeline.clone();
     let mode = frame_input.config.mode.inference_mode();
     let top_k = frame_input.config.top_k.max(1);
-    let cell_scale = frame_input.config.mask_cell_scale;
-    let blend_alpha = frame_input.config.blend_alpha;
+    let visualization_options = VisualizationOptions::new(
+        frame_input.config.mask_cell_scale,
+        frame_input.config.blend_alpha,
+        frame_input.config.show_psnr,
+    );
     frame_input.visualization_state.0.configure(
         frame_input.config.visualization_mode,
         frame_input.config.keyframe_duration,
@@ -677,8 +725,7 @@ fn process_frames(
             clip,
             top_k,
             mode,
-            cell_scale,
-            blend_alpha,
+            visualization_options,
             visualization_state,
         );
 
@@ -689,6 +736,7 @@ fn process_frames(
                     let width = visualization.width;
                     let height = visualization.height;
                     let gaze_update_ratio = visualization.gaze_update_ratio;
+                    let psnr_db = visualization.psnr_db;
                     if let Ok(entity) = world.get_entity_mut(image_entity)
                         && let Some(image_node) = entity.get::<ImageNode>()
                     {
@@ -710,6 +758,12 @@ fn process_frames(
 
                     if let Some(mut stats) = world.get_resource_mut::<GazeRatioStats>() {
                         stats.record(gaze_update_ratio);
+                    }
+
+                    if let Some(psnr_db) = psnr_db
+                        && let Some(mut stats) = world.get_resource_mut::<PsnrStats>()
+                    {
+                        stats.record(psnr_db);
                     }
                 }
                 Err(err) => {
@@ -766,7 +820,7 @@ fn preview_frames(
     };
 
     if model_ready {
-        let visualization = live_preview_visualization(frame);
+        let visualization = live_preview_visualization(frame, frame_input.config.show_psnr);
         apply_visualization_to_texture(
             image_entity,
             visualization,
@@ -781,13 +835,17 @@ fn preview_frames(
         frame_input.config.visualization_mode,
         frame_input.config.keyframe_duration,
     );
+    let visualization_options = VisualizationOptions::new(
+        frame_input.config.mask_cell_scale,
+        frame_input.config.blend_alpha,
+        frame_input.config.show_psnr,
+    );
     let visualization = match visualize_points(
         frame,
         frame.width() as usize,
         frame.height() as usize,
         &[],
-        frame_input.config.mask_cell_scale,
-        frame_input.config.blend_alpha,
+        visualization_options,
         &mut frame_input.visualization_state.0,
     ) {
         Ok(visualization) => visualization,
@@ -799,6 +857,9 @@ fn preview_frames(
     frame_input
         .gaze_ratio_stats
         .record(visualization.gaze_update_ratio);
+    if let Some(psnr_db) = visualization.psnr_db {
+        frame_input.psnr_stats.record(psnr_db);
+    }
     apply_visualization_to_texture(
         image_entity,
         visualization,
@@ -897,8 +958,7 @@ fn run_autogaze_visualization(
     clip: Vec<RgbaImage>,
     top_k: usize,
     mode: AutoGazeInferenceMode,
-    cell_scale: f32,
-    blend_alpha: f32,
+    visualization_options: VisualizationOptions,
     mut visualization_state: AutoGazeVisualizationState,
 ) -> Result<(Visualization, AutoGazeVisualizationState), String> {
     let device = burn_device();
@@ -938,11 +998,27 @@ fn run_autogaze_visualization(
         width,
         height,
         &points,
-        cell_scale,
-        blend_alpha,
+        visualization_options,
         &mut visualization_state,
     )?;
     Ok((visualization, visualization_state))
+}
+
+#[derive(Clone, Copy)]
+struct VisualizationOptions {
+    cell_scale: f32,
+    blend_alpha: f32,
+    calculate_psnr: bool,
+}
+
+impl VisualizationOptions {
+    fn new(cell_scale: f32, blend_alpha: f32, calculate_psnr: bool) -> Self {
+        Self {
+            cell_scale,
+            blend_alpha,
+            calculate_psnr,
+        }
+    }
 }
 
 struct Visualization {
@@ -950,6 +1026,7 @@ struct Visualization {
     height: u32,
     rgba: Vec<u8>,
     gaze_update_ratio: f64,
+    psnr_db: Option<f64>,
 }
 
 fn visualize_points(
@@ -957,8 +1034,7 @@ fn visualize_points(
     width: usize,
     height: usize,
     points: &[FixationPoint],
-    cell_scale: f32,
-    blend_alpha: f32,
+    options: VisualizationOptions,
     visualization_state: &mut AutoGazeVisualizationState,
 ) -> Result<Visualization, String> {
     let visualization = visualization_state
@@ -967,20 +1043,30 @@ fn visualize_points(
             width,
             height,
             points,
-            cell_scale,
-            blend_alpha,
+            options.cell_scale,
+            options.blend_alpha,
         )
         .map_err(|err| format!("{err:#}"))?;
     let gaze_update_ratio = visualization.update_ratio();
+    let psnr_db = if options.calculate_psnr {
+        Some(
+            visualization
+                .output_psnr_db(rgba.as_raw())
+                .map_err(|err| format!("{err:#}"))?,
+        )
+    } else {
+        None
+    };
     Ok(Visualization {
         width: visualization.side_by_side_width as u32,
         height: visualization.height as u32,
         rgba: visualization.side_by_side_rgba,
         gaze_update_ratio,
+        psnr_db,
     })
 }
 
-fn live_preview_visualization(rgba: &RgbaImage) -> Visualization {
+fn live_preview_visualization(rgba: &RgbaImage, calculate_psnr: bool) -> Visualization {
     let width = rgba.width().max(1);
     let height = rgba.height().max(1);
     let side_by_side_width = width.saturating_mul(3).max(1);
@@ -1001,6 +1087,7 @@ fn live_preview_visualization(rgba: &RgbaImage) -> Visualization {
         height,
         rgba: out,
         gaze_update_ratio: 0.0,
+        psnr_db: calculate_psnr.then_some(f64::INFINITY),
     }
 }
 
@@ -1165,7 +1252,7 @@ fn fps_display_setup(mut commands: Commands) {
             TextColor(Color::WHITE),
             Node {
                 position_type: PositionType::Absolute,
-                bottom: Val::Px(8.0),
+                bottom: Val::Px(METRIC_OVERLAY_BOTTOM),
                 left: Val::Px(12.0),
                 ..default()
             },
@@ -1199,7 +1286,7 @@ fn fps_update_system(
 }
 
 fn gaze_ratio_display_setup(mut commands: Commands, config: Res<BevyBurnAutoGazeConfig>) {
-    let bottom = if config.show_fps { 42.0 } else { 8.0 };
+    let bottom = metric_overlay_bottom(usize::from(config.show_fps));
     commands
         .spawn((
             Text("gaze: ".to_string()),
@@ -1244,6 +1331,74 @@ fn gaze_ratio_update_system(
         } else {
             **text = "--.-% ema --.-%".to_string();
         }
+    }
+}
+
+fn psnr_display_setup(mut commands: Commands, config: Res<BevyBurnAutoGazeConfig>) {
+    let row = usize::from(config.show_fps) + usize::from(config.show_gaze_ratio);
+    commands
+        .spawn((
+            Text("psnr: ".to_string()),
+            TextFont {
+                font_size: bevy::text::FontSize::Px(24.0),
+                ..Default::default()
+            },
+            TextColor(Color::WHITE),
+            Node {
+                position_type: PositionType::Absolute,
+                bottom: Val::Px(metric_overlay_bottom(row)),
+                left: Val::Px(12.0),
+                ..default()
+            },
+            ZIndex(2),
+        ))
+        .with_child((
+            PsnrText,
+            TextColor(Color::srgb(0.7, 1.0, 0.6)),
+            TextFont {
+                font_size: bevy::text::FontSize::Px(24.0),
+                ..Default::default()
+            },
+            TextSpan::default(),
+        ));
+}
+
+#[derive(Component)]
+struct PsnrText;
+
+fn psnr_update_system(stats: Res<PsnrStats>, mut query: Query<&mut TextSpan, With<PsnrText>>) {
+    for mut text in &mut query {
+        if stats.initialized {
+            **text = format!(
+                "{} dB ema {} dB",
+                format_psnr_db(stats.current),
+                format_psnr_db(stats.ema)
+            );
+        } else {
+            **text = "--.- dB ema --.- dB".to_string();
+        }
+    }
+}
+
+fn metric_overlay_bottom(row: usize) -> f32 {
+    METRIC_OVERLAY_BOTTOM + row as f32 * METRIC_OVERLAY_STEP
+}
+
+fn ema_metric(previous: f64, current: f64, alpha: f64) -> f64 {
+    if previous.is_finite() && current.is_finite() {
+        previous * (1.0 - alpha) + current * alpha
+    } else {
+        current
+    }
+}
+
+fn format_psnr_db(value: f64) -> String {
+    if value.is_infinite() && value.is_sign_positive() {
+        "inf".to_string()
+    } else if value.is_finite() {
+        format!("{value:.1}")
+    } else {
+        "--.-".to_string()
     }
 }
 
@@ -1310,7 +1465,7 @@ mod tests {
     fn applies_url_query_to_viewer_config() {
         let mut config = BevyBurnAutoGazeConfig::default();
         let errors = config.apply_query_string(
-            "?mode=full-res&top_k=2&frames-per-clip=3&inference-width=1920&inference-height=1080&show-fps=false&config-url=%2Fconfig.json&weights-url=%2Fmodel.safetensors&load-model=false&mask-cell-scale=2.5&blend-alpha=0.5&visualization-mode=interframe&keyframe-duration=7",
+            "?mode=full-res&top_k=2&frames-per-clip=3&inference-width=1920&inference-height=1080&show-fps=false&show-psnr=false&config-url=%2Fconfig.json&weights-url=%2Fmodel.safetensors&load-model=false&mask-cell-scale=2.5&blend-alpha=0.5&visualization-mode=interframe&keyframe-duration=7",
         );
 
         assert!(errors.is_empty(), "{errors:?}");
@@ -1321,6 +1476,7 @@ mod tests {
         assert_eq!(config.inference_height, Some(1080));
         assert!(!config.show_fps);
         assert!(config.show_gaze_ratio);
+        assert!(!config.show_psnr);
         assert_eq!(config.config_url, "/config.json");
         assert_eq!(config.weights_url, "/model.safetensors");
         assert!(!config.load_model);
@@ -1335,6 +1491,10 @@ mod tests {
         let errors = config.apply_query_string("?show-gaze-ratio=false");
         assert!(errors.is_empty(), "{errors:?}");
         assert!(!config.show_gaze_ratio);
+
+        let errors = config.apply_query_string("?show-psnr=true");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(config.show_psnr);
     }
 
     #[test]
@@ -1366,13 +1526,17 @@ mod tests {
     fn live_preview_keeps_input_visible_while_inference_is_busy() {
         let frame =
             RgbaImage::from_raw(2, 1, vec![10, 20, 30, 255, 40, 50, 60, 255]).expect("frame");
-        let visualization = live_preview_visualization(&frame);
+        let visualization = live_preview_visualization(&frame, false);
 
         assert_eq!(visualization.width, 6);
         assert_eq!(visualization.height, 1);
         assert_eq!(&visualization.rgba[0..4], &[10, 20, 30, 255]);
         assert_eq!(&visualization.rgba[8..12], &[0, 0, 0, 255]);
         assert_eq!(&visualization.rgba[16..20], &[10, 20, 30, 255]);
+        assert!(visualization.psnr_db.is_none());
+
+        let visualization = live_preview_visualization(&frame, true);
+        assert!(visualization.psnr_db.expect("psnr").is_infinite());
     }
 
     #[test]
@@ -1390,12 +1554,20 @@ mod tests {
         let point = FixationPoint::with_extent(0.25, 0.25, 0.5, 0.5, 1.0);
 
         let mut state = AutoGazeVisualizationState::new(AutoGazeVisualizationMode::FullBlend, 30);
-        let visualization =
-            visualize_points(&frame, 4, 4, &[point], 1.0, 0.5, &mut state).expect("visualize");
+        let visualization = visualize_points(
+            &frame,
+            4,
+            4,
+            &[point],
+            VisualizationOptions::new(1.0, 0.5, false),
+            &mut state,
+        )
+        .expect("visualize");
 
         assert_eq!(visualization.width, 12);
         assert_eq!(visualization.height, 4);
         assert_eq!(visualization.gaze_update_ratio, 1.0);
+        assert!(visualization.psnr_db.is_none());
         for y in 0..4 {
             for x in 0..4 {
                 let mask_src = (y * 12 + 4 + x) * 4;
@@ -1405,5 +1577,35 @@ mod tests {
                 assert_eq!(visualization.rgba[mask_src + 2], expected, "mask {x},{y}");
             }
         }
+    }
+
+    #[test]
+    fn bevy_visualization_calculates_psnr_only_when_requested() {
+        let frame =
+            RgbaImage::from_raw(2, 1, vec![10, 20, 30, 255, 40, 50, 60, 255]).expect("frame");
+        let point = FixationPoint::with_extent(0.25, 0.5, 0.5, 1.0, 1.0);
+        let mut state = AutoGazeVisualizationState::new(AutoGazeVisualizationMode::FullBlend, 30);
+
+        let without_psnr = visualize_points(
+            &frame,
+            2,
+            1,
+            &[point],
+            VisualizationOptions::new(1.0, 0.5, false),
+            &mut state,
+        )
+        .expect("visualize");
+        assert!(without_psnr.psnr_db.is_none());
+
+        let with_psnr = visualize_points(
+            &frame,
+            2,
+            1,
+            &[point],
+            VisualizationOptions::new(1.0, 0.5, true),
+            &mut state,
+        )
+        .expect("visualize");
+        assert!(with_psnr.psnr_db.expect("psnr").is_finite());
     }
 }

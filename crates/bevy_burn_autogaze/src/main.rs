@@ -16,6 +16,9 @@ struct NativeArgs {
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     show_gaze_ratio: bool,
 
+    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    show_psnr: bool,
+
     #[arg(long, default_value = bevy_burn_autogaze::DEFAULT_NATIVE_MODEL_DIR)]
     model_dir: std::path::PathBuf,
 
@@ -72,6 +75,7 @@ impl From<NativeArgs> for BevyBurnAutoGazeConfig {
             press_esc_to_close: args.press_esc_to_close,
             show_fps: args.show_fps,
             show_gaze_ratio: args.show_gaze_ratio,
+            show_psnr: args.show_psnr,
             model_dir: args.model_dir,
             image_path: args.image_path,
             load_model: args.load_model,

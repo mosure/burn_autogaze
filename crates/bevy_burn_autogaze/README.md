@@ -16,8 +16,10 @@ native camera. `--mode tile-224` runs the tiled full-resolution path. Common
 viewer/inference knobs include `--top-k`, `--frames-per-clip`,
 `--max-gaze-tokens-each-frame`, `--inference-width`, `--inference-height`,
 `--mask-cell-scale`, `--blend-alpha`, and `--show-fps`. `--show-gaze-ratio`
-toggles the text overlay for per-frame and EMA output update ratio. In
-`tile-224` mode, `--top-k` is a per-tile budget, so the frame budget is
+toggles the text overlay for per-frame and EMA output update ratio.
+`--show-psnr` toggles PSNR in dB between the current input and rendered output;
+the pixel comparison is skipped when this overlay is disabled. In `tile-224`
+mode, `--top-k` is a per-tile budget, so the frame budget is
 `top-k * tile-count`.
 Use `--load-model=false` to verify camera/preview rendering without waiting for
 model load or inference.
@@ -27,7 +29,8 @@ mask. `--visualization-mode interframe --keyframe-duration 30` preserves the
 previous output outside masked cells, updates masked cells to the current input,
 and redraws a full keyframe every 30 processed frames. The gaze-ratio overlay
 reports the percentage of output pixels updated on the current frame plus an EMA
-across processed frames.
+across processed frames. The PSNR overlay reports current-frame and EMA dB for
+the output column compared to the current input frame.
 
 In `full-blend` mode every processed frame is a full redraw, so the update ratio
 is `100%`. In `interframe` mode keyframes are also `100%`; intermediate frames
@@ -50,7 +53,7 @@ UI is rendered by Bevy into the `#bevy` canvas, matching the native path. Pass
 the same viewer/inference knobs as query parameters:
 
 ```text
-http://localhost:8080/?mode=tile-224&visualization-mode=interframe&keyframe-duration=30&top-k=2&frames-per-clip=2&inference-width=1920&inference-height=1080&show-fps=true&show-gaze-ratio=true
+http://localhost:8080/?mode=tile-224&visualization-mode=interframe&keyframe-duration=30&top-k=2&frames-per-clip=2&inference-width=1920&inference-height=1080&show-fps=true&show-gaze-ratio=true&show-psnr=true
 ```
 
 Use `?source=static` for a generated static frame, or `?image-url=./frame.png`

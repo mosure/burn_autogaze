@@ -26,8 +26,8 @@ bevy/webgpu demos.
   token cells with nearest sampling
 - optional `interframe` visualization keeps stale output outside the mask and
   updates masked cells to the current input between configurable keyframes
-- bevy overlay can show FPS plus gaze/update ratio with per-frame and EMA
-  percentages
+- bevy overlay can show FPS, gaze/update ratio, and output PSNR with per-frame
+  and EMA values
 - runs on ndarray, webgpu, cuda, and wasm/webgpu
 - ships a plain wasm-bindgen api plus a symmetric native/wasm bevy viewer
 
@@ -112,7 +112,9 @@ quad-tree-like cell structure stays crisp.
 
 The gaze ratio metric reports how much of the output frame changed compared to
 a full-frame redraw. The Bevy overlay shows the current frame ratio plus an EMA
-across processed frames.
+across processed frames. When `show-psnr` is enabled, Bevy also computes PSNR in
+dB between the current input frame and the rendered output frame; this RGB pixel
+comparison is skipped when the PSNR overlay is disabled.
 
 The README GIFs are generated from `/home/mosure/Videos/birds.mp4` at
 `1920x1080` inference resolution with the NVIDIA AutoGaze weights and the same
@@ -164,15 +166,16 @@ npm run serve
 browser builds render the same bevy app: the only platform split is camera/model
 I/O (`nokhwa` or `--image-path` natively, browser camera plus `frame_input` on
 wasm). both modes show the same bevy-rendered `input | mask | output`
-visualization plus toggleable FPS and gaze/update-ratio overlays.
+visualization plus toggleable FPS, gaze/update-ratio, and output-PSNR overlays.
 
-Set `--show-fps=false` or `--show-gaze-ratio=false` to hide either text overlay.
+Set `--show-fps=false`, `--show-gaze-ratio=false`, or `--show-psnr=false` to
+hide individual text overlays.
 
 The native app accepts CLI flags; the wasm app accepts the same viewer/inference
 knobs through query parameters:
 
 ```text
-http://localhost:8080/?mode=tile-224&visualization-mode=interframe&keyframe-duration=30&top-k=2&frames-per-clip=2&inference-width=1920&inference-height=1080&show-fps=true&show-gaze-ratio=true
+http://localhost:8080/?mode=tile-224&visualization-mode=interframe&keyframe-duration=30&top-k=2&frames-per-clip=2&inference-width=1920&inference-height=1080&show-fps=true&show-gaze-ratio=true&show-psnr=true
 ```
 
 For headless browsers or machines without a webcam, run the same Bevy UI from a
