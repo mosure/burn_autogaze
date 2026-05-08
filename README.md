@@ -111,20 +111,20 @@ The gaze ratio metric reports how much of the output frame changed compared to
 a full-frame redraw. The Bevy overlay shows the current frame ratio plus an EMA
 across processed frames.
 
-The README GIFs are generated from `/home/mosure/Videos/birds.mp4` at `1280x720`
-inference resolution with the NVIDIA AutoGaze weights and the same Rust pipeline
-exposed by the crate. `trace_rgba_clip_with_mode(..., tile-224)` fully tiles the
-clip before the resulting stream is downsampled for README display. The mask GIF
-uses scale colors from the model trace, drawing larger cells first and smaller
-cells on top. The per-run ratios and detected cell scale histogram are checked
-in at
+The README GIFs are generated from `/home/mosure/Videos/birds.mp4` at
+`1920x1080` inference resolution with the NVIDIA AutoGaze weights and the same
+Rust pipeline exposed by the crate. `trace_rgba_clip_with_mode(..., tile-224)`
+fully tiles the clip before the resulting stream is downsampled for README
+display. The mask GIF uses scale colors from the model trace, drawing larger
+cells first and smaller cells on top. The per-run ratios and detected cell scale
+histogram are checked in at
 [`docs/autogaze_birds_metrics.json`](./docs/autogaze_birds_metrics.json).
 
 ```sh
 cargo run --example render_readme_assets --features cuda -- \
   --input /home/mosure/Videos/birds.mp4 \
   --model-dir /path/to/AutoGaze \
-  --inference-width 1280 --inference-height 720 \
+  --inference-width 1920 --inference-height 1080 \
   --out-dir docs
 ```
 
@@ -149,7 +149,7 @@ this is the low-level wasm-bindgen api demo.
 
 ```sh
 cargo run -p bevy_burn_autogaze --features native -- --mode resize-224 --visualization-mode full-blend
-cargo run -p bevy_burn_autogaze --features native -- --mode tile-224 --visualization-mode interframe --keyframe-duration 30
+cargo run -p bevy_burn_autogaze --features native -- --mode tile-224 --visualization-mode interframe --keyframe-duration 30 --inference-width 1920 --inference-height 1080
 
 cd crates/bevy_burn_autogaze
 npm run build:wasm
@@ -168,14 +168,14 @@ The native app accepts CLI flags; the wasm app accepts the same viewer/inference
 knobs through query parameters:
 
 ```text
-http://localhost:8080/?mode=tile-224&visualization-mode=interframe&keyframe-duration=30&top-k=2&frames-per-clip=2&show-fps=true&show-gaze-ratio=true
+http://localhost:8080/?mode=tile-224&visualization-mode=interframe&keyframe-duration=30&top-k=2&frames-per-clip=2&inference-width=1920&inference-height=1080&show-fps=true&show-gaze-ratio=true
 ```
 
 For headless browsers or machines without a webcam, run the same Bevy UI from a
 static source:
 
 ```text
-http://localhost:8080/?source=static&frames-per-clip=1
+http://localhost:8080/?source=static&frames-per-clip=1&inference-width=1920&inference-height=1080
 http://localhost:8080/?image-url=./frame.png&frames-per-clip=1
 ```
 

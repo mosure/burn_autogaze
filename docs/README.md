@@ -17,6 +17,6 @@ Regenerate these assets with:
 cargo run --example render_readme_assets --features cuda -- \
   --input /home/mosure/Videos/birds.mp4 \
   --model-dir /path/to/AutoGaze \
-  --inference-width 1280 --inference-height 720 \
+  --inference-width 1920 --inference-height 1080 \
   --out-dir docs
 ```

@@ -100,10 +100,12 @@
 
       async function startCameraSource() {
         try {
+          const width = queryNumber(["camera-width", "inference-width", "width"], 64, 3840, 1280);
+          const height = queryNumber(["camera-height", "inference-height", "height"], 64, 2160, 720);
           const stream = await navigator.mediaDevices.getUserMedia({
             video: {
-              width: { ideal: 1280 },
-              height: { ideal: 720 },
+              width: { ideal: width },
+              height: { ideal: height },
               frameRate: { ideal: 30, max: 30 },
             },
             audio: false,
@@ -153,8 +155,8 @@
           return loadImageFrame(imageUrl);
         }
 
-        const width = clampNumber(params.get("static-width"), 64, 3840, 1280);
-        const height = clampNumber(params.get("static-height"), 64, 2160, 720);
+        const width = queryNumber(["static-width", "inference-width", "width"], 64, 3840, 1280);
+        const height = queryNumber(["static-height", "inference-height", "height"], 64, 2160, 720);
         return generatedFrame(width, height);
       }
 
@@ -229,6 +231,15 @@
           return fallback;
         }
         return Math.min(max, Math.max(min, number));
+      }
+
+      function queryNumber(names, min, max, fallback) {
+        for (const name of names) {
+          if (params.has(name)) {
+            return clampNumber(params.get(name), min, max, fallback);
+          }
+        }
+        return fallback;
       }
 
       function isWebGpuUnavailable(message) {

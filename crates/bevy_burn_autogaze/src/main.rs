@@ -37,6 +37,12 @@ struct NativeArgs {
     #[arg(long, default_value_t = 2)]
     frames_per_clip: usize,
 
+    #[arg(long, alias = "width")]
+    inference_width: Option<u32>,
+
+    #[arg(long, alias = "height")]
+    inference_height: Option<u32>,
+
     #[arg(
         long = "mask-cell-scale",
         alias = "mask-radius-scale",
@@ -73,6 +79,8 @@ impl From<NativeArgs> for BevyBurnAutoGazeConfig {
             top_k: args.top_k,
             max_gaze_tokens_each_frame: args.max_gaze_tokens_each_frame,
             frames_per_clip: args.frames_per_clip,
+            inference_width: args.inference_width,
+            inference_height: args.inference_height,
             mask_cell_scale: args.mask_cell_scale,
             blend_alpha: args.blend_alpha,
             visualization_mode,

@@ -33,7 +33,7 @@ use burn_autogaze::{
     AutoGazeInferenceMode, AutoGazePipeline, AutoGazeRgbaClipShape, AutoGazeVisualizationMode,
     AutoGazeVisualizationState, FixationPoint,
 };
-use image::RgbaImage;
+use image::{RgbaImage, imageops::FilterType};
 
 pub mod platform;
 
@@ -101,6 +101,8 @@ pub struct BevyBurnAutoGazeConfig {
     pub top_k: usize,
     pub max_gaze_tokens_each_frame: usize,
     pub frames_per_clip: usize,
+    pub inference_width: Option<u32>,
+    pub inference_height: Option<u32>,
     pub mask_cell_scale: f32,
     pub blend_alpha: f32,
     pub visualization_mode: AutoGazeVisualizationMode,
@@ -122,6 +124,8 @@ impl Default for BevyBurnAutoGazeConfig {
             top_k: 4,
             max_gaze_tokens_each_frame: 4,
             frames_per_clip: 2,
+            inference_width: None,
+            inference_height: None,
             mask_cell_scale: 1.0,
             blend_alpha: 0.72,
             visualization_mode: AutoGazeVisualizationMode::FullBlend,
@@ -181,6 +185,14 @@ impl BevyBurnAutoGazeConfig {
             }
             "frames-per-clip" => {
                 self.frames_per_clip = parse_usize_option(&key, value)?;
+                Ok(())
+            }
+            "inference-width" | "input-width" | "source-width" | "frame-width" | "width" => {
+                self.inference_width = parse_optional_u32_option(&key, value)?;
+                Ok(())
+            }
+            "inference-height" | "input-height" | "source-height" | "frame-height" | "height" => {
+                self.inference_height = parse_optional_u32_option(&key, value)?;
                 Ok(())
             }
             "mask-cell-scale" | "mask-radius-scale" => {
@@ -248,6 +260,19 @@ fn parse_usize_option(key: &str, value: &str) -> Result<usize, String> {
     value
         .parse()
         .map_err(|_| format!("invalid usize for `{key}`: `{value}`"))
+}
+
+fn parse_optional_u32_option(key: &str, value: &str) -> Result<Option<u32>, String> {
+    if value.trim().is_empty() || value.eq_ignore_ascii_case("native") {
+        return Ok(None);
+    }
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|_| format!("invalid u32 for `{key}`: `{value}`"))?;
+    if parsed == 0 {
+        return Err(format!("invalid zero dimension for `{key}`"));
+    }
+    Ok(Some(parsed))
 }
 
 fn parse_f32_option(key: &str, value: &str) -> Result<f32, String> {
@@ -626,6 +651,7 @@ fn process_frames(
     let Some(frame) = frame else {
         return;
     };
+    let frame = prepare_frame_for_inference(frame, &frame_input.config);
     let Some(clip) = frame_input
         .frame_queue
         .push(frame, frame_input.config.frames_per_clip)
@@ -720,6 +746,7 @@ fn preview_frames(
     let Some(frame) = frame else {
         return;
     };
+    let frame = prepare_frame_for_inference(frame, &frame_input.config);
 
     frame_input
         .frame_queue
@@ -1005,6 +1032,46 @@ fn load_static_frame(path: Option<&Path>) -> StaticFrame {
     StaticFrame(frame)
 }
 
+fn prepare_frame_for_inference(frame: RgbaImage, config: &BevyBurnAutoGazeConfig) -> RgbaImage {
+    let (width, height) = frame.dimensions();
+    let (target_width, target_height) = configured_inference_dimensions(
+        width,
+        height,
+        config.inference_width,
+        config.inference_height,
+    );
+    if target_width == width && target_height == height {
+        return frame;
+    }
+    image::imageops::resize(&frame, target_width, target_height, FilterType::Lanczos3)
+}
+
+fn configured_inference_dimensions(
+    width: u32,
+    height: u32,
+    inference_width: Option<u32>,
+    inference_height: Option<u32>,
+) -> (u32, u32) {
+    let width = width.max(1);
+    let height = height.max(1);
+    match (inference_width, inference_height) {
+        (Some(target_width), Some(target_height)) => (target_width.max(1), target_height.max(1)),
+        (Some(target_width), None) => {
+            let target_width = target_width.max(1);
+            let target_height =
+                ((height as f64 * target_width as f64 / width as f64).round() as u32).max(1);
+            (target_width, target_height)
+        }
+        (None, Some(target_height)) => {
+            let target_height = target_height.max(1);
+            let target_width =
+                ((width as f64 * target_height as f64 / height as f64).round() as u32).max(1);
+            (target_width, target_height)
+        }
+        (None, None) => (width, height),
+    }
+}
+
 fn press_esc_close(keys: Res<ButtonInput<KeyCode>>, mut exit: MessageWriter<AppExit>) {
     if keys.just_pressed(KeyCode::Escape) {
         exit.write(AppExit::Success);
@@ -1167,13 +1234,15 @@ mod tests {
     fn applies_url_query_to_viewer_config() {
         let mut config = BevyBurnAutoGazeConfig::default();
         let errors = config.apply_query_string(
-            "?mode=full-res&top_k=2&frames-per-clip=3&show-fps=false&config-url=%2Fconfig.json&weights-url=%2Fmodel.safetensors&load-model=false&mask-cell-scale=2.5&blend-alpha=0.5&visualization-mode=interframe&keyframe-duration=7",
+            "?mode=full-res&top_k=2&frames-per-clip=3&inference-width=1920&inference-height=1080&show-fps=false&config-url=%2Fconfig.json&weights-url=%2Fmodel.safetensors&load-model=false&mask-cell-scale=2.5&blend-alpha=0.5&visualization-mode=interframe&keyframe-duration=7",
         );
 
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(config.mode, BevyAutoGazeMode::Tile224);
         assert_eq!(config.top_k, 2);
         assert_eq!(config.frames_per_clip, 3);
+        assert_eq!(config.inference_width, Some(1920));
+        assert_eq!(config.inference_height, Some(1080));
         assert!(!config.show_fps);
         assert!(config.show_gaze_ratio);
         assert_eq!(config.config_url, "/config.json");
@@ -1190,6 +1259,31 @@ mod tests {
         let errors = config.apply_query_string("?show-gaze-ratio=false");
         assert!(errors.is_empty(), "{errors:?}");
         assert!(!config.show_gaze_ratio);
+    }
+
+    #[test]
+    fn inference_dimensions_preserve_aspect_when_one_axis_is_configured() {
+        assert_eq!(
+            configured_inference_dimensions(1280, 720, Some(1920), None),
+            (1920, 1080)
+        );
+        assert_eq!(
+            configured_inference_dimensions(1280, 720, None, Some(1080)),
+            (1920, 1080)
+        );
+    }
+
+    #[test]
+    fn resizes_frame_to_configured_inference_resolution() {
+        let frame = RgbaImage::from_pixel(4, 2, image::Rgba([10, 20, 30, 255]));
+        let config = BevyBurnAutoGazeConfig {
+            inference_width: Some(8),
+            inference_height: Some(4),
+            ..Default::default()
+        };
+        let resized = prepare_frame_for_inference(frame, &config);
+
+        assert_eq!(resized.dimensions(), (8, 4));
     }
 
     #[test]
