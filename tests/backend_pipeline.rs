@@ -70,6 +70,13 @@ fn accelerator_embeddings_match_ndarray_reference() {
     }
 }
 
+#[test]
+fn unavailable_backend_reason_matches_ci_adapter_failure() {
+    assert!(is_unavailable_backend_reason(
+        "No possible adapter available for backend"
+    ));
+}
+
 #[cfg(feature = "webgpu")]
 fn webgpu_device() -> Option<burn::backend::wgpu::WgpuDevice> {
     static INIT: OnceLock<Result<(), String>> = OnceLock::new();
@@ -296,6 +303,7 @@ fn is_unavailable_backend_reason(reason: &str) -> bool {
     let lower = reason.to_ascii_lowercase();
     [
         "no adapter",
+        "no possible adapter",
         "no suitable adapter",
         "adapter not found",
         "backend is not available",

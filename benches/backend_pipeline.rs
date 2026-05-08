@@ -522,6 +522,7 @@ fn is_unavailable_backend_reason(reason: &str) -> bool {
     let lower = reason.to_ascii_lowercase();
     [
         "no adapter",
+        "no possible adapter",
         "no suitable adapter",
         "adapter not found",
         "backend is not available",

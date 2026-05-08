@@ -20,7 +20,7 @@ jobs:
 
     steps:
       - name: checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: setup nightly rust toolchain
         uses: dtolnay/rust-toolchain@nightly

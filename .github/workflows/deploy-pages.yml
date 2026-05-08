@@ -7,7 +7,9 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+  pages: write
+  id-token: write
 
 concurrency:
   group: pages
@@ -20,10 +22,13 @@ env:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
       - name: checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: setup nightly rust toolchain
         uses: dtolnay/rust-toolchain@nightly
@@ -66,9 +71,14 @@ jobs:
           test -f crates/bevy_burn_autogaze/www/out/bevy_burn_autogaze.js
           test -f crates/bevy_burn_autogaze/www/out/bevy_burn_autogaze_bg.wasm
 
-      - name: deploy to github pages
-        uses: JamesIves/github-pages-deploy-action@v4
+      - name: configure github pages
+        uses: actions/configure-pages@v5
+
+      - name: upload pages artifact
+        uses: actions/upload-pages-artifact@v3
         with:
-          folder: crates/bevy_burn_autogaze/www
-          branch: www
-          clean: true
+          path: crates/bevy_burn_autogaze/www
+
+      - name: deploy to github pages
+        id: deployment
+        uses: actions/deploy-pages@v4
