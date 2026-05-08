@@ -13,9 +13,11 @@ bevy/webgpu demos.
 |---|---|---|
 | <img src="./docs/autogaze_birds_input.gif" alt="birds input clip" title="https://www.vecteezy.com/free-videos Wildlife Stock Videos by Vecteezy"> | <img src="./docs/autogaze_birds_mask.gif" alt="scale-colored crisp autogaze token-cell mask"> | <img src="./docs/autogaze_birds_output.gif" alt="autogaze interframe output stream"> |
 
-## vibes
+## features
 
-- lowercase, small, practical burn crate for gaze inference
+### high-level
+
+- practical burn-native gaze inference for video clips and RGBA frame buffers
 - loads hugging face `config.json` + `model.safetensors`
 - default fast path downsamples frames to the model's `224` input
 - optional tiled full-resolution mode remaps local 224px tile predictions and
@@ -31,14 +33,7 @@ bevy/webgpu demos.
 - runs on ndarray, webgpu, cuda, and wasm/webgpu
 - ships a plain wasm-bindgen api plus a symmetric native/wasm bevy viewer
 
-## burn support
-
-| burn_autogaze | burn | burn-store | status |
-|---|---:|---:|---|
-| `0.21.x` | `0.21.x` | `0.21.x` | current |
-| `<0.21` | `<0.21` | `<0.21` | not supported in this repo |
-
-## features
+### cargo features
 
 | feature | default | target | notes |
 |---|---:|---|---|
@@ -48,6 +43,13 @@ bevy/webgpu demos.
 | `cuda` | no | native | cuda backend |
 | `wasm` | no | wasm32 | wasm-bindgen api over burn webgpu |
 | `bevy-web-demo` | no | wasm32 | compatibility alias for demo builds |
+
+## burn support
+
+| burn_autogaze | burn | burn-store | status |
+|---|---:|---:|---|
+| `0.21.x` | `0.21.x` | `0.21.x` | current |
+| `<0.21` | `<0.21` | `<0.21` | not supported in this repo |
 
 ## usage
 
