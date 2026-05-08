@@ -20,7 +20,7 @@ inference, fixation traces, white-mask visualization, and bevy/webgpu demos.
 - optional tiled full-resolution mode remaps local 224px tile predictions back
   into source-frame coordinates
 - runs on ndarray, webgpu, cuda, and wasm/webgpu
-- ships a plain wasm-bindgen api plus a native/wasm bevy viewer
+- ships a plain wasm-bindgen api plus a symmetric native/wasm bevy viewer
 
 ## burn support
 
@@ -87,7 +87,7 @@ npm run serve
 
 `WasmAutoGaze` loads `config.json` plus `model.safetensors` bytes, accepts RGBA
 video clips, and returns white mask, alpha-blended, and `input | mask | blend`
-RGBA buffers.
+RGBA buffers. this is the low-level wasm-bindgen api demo.
 
 ## bevy
 
@@ -99,9 +99,22 @@ npm run build:wasm
 npm run serve
 ```
 
-`bevy_burn_autogaze` supports native camera input through `nokhwa`, static image
-input through `--image-path`, and browser camera input through a wasm
-`frame_input` hook. the bevy crate pins bevy to
+`bevy_burn_autogaze` is the primary UI demo on both native and wasm. native and
+browser builds render the same bevy app: the only platform split is camera/model
+I/O (`nokhwa` or `--image-path` natively, browser camera plus `frame_input` on
+wasm). both modes show the same bevy-rendered `input | mask | blend`
+visualization and FPS overlay.
+
+The native app accepts CLI flags; the wasm app accepts the same viewer/inference
+knobs through query parameters:
+
+```text
+http://localhost:8080/?mode=tile-224&top-k=2&frames-per-clip=2&show-fps=true
+```
+
+The web build fetches NVIDIA AutoGaze from Hugging Face by default. override
+URLs with `config-url` and `weights-url` query parameters. the bevy crate pins
+bevy to
 `ae2fcc0353d95e887470f0f6fc8a7e434e5549ce` so burn and bevy resolve through
 `wgpu` v29.
 

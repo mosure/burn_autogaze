@@ -35,8 +35,9 @@ pub type AutoGazeBevyBackend = burn::backend::WebGpu<f32, i32>;
 pub type AutoGazeBevyDevice = burn::backend::wgpu::WgpuDevice;
 
 pub const DEFAULT_NATIVE_MODEL_DIR: &str = "/home/mosure/.cache/huggingface/hub/models--nvidia--AutoGaze/snapshots/5100fae739ec1bf3f875914fa1b703846a18943a";
-const DEFAULT_CONFIG_URL: &str = "https://huggingface.co/nvidia/AutoGaze/resolve/main/config.json";
-const DEFAULT_WEIGHTS_URL: &str =
+pub const DEFAULT_CONFIG_URL: &str =
+    "https://huggingface.co/nvidia/AutoGaze/resolve/main/config.json";
+pub const DEFAULT_WEIGHTS_URL: &str =
     "https://huggingface.co/nvidia/AutoGaze/resolve/main/model.safetensors";
 const MODEL_INPUT_SIZE: usize = 224;
 const MAX_IN_FLIGHT_TASKS: usize = 1;
@@ -67,7 +68,7 @@ impl std::str::FromStr for BevyAutoGazeMode {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "resize" | "resize-224" => Ok(Self::Resize224),
-            "tile" | "tile-224" => Ok(Self::Tile224),
+            "tile" | "tile-224" | "tiled" | "full-res" | "fullres" => Ok(Self::Tile224),
             other => Err(format!("unsupported autogaze mode `{other}`")),
         }
     }
@@ -105,6 +106,149 @@ impl Default for BevyBurnAutoGazeConfig {
             mask_radius_scale: 3.0,
             blend_alpha: 0.72,
         }
+    }
+}
+
+impl BevyBurnAutoGazeConfig {
+    pub fn apply_option(&mut self, key: &str, value: &str) -> Result<(), String> {
+        let key = key.trim().replace('_', "-").to_ascii_lowercase();
+        match key.as_str() {
+            "" => Ok(()),
+            "press-esc-to-close" => {
+                self.press_esc_to_close = parse_bool_option(&key, value)?;
+                Ok(())
+            }
+            "show-fps" => {
+                self.show_fps = parse_bool_option(&key, value)?;
+                Ok(())
+            }
+            "model-dir" => {
+                self.model_dir = PathBuf::from(value);
+                Ok(())
+            }
+            "config-url" | "config" => {
+                self.config_url = value.to_string();
+                Ok(())
+            }
+            "weights-url" | "weights" | "model-url" => {
+                self.weights_url = value.to_string();
+                Ok(())
+            }
+            "image-path" => {
+                self.image_path = (!value.is_empty()).then(|| PathBuf::from(value));
+                Ok(())
+            }
+            "mode" => {
+                self.mode = value.parse()?;
+                Ok(())
+            }
+            "top-k" => {
+                self.top_k = parse_usize_option(&key, value)?;
+                Ok(())
+            }
+            "max-gaze-tokens-each-frame" => {
+                self.max_gaze_tokens_each_frame = parse_usize_option(&key, value)?;
+                Ok(())
+            }
+            "frames-per-clip" => {
+                self.frames_per_clip = parse_usize_option(&key, value)?;
+                Ok(())
+            }
+            "mask-radius-scale" => {
+                self.mask_radius_scale = parse_f32_option(&key, value)?;
+                Ok(())
+            }
+            "blend-alpha" => {
+                self.blend_alpha = parse_f32_option(&key, value)?;
+                Ok(())
+            }
+            other => Err(format!("unsupported bevy_burn_autogaze option `{other}`")),
+        }
+    }
+
+    pub fn apply_query_string(&mut self, query: &str) -> Vec<String> {
+        let query = query.strip_prefix('?').unwrap_or(query);
+        let mut errors = Vec::new();
+
+        for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, "true"));
+            let key = decode_url_component(key);
+            let value = decode_url_component(value);
+            if let Err(err) = self.apply_option(&key, &value) {
+                errors.push(err);
+            }
+        }
+
+        errors
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn from_browser_query() -> Self {
+        let mut config = Self::default();
+        if let Some(window) = web_sys::window() {
+            match window.location().search() {
+                Ok(search) => {
+                    for err in config.apply_query_string(&search) {
+                        log(&format!("ignoring invalid URL option: {err}"));
+                    }
+                }
+                Err(err) => log(&format!("failed to read URL query: {err:?}")),
+            }
+        }
+        config
+    }
+}
+
+fn parse_bool_option(key: &str, value: &str) -> Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(format!("invalid boolean for `{key}`: `{value}`")),
+    }
+}
+
+fn parse_usize_option(key: &str, value: &str) -> Result<usize, String> {
+    value
+        .parse()
+        .map_err(|_| format!("invalid usize for `{key}`: `{value}`"))
+}
+
+fn parse_f32_option(key: &str, value: &str) -> Result<f32, String> {
+    value
+        .parse()
+        .map_err(|_| format!("invalid f32 for `{key}`: `{value}`"))
+}
+
+fn decode_url_component(value: &str) -> String {
+    let value = value.replace('+', " ");
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+        {
+            decoded.push(high << 4 | low);
+            index += 3;
+            continue;
+        }
+
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+
+    String::from_utf8(decoded).unwrap_or(value)
+}
+
+fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -790,4 +934,27 @@ async fn fetch_array_buffer(url: &str) -> Result<Vec<u8>, String> {
     let mut data = vec![0; bytes.length() as usize];
     bytes.copy_to(&mut data);
     Ok(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn applies_url_query_to_viewer_config() {
+        let mut config = BevyBurnAutoGazeConfig::default();
+        let errors = config.apply_query_string(
+            "?mode=full-res&top_k=2&frames-per-clip=3&show-fps=false&config-url=%2Fconfig.json&weights-url=%2Fmodel.safetensors&mask-radius-scale=2.5&blend-alpha=0.5",
+        );
+
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(config.mode, BevyAutoGazeMode::Tile224);
+        assert_eq!(config.top_k, 2);
+        assert_eq!(config.frames_per_clip, 3);
+        assert!(!config.show_fps);
+        assert_eq!(config.config_url, "/config.json");
+        assert_eq!(config.weights_url, "/model.safetensors");
+        assert_eq!(config.mask_radius_scale, 2.5);
+        assert_eq!(config.blend_alpha, 0.5);
+    }
 }

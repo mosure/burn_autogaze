@@ -30,6 +30,12 @@ struct NativeArgs {
 
     #[arg(long, default_value_t = 2)]
     frames_per_clip: usize,
+
+    #[arg(long, default_value_t = 3.0)]
+    mask_radius_scale: f32,
+
+    #[arg(long, default_value_t = 0.72)]
+    blend_alpha: f32,
 }
 
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
@@ -45,30 +51,35 @@ impl From<NativeArgs> for BevyBurnAutoGazeConfig {
             top_k: args.top_k,
             max_gaze_tokens_each_frame: args.max_gaze_tokens_each_frame,
             frames_per_clip: args.frames_per_clip,
+            mask_radius_scale: args.mask_radius_scale,
+            blend_alpha: args.blend_alpha,
             ..Default::default()
         }
     }
 }
 
 fn main() {
+    let config = runtime_config();
+
     #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
     {
-        let args = NativeArgs::parse();
-        if args.image_path.is_none() {
+        if config.image_path.is_none() {
             std::thread::spawn(bevy_burn_autogaze::platform::camera::native_camera_thread);
         }
-        run_app(args.into());
     }
 
-    #[cfg(target_arch = "wasm32")]
-    {
-        #[cfg(feature = "web")]
-        console_error_panic_hook::set_once();
+    run_app(config);
+}
 
-        let config = BevyBurnAutoGazeConfig {
-            mode: bevy_burn_autogaze::BevyAutoGazeMode::Resize224,
-            ..Default::default()
-        };
-        run_app(config);
-    }
+#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+fn runtime_config() -> BevyBurnAutoGazeConfig {
+    NativeArgs::parse().into()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn runtime_config() -> BevyBurnAutoGazeConfig {
+    #[cfg(feature = "web")]
+    console_error_panic_hook::set_once();
+
+    BevyBurnAutoGazeConfig::from_browser_query()
 }
