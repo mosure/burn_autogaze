@@ -9,9 +9,9 @@ burn-native [nvidia autogaze](https://huggingface.co/nvidia/AutoGaze) model
 inference, fixation traces, crisp multi-scale token-cell mask visualization, and
 bevy/webgpu demos.
 
-| input | actual multi-scale mask | actual interframe output |
+| input | multi-scale mask | interframe output |
 |---|---|---|
-| <img src="./docs/autogaze_birds_input.gif" alt="birds input clip" title="https://www.vecteezy.com/free-videos Wildlife Stock Videos by Vecteezy"> | <img src="./docs/autogaze_birds_mask.gif" alt="actual crisp multi-scale autogaze white mask"> | <img src="./docs/autogaze_birds_output.gif" alt="actual autogaze interframe alpha-blended output"> |
+| <img src="./docs/autogaze_birds_input.gif" alt="birds input clip" title="https://www.vecteezy.com/free-videos Wildlife Stock Videos by Vecteezy"> | <img src="./docs/autogaze_birds_mask.gif" alt="scale-colored crisp autogaze token-cell mask"> | <img src="./docs/autogaze_birds_output.gif" alt="autogaze interframe output stream"> |
 
 ## vibes
 
@@ -20,10 +20,10 @@ bevy/webgpu demos.
 - default fast path downsamples frames to the model's `224` input
 - optional tiled full-resolution mode remaps local 224px tile predictions and
   token-cell extents back into source-frame coordinates
-- white mask and output visualizations preserve the model's multi-scale
-  `2x2`/`4x4`/`7x7`/`14x14` token cells with nearest sampling
-- optional `interframe` visualization updates only masked cells between
-  configurable keyframes, emulating an interframe video-encoding preview
+- mask visualizations preserve the model's multi-scale `2x2`/`4x4`/`7x7`/`14x14`
+  token cells with nearest sampling
+- optional `interframe` visualization keeps stale output outside the mask and
+  updates masked cells to the current input between configurable keyframes
 - bevy overlay can show FPS plus gaze/update ratio with per-frame and EMA
   percentages
 - runs on ndarray, webgpu, cuda, and wasm/webgpu
@@ -100,7 +100,7 @@ runs through the model.
 | mode | output behavior | update ratio |
 |---|---|---|
 | `full-blend` | redraws the current input with a white alpha-blended mask | `100%` |
-| `interframe` | keeps prior output outside the current mask and redraws a full keyframe every `keyframe-duration` frames | masked-cell pixels / full-frame pixels, or `100%` on keyframes |
+| `interframe` | keeps prior output outside the current mask, updates masked cells to the current input, and redraws a full keyframe every `keyframe-duration` frames | masked-cell pixels / full-frame pixels, or `100%` on keyframes |
 
 AutoGaze emits multi-scale token positions. For the NVIDIA config, the Rust
 trace decoder maps those tokens back to `2x2`, `4x4`, `7x7`, and `14x14`
@@ -111,17 +111,20 @@ The gaze ratio metric reports how much of the output frame changed compared to
 a full-frame redraw. The Bevy overlay shows the current frame ratio plus an EMA
 across processed frames.
 
-The README GIFs are generated from `/home/mosure/Videos/birds.mp4` with the
-real NVIDIA AutoGaze weights and the same Rust pipeline exposed by the crate:
-`trace_rgba_clip_with_mode(..., tile-224)` feeds actual model traces into
-`AutoGazeVisualizationState::Interframe`. The per-run ratios and detected cell
-scale histogram are checked in at
+The README GIFs are generated from `/home/mosure/Videos/birds.mp4` at `1280x720`
+inference resolution with the NVIDIA AutoGaze weights and the same Rust pipeline
+exposed by the crate. `trace_rgba_clip_with_mode(..., tile-224)` fully tiles the
+clip before the resulting stream is downsampled for README display. The mask GIF
+uses scale colors from the model trace, drawing larger cells first and smaller
+cells on top. The per-run ratios and detected cell scale histogram are checked
+in at
 [`docs/autogaze_birds_metrics.json`](./docs/autogaze_birds_metrics.json).
 
 ```sh
 cargo run --example render_readme_assets --features cuda -- \
   --input /home/mosure/Videos/birds.mp4 \
   --model-dir /path/to/AutoGaze \
+  --inference-width 1280 --inference-height 720 \
   --out-dir docs
 ```
 
@@ -135,12 +138,12 @@ npm run serve
 
 `WasmAutoGaze.create(configJson, safetensors)` loads `config.json` plus
 `model.safetensors` bytes through async WebGPU setup, accepts RGBA video clips,
-and returns white binary token-cell mask, alpha-blended, and `input | mask |
+and returns binary token-cell mask, visualization output, and `input | mask |
 output` RGBA buffers (`output_rgba()` is the preferred accessor, with
 `blend_rgba()` kept for compatibility). outputs also expose mask/update pixel
 counts and ratios. use `set_visualization_mode("interframe")` and
-`set_keyframe_duration(n)` to enable stateful interframe output. this is the
-low-level wasm-bindgen api demo.
+`set_keyframe_duration(n)` to enable stateful interframe output-stream updates.
+this is the low-level wasm-bindgen api demo.
 
 ## bevy
 

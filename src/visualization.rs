@@ -132,7 +132,7 @@ impl AutoGazeVisualizationState {
         let (output_rgba, updated_pixel_count) = match self.mode {
             AutoGazeVisualizationMode::FullBlend => (full_blend_rgba.clone(), pixels),
             AutoGazeVisualizationMode::Interframe => {
-                self.interframe_rgba(rgba, width, height, &mask_rgba, &full_blend_rgba)?
+                self.interframe_rgba(rgba, width, height, &mask_rgba)?
             }
         };
         self.frame_index = self.frame_index.saturating_add(1);
@@ -153,7 +153,6 @@ impl AutoGazeVisualizationState {
         width: usize,
         height: usize,
         mask_rgba: &[u8],
-        full_blend_rgba: &[u8],
     ) -> Result<(Vec<u8>, usize)> {
         let pixels = validate_rgba_dimensions(rgba, width, height)?;
         let dimensions_changed = self.interframe_width != width || self.interframe_height != height;
@@ -170,12 +169,12 @@ impl AutoGazeVisualizationState {
             self.interframe_height = height;
         }
 
-        for pixel in 0..pixels {
-            let offset = pixel * 4;
-            if mask_rgba[offset] > 0 {
-                self.interframe_output_rgba[offset..offset + 4]
-                    .copy_from_slice(&full_blend_rgba[offset..offset + 4]);
-                if !keyframe {
+        if !keyframe {
+            for pixel in 0..pixels {
+                let offset = pixel * 4;
+                if mask_rgba[offset] > 0 {
+                    self.interframe_output_rgba[offset..offset + 4]
+                        .copy_from_slice(&rgba[offset..offset + 4]);
                     updated_pixel_count += 1;
                 }
             }
@@ -431,7 +430,7 @@ mod tests {
         let first_visualization = state
             .visualize_rgba(&first, 2, 1, &[point], 1.0, 1.0)
             .expect("first visualization");
-        assert_eq!(&first_visualization.blend_rgba[0..4], &[255, 255, 255, 255]);
+        assert_eq!(&first_visualization.blend_rgba[0..4], &[10, 0, 0, 255]);
         assert_eq!(&first_visualization.blend_rgba[4..8], &[20, 0, 0, 255]);
         assert_eq!(first_visualization.mask_ratio(), 0.5);
         assert_eq!(first_visualization.update_ratio(), 1.0);
@@ -442,7 +441,7 @@ mod tests {
             .expect("second visualization");
         assert_eq!(
             &second_visualization.blend_rgba[0..8],
-            &[255, 255, 255, 255, 20, 0, 0, 255]
+            &[30, 0, 0, 255, 20, 0, 0, 255]
         );
         assert_eq!(second_visualization.mask_ratio(), 0.5);
         assert_eq!(second_visualization.update_ratio(), 0.5);
@@ -453,7 +452,7 @@ mod tests {
             .expect("third visualization");
         assert_eq!(
             &third_visualization.blend_rgba[0..8],
-            &[255, 255, 255, 255, 20, 0, 0, 255]
+            &[30, 0, 0, 255, 20, 0, 0, 255]
         );
         assert_eq!(third_visualization.mask_ratio(), 0.0);
         assert_eq!(third_visualization.update_ratio(), 0.0);

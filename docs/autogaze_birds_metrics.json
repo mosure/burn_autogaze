@@ -4,29 +4,53 @@
   "backend": "cuda",
   "inference_mode": "tile-224/224",
   "visualization_mode": "interframe",
-  "width": 384,
-  "height": 216,
+  "inference_width": 1280,
+  "inference_height": 720,
+  "gif_width": 384,
+  "gif_height": 216,
   "fps": 8,
-  "frames": 24,
+  "frames": 16,
   "clip_len": 2,
-  "top_k": 4,
-  "max_gaze_tokens_each_frame": 10,
-  "tile_count": 2,
+  "top_k": 16,
+  "max_gaze_tokens_each_frame": 16,
+  "tile_count": 24,
   "scales": "32+64+112+224",
   "num_vision_tokens_each_frame": 265,
   "mask_cell_scale": 1.0,
   "blend_alpha": 0.55,
   "keyframe_duration": 12,
-  "average_mask_ratio": 0.1326457208076132,
-  "average_update_ratio": 0.20534537358539093,
-  "final_update_ratio_ema": 0.17231334429856618,
-  "min_update_ratio": 0.10416666666666667,
+  "average_mask_ratio": 0.09139444986979167,
+  "average_update_ratio": 0.20860317654079863,
+  "final_update_ratio_ema": 0.25748922358083026,
+  "min_update_ratio": 0.06231662326388889,
   "max_update_ratio": 1.0,
-  "positive_fixations": 96,
+  "positive_fixations": 256,
   "cell_grid_histogram": {
-    "2x2": 1,
-    "4x4": 83,
-    "7x7": 12
+    "2x2": 88,
+    "4x4": 138,
+    "7x7": 30
+  },
+  "mask_palette": {
+    "14x14": [
+      230,
+      110,
+      255
+    ],
+    "2x2": [
+      255,
+      180,
+      0
+    ],
+    "4x4": [
+      60,
+      220,
+      120
+    ],
+    "7x7": [
+      0,
+      185,
+      255
+    ]
   },
   "output_files": {
     "input": "docs/autogaze_birds_input.gif",
