@@ -3,7 +3,6 @@ use crate::{
     AutoGazeRgbaClipShape, AutoGazeVisualizationMode, AutoGazeVisualizationState,
     NativeAutoGazeModel, rgba_clip_to_tensor,
 };
-use burn::tensor::backend::Backend;
 use std::sync::OnceLock;
 use wasm_bindgen::prelude::*;
 
@@ -155,7 +154,7 @@ impl WasmAutoGaze {
         }
     }
 
-    pub fn infer_rgba_clip(
+    pub async fn infer_rgba_clip(
         &mut self,
         rgba: &[u8],
         width: usize,
@@ -182,9 +181,9 @@ impl WasmAutoGaze {
             .map_err(|err| js_error(format!("failed to build RGBA clip tensor: {err:#}")))?;
         let traces = self
             .pipeline
-            .trace_video_with_mode(video, self.top_k, self.mode);
-        WasmBackend::sync(&self.device)
-            .map_err(|err| js_error(format!("failed to sync WebGPU backend: {err:?}")))?;
+            .trace_video_with_mode_async(video, self.top_k, self.mode)
+            .await
+            .map_err(|err| js_error(format!("failed to read AutoGaze tensor data: {err:?}")))?;
 
         let frame_index = frames.saturating_sub(1);
         let points = traces

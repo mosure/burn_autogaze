@@ -2,8 +2,8 @@ use crate::{
     AutoGazeConfig, AutoGazeGenerateOutput, AutoGazeLoadOptions, FixationPoint, FixationSet,
     FrameFixationTrace, NativeAutoGazeModel,
 };
-use anyhow::{Result, ensure};
-use burn::tensor::backend::Backend;
+use anyhow::{Result, anyhow, ensure};
+use burn::tensor::backend::{Backend, ExecutionError};
 use burn::tensor::ops::PadMode;
 use burn::tensor::{Tensor, TensorData};
 use std::path::Path;
@@ -373,6 +373,33 @@ impl<B: Backend> AutoGazePipeline<B> {
         )
     }
 
+    pub async fn generate_async(
+        &self,
+        video: Tensor<B, 5>,
+    ) -> std::result::Result<AutoGazeGenerateOutput, ExecutionError> {
+        self.model
+            .generate_with_task_loss_requirement_async(
+                video,
+                self.max_gaze_tokens_each_frame,
+                self.task_loss_requirement,
+            )
+            .await
+    }
+
+    pub async fn generate_with_limit_async(
+        &self,
+        video: Tensor<B, 5>,
+        max_gaze_tokens_each_frame: usize,
+    ) -> std::result::Result<AutoGazeGenerateOutput, ExecutionError> {
+        self.model
+            .generate_with_task_loss_requirement_async(
+                video,
+                max_gaze_tokens_each_frame.max(1),
+                self.task_loss_requirement,
+            )
+            .await
+    }
+
     pub fn infer(&self, video: Tensor<B, 5>, k: usize) -> Vec<FrameFixationTrace> {
         self.trace_video(video, k)
     }
@@ -388,6 +415,31 @@ impl<B: Backend> AutoGazePipeline<B> {
 
     pub fn trace_video(&self, video: Tensor<B, 5>, k: usize) -> Vec<FrameFixationTrace> {
         self.trace_video_resize(video, k)
+    }
+
+    pub async fn infer_async(
+        &self,
+        video: Tensor<B, 5>,
+        k: usize,
+    ) -> std::result::Result<Vec<FrameFixationTrace>, ExecutionError> {
+        self.trace_video_async(video, k).await
+    }
+
+    pub async fn infer_with_mode_async(
+        &self,
+        video: Tensor<B, 5>,
+        k: usize,
+        mode: AutoGazeInferenceMode,
+    ) -> std::result::Result<Vec<FrameFixationTrace>, ExecutionError> {
+        self.trace_video_with_mode_async(video, k, mode).await
+    }
+
+    pub async fn trace_video_async(
+        &self,
+        video: Tensor<B, 5>,
+        k: usize,
+    ) -> std::result::Result<Vec<FrameFixationTrace>, ExecutionError> {
+        self.trace_video_resize_async(video, k).await
     }
 
     pub fn trace_video_with_mode(
@@ -448,6 +500,66 @@ impl<B: Backend> AutoGazePipeline<B> {
         }
     }
 
+    pub async fn trace_video_with_mode_async(
+        &self,
+        video: Tensor<B, 5>,
+        k: usize,
+        mode: AutoGazeInferenceMode,
+    ) -> std::result::Result<Vec<FrameFixationTrace>, ExecutionError> {
+        let [batch, time, _channels, height, width] = video.shape().dims::<5>();
+        match mode.normalized() {
+            AutoGazeInferenceMode::ResizeToModelInput => {
+                self.trace_video_resize_async(video, k).await
+            }
+            AutoGazeInferenceMode::TiledFullResolution { tile_size, stride } => {
+                let layout = AutoGazeTileLayout::tiled(height, width, tile_size, stride);
+                let frame_budget = k.max(1).saturating_mul(layout.tile_count().max(1));
+                let mut frame_points = (0..batch)
+                    .map(|_| (0..time).map(|_| Vec::<FixationPoint>::new()).collect())
+                    .collect::<Vec<Vec<Vec<FixationPoint>>>>();
+                let mut stop_probabilities = vec![vec![0.0f32; time]; batch];
+                for tile in layout.tiles.iter().copied() {
+                    let crop = crop_video_tile(video.clone(), tile);
+                    let tile_traces = self.trace_video_resize_async(crop, k).await?;
+                    for batch_idx in 0..batch.min(tile_traces.len()) {
+                        for (frame_idx, fixation_set) in
+                            tile_traces[batch_idx].frames.iter().enumerate().take(time)
+                        {
+                            stop_probabilities[batch_idx][frame_idx] = stop_probabilities
+                                [batch_idx][frame_idx]
+                                .max(fixation_set.stop_probability);
+                            frame_points[batch_idx][frame_idx].extend(
+                                fixation_set
+                                    .points
+                                    .iter()
+                                    .copied()
+                                    .filter(|point| point.confidence > 0.0)
+                                    .filter_map(|point| remap_tile_point(point, tile, &layout)),
+                            );
+                        }
+                    }
+                }
+                Ok(frame_points
+                    .into_iter()
+                    .zip(stop_probabilities)
+                    .map(|(batch_frames, batch_stop_probabilities)| {
+                        let frames = batch_frames
+                            .into_iter()
+                            .zip(batch_stop_probabilities)
+                            .map(|(mut points, stop_probability)| {
+                                points.sort_by(|left, right| {
+                                    right.confidence.total_cmp(&left.confidence)
+                                });
+                                FixationSet::new(points, stop_probability, frame_budget)
+                            })
+                            .collect();
+                        FrameFixationTrace::new(frames)
+                    })
+                    .collect())
+            }
+        }
+    }
+
     fn trace_video_resize(&self, video: Tensor<B, 5>, k: usize) -> Vec<FrameFixationTrace> {
         self.model.trace_video_with_task_loss_requirement(
             video,
@@ -455,6 +567,21 @@ impl<B: Backend> AutoGazePipeline<B> {
             self.max_gaze_tokens_each_frame.max(k.max(1)),
             self.task_loss_requirement,
         )
+    }
+
+    async fn trace_video_resize_async(
+        &self,
+        video: Tensor<B, 5>,
+        k: usize,
+    ) -> std::result::Result<Vec<FrameFixationTrace>, ExecutionError> {
+        self.model
+            .trace_video_with_task_loss_requirement_async(
+                video,
+                k,
+                self.max_gaze_tokens_each_frame.max(k.max(1)),
+                self.task_loss_requirement,
+            )
+            .await
     }
 
     pub fn trace_clip_from_frames(
@@ -515,6 +642,43 @@ impl<B: Backend> AutoGazePipeline<B> {
             .unwrap_or_else(|| FrameFixationTrace::new(vec![])))
     }
 
+    pub async fn trace_clip_from_frames_with_mode_async(
+        &self,
+        frames: &[f32],
+        shape: AutoGazeClipShape,
+        k: usize,
+        mode: AutoGazeInferenceMode,
+    ) -> Result<FrameFixationTrace> {
+        ensure!(
+            frames.len() == shape.num_values(),
+            "expected {} frame values for clip shape {:?}, got {}",
+            shape.num_values(),
+            shape,
+            frames.len()
+        );
+        let device = self.model.gazing_model.connector.pos_embed.val().device();
+        let clip = Tensor::<B, 5>::from_data(
+            TensorData::new(
+                frames.to_vec(),
+                [
+                    1,
+                    shape.clip_len.max(1),
+                    shape.channels.max(1),
+                    shape.height.max(1),
+                    shape.width.max(1),
+                ],
+            ),
+            &device,
+        );
+        Ok(self
+            .trace_video_with_mode_async(clip, k, mode)
+            .await
+            .map_err(|err| anyhow!("failed to read AutoGaze tensor data asynchronously: {err:?}"))?
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| FrameFixationTrace::new(vec![])))
+    }
+
     pub fn trace_rgba_clip(
         &self,
         rgba: &[u8],
@@ -541,6 +705,20 @@ impl<B: Backend> AutoGazePipeline<B> {
     ) -> Result<Vec<FrameFixationTrace>> {
         let video = rgba_clip_to_tensor::<B>(rgba, shape, device)?;
         Ok(self.trace_video_with_mode(video, k, mode))
+    }
+
+    pub async fn trace_rgba_clip_with_mode_async(
+        &self,
+        rgba: &[u8],
+        shape: AutoGazeRgbaClipShape,
+        k: usize,
+        mode: AutoGazeInferenceMode,
+        device: &B::Device,
+    ) -> Result<Vec<FrameFixationTrace>> {
+        let video = rgba_clip_to_tensor::<B>(rgba, shape, device)?;
+        self.trace_video_with_mode_async(video, k, mode)
+            .await
+            .map_err(|err| anyhow!("failed to read AutoGaze tensor data asynchronously: {err:?}"))
     }
 }
 

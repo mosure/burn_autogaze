@@ -163,7 +163,7 @@ function captureLoop() {
 
 function runInference(width, height, frames) {
   processing = true;
-  setTimeout(() => {
+  setTimeout(async () => {
     try {
       applyModelOptions();
       const frameBytes = width * height * 4;
@@ -173,7 +173,7 @@ function runInference(width, height, frames) {
       }
 
       const started = performance.now();
-      const output = model.infer_rgba_clip(clip, width, height, frames);
+      const output = await model.infer_rgba_clip(clip, width, height, frames);
       const elapsed = performance.now() - started;
       drawOutput(output);
 
@@ -200,6 +200,7 @@ function runInference(width, height, frames) {
 
 function drawOutput(output) {
   const pixels = output.side_by_side_rgba();
+  triptych.style.aspectRatio = `${output.side_by_side_width} / ${output.height}`;
   const image = new ImageData(
     new Uint8ClampedArray(pixels),
     output.side_by_side_width,

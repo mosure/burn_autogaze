@@ -25,7 +25,9 @@ use bevy::{
     },
     tasks::{AsyncComputeTaskPool, Task, block_on, futures_lite::future},
     ui::widget::ImageNode,
+    window::PrimaryWindow,
 };
+#[cfg(not(target_arch = "wasm32"))]
 use burn::prelude::Backend;
 #[cfg(target_arch = "wasm32")]
 use burn_autogaze::{AutoGazeConfig, AutoGazeLoadOptions, NativeAutoGazeModel};
@@ -567,6 +569,7 @@ pub fn viewer_app(config: BevyBurnAutoGazeConfig) -> App {
             handle_tasks,
             preview_frames,
             process_frames,
+            fit_visualization_node,
         )
             .chain(),
     );
@@ -611,6 +614,8 @@ fn setup_ui(
             display: Display::Grid,
             width: Val::Percent(100.0),
             height: Val::Percent(100.0),
+            align_items: AlignItems::Center,
+            justify_items: JustifyItems::Center,
             grid_template_columns: RepeatedGridTrack::flex(1, 1.0),
             grid_template_rows: RepeatedGridTrack::flex(1, 1.0),
             ..default()
@@ -620,8 +625,8 @@ fn setup_ui(
                 .spawn((
                     ImageNode::new(texture.image.clone()).with_mode(NodeImageMode::Stretch),
                     Node {
-                        width: Val::Percent(100.0),
-                        height: Val::Percent(100.0),
+                        width: Val::Px(texture.width.max(1) as f32),
+                        height: Val::Px(texture.height.max(1) as f32),
                         ..default()
                     },
                 ))
@@ -661,6 +666,39 @@ fn setup_ui(
 
     texture.entity = image_entity;
     commands.spawn(Camera2d);
+}
+
+fn fit_visualization_node(
+    texture: Res<AutoGazeTexture>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    mut nodes: Query<&mut Node>,
+) {
+    let Some(entity) = texture.entity else {
+        return;
+    };
+    let Some(window) = windows.iter().next() else {
+        return;
+    };
+    let Ok(mut node) = nodes.get_mut(entity) else {
+        return;
+    };
+
+    let source_width = texture.width.max(1) as f32;
+    let source_height = texture.height.max(1) as f32;
+    let available_width = window.resolution.width().max(1.0);
+    let available_height = window.resolution.height().max(1.0);
+    let source_aspect = source_width / source_height;
+    let window_aspect = available_width / available_height;
+    let (display_width, display_height) = if window_aspect > source_aspect {
+        let height = available_height;
+        (height * source_aspect, height)
+    } else {
+        let width = available_width;
+        (width, width / source_aspect)
+    };
+
+    node.width = Val::Px(display_width.max(1.0));
+    node.height = Val::Px(display_height.max(1.0));
 }
 
 fn begin_model_load(mut state: ResMut<AutoGazeModelState>) {
@@ -704,6 +742,7 @@ fn process_frames(
     texture: Res<AutoGazeTexture>,
     mut frame_input: FrameInputParams,
     active_tasks: Query<&ProcessAutoGaze>,
+    mut logged_first_inference: Local<bool>,
 ) {
     let Some(pipeline) = model.pipeline.as_ref() else {
         return;
@@ -746,8 +785,24 @@ fn process_frames(
         frame_input.config.keyframe_duration,
     );
     let visualization_state = frame_input.visualization_state.0.clone();
+    if !*logged_first_inference {
+        log("AutoGaze inference started; the first native run may spend time tuning GPU kernels");
+        *logged_first_inference = true;
+    }
 
     let task = AsyncComputeTaskPool::get().spawn(async move {
+        #[cfg(target_arch = "wasm32")]
+        let result = run_autogaze_visualization(
+            pipeline,
+            clip,
+            top_k,
+            mode,
+            visualization_options,
+            visualization_state,
+        )
+        .await;
+
+        #[cfg(not(target_arch = "wasm32"))]
         let result = run_autogaze_visualization(
             pipeline,
             clip,
@@ -994,6 +1049,7 @@ fn apply_task_loss_requirement_config<B: burn::tensor::backend::Backend>(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn run_autogaze_visualization(
     pipeline: Arc<Mutex<AutoGazePipeline<AutoGazeBevyBackend>>>,
     clip: Vec<RgbaImage>,
@@ -1026,6 +1082,58 @@ fn run_autogaze_visualization(
     };
     AutoGazeBevyBackend::sync(&device)
         .map_err(|err| format!("failed to sync Burn WebGPU backend: {err}"))?;
+
+    let frame_index = clip.len().saturating_sub(1);
+    let points = traces
+        .first()
+        .and_then(|trace| trace.frames.get(frame_index))
+        .map(|set| set.points.clone())
+        .unwrap_or_default();
+    let visualization = visualize_points(
+        clip.last()
+            .ok_or_else(|| "AutoGaze clip must contain at least one frame".to_string())?,
+        width,
+        height,
+        &points,
+        visualization_options,
+        &mut visualization_state,
+    )?;
+    Ok((visualization, visualization_state))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn run_autogaze_visualization(
+    pipeline: Arc<Mutex<AutoGazePipeline<AutoGazeBevyBackend>>>,
+    clip: Vec<RgbaImage>,
+    top_k: usize,
+    mode: AutoGazeInferenceMode,
+    visualization_options: VisualizationOptions,
+    mut visualization_state: AutoGazeVisualizationState,
+) -> Result<(Visualization, AutoGazeVisualizationState), String> {
+    let device = burn_device();
+    let first_frame = clip
+        .first()
+        .ok_or_else(|| "AutoGaze clip must contain at least one frame".to_string())?;
+    let width = first_frame.width() as usize;
+    let height = first_frame.height() as usize;
+    let mut rgba = Vec::with_capacity(clip.len() * width * height * 4);
+    for frame in &clip {
+        if frame.width() as usize != width || frame.height() as usize != height {
+            return Err("AutoGaze clip frame dimensions changed".to_string());
+        }
+        rgba.extend_from_slice(frame.as_raw());
+    }
+    let traces = {
+        let pipeline = pipeline
+            .lock()
+            .map_err(|_| "AutoGaze model lock was poisoned".to_string())?
+            .clone();
+        let shape = AutoGazeRgbaClipShape::new(clip.len(), height, width);
+        pipeline
+            .trace_rgba_clip_with_mode_async(&rgba, shape, top_k, mode, &device)
+            .await
+            .map_err(|err| format!("{err:#}"))?
+    };
 
     let frame_index = clip.len().saturating_sub(1);
     let points = traces

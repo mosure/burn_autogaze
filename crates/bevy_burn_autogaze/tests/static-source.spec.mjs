@@ -51,9 +51,11 @@ test("boots bevy wasm with static frames and no webcam", async ({ page }) => {
     .not.toBe("pending");
 
   if (state === "no-webgpu") {
-    expect(consoleLines.join("\n")).not.toContain(
+    const output = `${consoleLines.join("\n")}\n${pageErrors.join("\n")}`;
+    expect(output).not.toContain(
       "Creating a wgpu setup synchronously is unsupported on wasm",
     );
+    expect(output).not.toContain("Failed to read tensor data synchronously");
     return;
   }
 
@@ -73,6 +75,9 @@ test("boots bevy wasm with static frames and no webcam", async ({ page }) => {
   expect(pageErrors).toEqual([]);
   expect(consoleLines.join("\n")).not.toContain(
     "Creating a wgpu setup synchronously is unsupported on wasm",
+  );
+  expect(`${consoleLines.join("\n")}\n${pageErrors.join("\n")}`).not.toContain(
+    "Failed to read tensor data synchronously",
   );
 });
 
@@ -105,7 +110,8 @@ test("starts wasm model load through async wgpu setup", async ({ page }) => {
         if (
           output.includes(
             "Creating a wgpu setup synchronously is unsupported on wasm",
-          )
+          ) ||
+          output.includes("Failed to read tensor data synchronously")
         ) {
           state = "sync-panic";
         } else if (output.includes("failed to load AutoGaze model")) {
