@@ -53,6 +53,7 @@ pub const DEFAULT_WEIGHTS_URL: &str =
 const MODEL_INPUT_SIZE: usize = 224;
 const MAX_IN_FLIGHT_TASKS: usize = 1;
 pub const DEFAULT_KEYFRAME_DURATION: usize = 30;
+const GAZE_RATIO_EMA_ALPHA: f64 = 0.15;
 const INFERENCE_FPS: DiagnosticPath = DiagnosticPath::const_new("autogaze_inference_fps");
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -90,6 +91,7 @@ impl std::str::FromStr for BevyAutoGazeMode {
 pub struct BevyBurnAutoGazeConfig {
     pub press_esc_to_close: bool,
     pub show_fps: bool,
+    pub show_gaze_ratio: bool,
     pub model_dir: PathBuf,
     pub config_url: String,
     pub weights_url: String,
@@ -110,6 +112,7 @@ impl Default for BevyBurnAutoGazeConfig {
         Self {
             press_esc_to_close: true,
             show_fps: true,
+            show_gaze_ratio: true,
             model_dir: PathBuf::from(DEFAULT_NATIVE_MODEL_DIR),
             config_url: DEFAULT_CONFIG_URL.to_string(),
             weights_url: DEFAULT_WEIGHTS_URL.to_string(),
@@ -138,6 +141,10 @@ impl BevyBurnAutoGazeConfig {
             }
             "show-fps" => {
                 self.show_fps = parse_bool_option(&key, value)?;
+                Ok(())
+            }
+            "show-gaze-ratio" | "show-gaze" | "show-update-ratio" => {
+                self.show_gaze_ratio = parse_bool_option(&key, value)?;
                 Ok(())
             }
             "model-dir" => {
@@ -340,12 +347,42 @@ struct StaticFrame(Option<Arc<RgbaImage>>);
 #[derive(Resource, Clone, Debug)]
 struct BevyVisualizationState(AutoGazeVisualizationState);
 
+#[derive(Resource, Clone, Debug)]
+struct GazeRatioStats {
+    current: f64,
+    ema: f64,
+    initialized: bool,
+}
+
+impl Default for GazeRatioStats {
+    fn default() -> Self {
+        Self {
+            current: 0.0,
+            ema: 0.0,
+            initialized: false,
+        }
+    }
+}
+
+impl GazeRatioStats {
+    fn record(&mut self, ratio: f64) {
+        self.current = ratio.clamp(0.0, 1.0);
+        self.ema = if self.initialized {
+            self.ema * (1.0 - GAZE_RATIO_EMA_ALPHA) + self.current * GAZE_RATIO_EMA_ALPHA
+        } else {
+            self.initialized = true;
+            self.current
+        };
+    }
+}
+
 #[derive(SystemParam)]
 struct FrameInputParams<'w> {
     config: Res<'w, BevyBurnAutoGazeConfig>,
     static_frame: Res<'w, StaticFrame>,
     frame_queue: ResMut<'w, FrameQueue>,
     visualization_state: ResMut<'w, BevyVisualizationState>,
+    gaze_ratio_stats: ResMut<'w, GazeRatioStats>,
 }
 
 #[derive(Component)]
@@ -383,6 +420,7 @@ pub fn viewer_app(config: BevyBurnAutoGazeConfig) -> App {
         config.visualization_mode,
         config.keyframe_duration,
     )));
+    app.insert_resource(GazeRatioStats::default());
     app.insert_resource(AutoGazeModelState {
         config: config.clone(),
         pipeline: None,
@@ -415,6 +453,11 @@ pub fn viewer_app(config: BevyBurnAutoGazeConfig) -> App {
         app.register_diagnostic(Diagnostic::new(INFERENCE_FPS));
         app.add_systems(Startup, fps_display_setup);
         app.add_systems(Update, fps_update_system);
+    }
+
+    if config.show_gaze_ratio {
+        app.add_systems(Startup, gaze_ratio_display_setup);
+        app.add_systems(Update, gaze_ratio_update_system);
     }
 
     app.add_systems(
@@ -617,6 +660,7 @@ fn process_frames(
         queue.push(move |world: &mut World| {
             let width = visualization.width;
             let height = visualization.height;
+            let gaze_update_ratio = visualization.gaze_update_ratio;
             if let Ok(entity) = world.get_entity_mut(image_entity)
                 && let Some(image_node) = entity.get::<ImageNode>()
             {
@@ -634,6 +678,10 @@ fn process_frames(
 
             if let Some(mut state) = world.get_resource_mut::<BevyVisualizationState>() {
                 state.0 = visualization_state;
+            }
+
+            if let Some(mut stats) = world.get_resource_mut::<GazeRatioStats>() {
+                stats.record(gaze_update_ratio);
             }
 
             if let Ok(mut tracker) = world.get_entity_mut(task_entity) {
@@ -693,6 +741,9 @@ fn preview_frames(
         frame_input.config.blend_alpha,
         &mut frame_input.visualization_state.0,
     );
+    frame_input
+        .gaze_ratio_stats
+        .record(visualization.gaze_update_ratio);
     apply_visualization_to_texture(
         image_entity,
         visualization,
@@ -833,6 +884,7 @@ struct Visualization {
     width: u32,
     height: u32,
     rgba: Vec<u8>,
+    gaze_update_ratio: f64,
 }
 
 fn visualize_points(
@@ -854,10 +906,12 @@ fn visualize_points(
             blend_alpha,
         )
         .expect("valid Bevy AutoGaze visualization input");
+    let gaze_update_ratio = visualization.update_ratio();
     Visualization {
         width: visualization.side_by_side_width as u32,
         height: visualization.height as u32,
         rgba: visualization.side_by_side_rgba,
+        gaze_update_ratio,
     }
 }
 
@@ -1001,6 +1055,55 @@ fn fps_update_system(
     }
 }
 
+fn gaze_ratio_display_setup(mut commands: Commands, config: Res<BevyBurnAutoGazeConfig>) {
+    let bottom = if config.show_fps { 42.0 } else { 8.0 };
+    commands
+        .spawn((
+            Text("gaze: ".to_string()),
+            TextFont {
+                font_size: bevy::text::FontSize::Px(24.0),
+                ..Default::default()
+            },
+            TextColor(Color::WHITE),
+            Node {
+                position_type: PositionType::Absolute,
+                bottom: Val::Px(bottom),
+                left: Val::Px(12.0),
+                ..default()
+            },
+            ZIndex(2),
+        ))
+        .with_child((
+            GazeRatioText,
+            TextColor(Color::srgb(0.55, 0.9, 1.0)),
+            TextFont {
+                font_size: bevy::text::FontSize::Px(24.0),
+                ..Default::default()
+            },
+            TextSpan::default(),
+        ));
+}
+
+#[derive(Component)]
+struct GazeRatioText;
+
+fn gaze_ratio_update_system(
+    stats: Res<GazeRatioStats>,
+    mut query: Query<&mut TextSpan, With<GazeRatioText>>,
+) {
+    for mut text in &mut query {
+        if stats.initialized {
+            **text = format!(
+                "{:.1}% ema {:.1}%",
+                stats.current * 100.0,
+                stats.ema * 100.0
+            );
+        } else {
+            **text = "--.-% ema --.-%".to_string();
+        }
+    }
+}
+
 pub fn log(message: &str) {
     #[cfg(target_arch = "wasm32")]
     {
@@ -1072,6 +1175,7 @@ mod tests {
         assert_eq!(config.top_k, 2);
         assert_eq!(config.frames_per_clip, 3);
         assert!(!config.show_fps);
+        assert!(config.show_gaze_ratio);
         assert_eq!(config.config_url, "/config.json");
         assert_eq!(config.weights_url, "/model.safetensors");
         assert!(!config.load_model);
@@ -1082,6 +1186,10 @@ mod tests {
             AutoGazeVisualizationMode::Interframe
         );
         assert_eq!(config.keyframe_duration, 7);
+
+        let errors = config.apply_query_string("?show-gaze-ratio=false");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(!config.show_gaze_ratio);
     }
 
     #[test]
@@ -1103,6 +1211,7 @@ mod tests {
 
         assert_eq!(visualization.width, 12);
         assert_eq!(visualization.height, 4);
+        assert_eq!(visualization.gaze_update_ratio, 1.0);
         for y in 0..4 {
             for x in 0..4 {
                 let mask_src = (y * 12 + 4 + x) * 4;

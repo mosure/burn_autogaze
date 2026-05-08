@@ -18,7 +18,8 @@ and `model.safetensors` URLs work as long as the server can fetch them.
 
 The demo exposes both inference input modes (`resize-224`, `tile-224`) and
 output visualization modes (`full blend`, `interframe`). Interframe mode updates
-only masked token cells between configurable keyframes.
+only masked token cells between configurable keyframes. The stats line includes
+the current output update ratio plus an EMA.
 
 Check that the Bevy web dependency anchor resolves the requested git revision
 and the same `wgpu` v29 tree as Burn:

@@ -24,6 +24,8 @@ bevy/webgpu demos.
   `2x2`/`4x4`/`7x7`/`14x14` token cells with nearest sampling
 - optional `interframe` visualization updates only masked cells between
   configurable keyframes, emulating an interframe video-encoding preview
+- bevy overlay can show FPS plus gaze/update ratio with per-frame and EMA
+  percentages
 - runs on ndarray, webgpu, cuda, and wasm/webgpu
 - ships a plain wasm-bindgen api plus a symmetric native/wasm bevy viewer
 
@@ -105,7 +107,8 @@ npm run serve
 `model.safetensors` bytes through async WebGPU setup, accepts RGBA video clips,
 and returns white binary token-cell mask, alpha-blended, and `input | mask |
 output` RGBA buffers (`output_rgba()` is the preferred accessor, with
-`blend_rgba()` kept for compatibility). use `set_visualization_mode("interframe")` and
+`blend_rgba()` kept for compatibility). outputs also expose mask/update pixel
+counts and ratios. use `set_visualization_mode("interframe")` and
 `set_keyframe_duration(n)` to enable stateful interframe output. this is the
 low-level wasm-bindgen api demo.
 
@@ -124,13 +127,13 @@ npm run serve
 browser builds render the same bevy app: the only platform split is camera/model
 I/O (`nokhwa` or `--image-path` natively, browser camera plus `frame_input` on
 wasm). both modes show the same bevy-rendered `input | mask | output`
-visualization and FPS overlay.
+visualization plus toggleable FPS and gaze/update-ratio overlays.
 
 The native app accepts CLI flags; the wasm app accepts the same viewer/inference
 knobs through query parameters:
 
 ```text
-http://localhost:8080/?mode=tile-224&visualization-mode=interframe&keyframe-duration=30&top-k=2&frames-per-clip=2&show-fps=true
+http://localhost:8080/?mode=tile-224&visualization-mode=interframe&keyframe-duration=30&top-k=2&frames-per-clip=2&show-fps=true&show-gaze-ratio=true
 ```
 
 For headless browsers or machines without a webcam, run the same Bevy UI from a

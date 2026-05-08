@@ -25,7 +25,7 @@ test("boots bevy wasm with static frames and no webcam", async ({ page }) => {
   });
 
   await page.goto(
-    "/?source=static&load-model=false&show-fps=false&mode=tile-224&visualization-mode=interframe&keyframe-duration=3&frames-per-clip=1&static-width=320&static-height=180&static-fps=5",
+    "/?source=static&load-model=false&show-fps=false&show-gaze-ratio=true&mode=tile-224&visualization-mode=interframe&keyframe-duration=3&frames-per-clip=1&static-width=320&static-height=180&static-fps=5",
     { waitUntil: "domcontentloaded" },
   );
 

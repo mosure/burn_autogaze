@@ -32,6 +32,7 @@ let processing = false;
 let frameQueue = [];
 let lastInferenceAt = 0;
 let smoothedFps = 0;
+let smoothedGazeRatio = 0;
 
 configUrl.value = DEFAULT_CONFIG;
 weightsUrl.value = DEFAULT_WEIGHTS;
@@ -105,6 +106,9 @@ async function toggleCamera() {
     video.srcObject = stream;
     await video.play();
     frameQueue = [];
+    lastInferenceAt = 0;
+    smoothedFps = 0;
+    smoothedGazeRatio = 0;
     running = true;
     startCamera.textContent = "Stop";
     setStatus("camera running");
@@ -178,8 +182,12 @@ function runInference(width, height, frames) {
         const fps = 1000 / (now - lastInferenceAt);
         smoothedFps = smoothedFps ? smoothedFps * 0.85 + fps * 0.15 : fps;
       }
+      const gazeRatio = output.update_ratio * 100;
+      smoothedGazeRatio = smoothedGazeRatio
+        ? smoothedGazeRatio * 0.85 + gazeRatio * 0.15
+        : gazeRatio;
       lastInferenceAt = now;
-      stats.textContent = `${width}x${height} ${output.mode}, ${output.visualization_mode}, ${output.tile_count} tile(s), ${elapsed.toFixed(1)} ms, ${smoothedFps.toFixed(1)} fps`;
+      stats.textContent = `${width}x${height} ${output.mode}, ${output.visualization_mode}, ${output.tile_count} tile(s), ${elapsed.toFixed(1)} ms, ${smoothedFps.toFixed(1)} fps, gaze ${gazeRatio.toFixed(1)}% ema ${smoothedGazeRatio.toFixed(1)}%`;
       output.free();
     } catch (error) {
       console.error(error);

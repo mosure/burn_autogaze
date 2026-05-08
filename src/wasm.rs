@@ -204,6 +204,10 @@ impl WasmAutoGaze {
             width,
             height,
             side_by_side_width: visualization.side_by_side_width,
+            mask_pixel_count: visualization.mask_pixel_count,
+            updated_pixel_count: visualization.updated_pixel_count,
+            mask_ratio: visualization.mask_ratio(),
+            update_ratio: visualization.update_ratio(),
             mask_rgba: visualization.mask_rgba,
             blend_rgba: visualization.blend_rgba,
             side_by_side_rgba: visualization.side_by_side_rgba,
@@ -221,6 +225,10 @@ pub struct WasmAutoGazeOutput {
     width: usize,
     height: usize,
     side_by_side_width: usize,
+    mask_pixel_count: usize,
+    updated_pixel_count: usize,
+    mask_ratio: f64,
+    update_ratio: f64,
     mask_rgba: Vec<u8>,
     blend_rgba: Vec<u8>,
     side_by_side_rgba: Vec<u8>,
@@ -246,6 +254,26 @@ impl WasmAutoGazeOutput {
     #[wasm_bindgen(getter)]
     pub fn side_by_side_width(&self) -> usize {
         self.side_by_side_width
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn mask_pixel_count(&self) -> usize {
+        self.mask_pixel_count
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn updated_pixel_count(&self) -> usize {
+        self.updated_pixel_count
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn mask_ratio(&self) -> f64 {
+        self.mask_ratio
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn update_ratio(&self) -> f64 {
+        self.update_ratio
     }
 
     #[wasm_bindgen(getter)]

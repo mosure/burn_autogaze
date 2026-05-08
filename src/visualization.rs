@@ -10,11 +10,21 @@ pub struct AutoGazeVisualization {
     pub mask_rgba: Vec<u8>,
     pub blend_rgba: Vec<u8>,
     pub side_by_side_rgba: Vec<u8>,
+    pub mask_pixel_count: usize,
+    pub updated_pixel_count: usize,
 }
 
 impl AutoGazeVisualization {
     pub fn output_rgba(&self) -> &[u8] {
         &self.blend_rgba
+    }
+
+    pub fn mask_ratio(&self) -> f64 {
+        ratio(self.mask_pixel_count, self.width * self.height)
+    }
+
+    pub fn update_ratio(&self) -> f64 {
+        ratio(self.updated_pixel_count, self.width * self.height)
     }
 }
 
@@ -116,16 +126,25 @@ impl AutoGazeVisualizationState {
         cell_scale: f32,
         blend_alpha: f32,
     ) -> Result<AutoGazeVisualization> {
-        let (mask_rgba, full_blend_rgba) =
+        let (mask_rgba, full_blend_rgba, mask_pixel_count) =
             mask_and_blend_rgba(rgba, width, height, points, cell_scale, blend_alpha)?;
-        let output_rgba = match self.mode {
-            AutoGazeVisualizationMode::FullBlend => full_blend_rgba.clone(),
+        let pixels = validate_rgba_dimensions(rgba, width, height)?;
+        let (output_rgba, updated_pixel_count) = match self.mode {
+            AutoGazeVisualizationMode::FullBlend => (full_blend_rgba.clone(), pixels),
             AutoGazeVisualizationMode::Interframe => {
                 self.interframe_rgba(rgba, width, height, &mask_rgba, &full_blend_rgba)?
             }
         };
         self.frame_index = self.frame_index.saturating_add(1);
-        build_visualization(rgba, width, height, mask_rgba, output_rgba)
+        build_visualization(
+            rgba,
+            width,
+            height,
+            mask_rgba,
+            output_rgba,
+            mask_pixel_count,
+            updated_pixel_count,
+        )
     }
 
     fn interframe_rgba(
@@ -135,13 +154,14 @@ impl AutoGazeVisualizationState {
         height: usize,
         mask_rgba: &[u8],
         full_blend_rgba: &[u8],
-    ) -> Result<Vec<u8>> {
+    ) -> Result<(Vec<u8>, usize)> {
         let pixels = validate_rgba_dimensions(rgba, width, height)?;
         let dimensions_changed = self.interframe_width != width || self.interframe_height != height;
         let keyframe = dimensions_changed
             || self.interframe_output_rgba.len() != pixels * 4
             || self.frame_index == 0
             || self.frame_index.is_multiple_of(self.keyframe_duration);
+        let mut updated_pixel_count = if keyframe { pixels } else { 0 };
 
         if keyframe {
             self.interframe_output_rgba.clear();
@@ -155,10 +175,13 @@ impl AutoGazeVisualizationState {
             if mask_rgba[offset] > 0 {
                 self.interframe_output_rgba[offset..offset + 4]
                     .copy_from_slice(&full_blend_rgba[offset..offset + 4]);
+                if !keyframe {
+                    updated_pixel_count += 1;
+                }
             }
         }
 
-        Ok(self.interframe_output_rgba.clone())
+        Ok((self.interframe_output_rgba.clone(), updated_pixel_count))
     }
 }
 
@@ -199,9 +222,18 @@ pub fn visualize_fixations_rgba(
     cell_scale: f32,
     blend_alpha: f32,
 ) -> Result<AutoGazeVisualization> {
-    let (mask_rgba, blend_rgba) =
+    let (mask_rgba, blend_rgba, mask_pixel_count) =
         mask_and_blend_rgba(rgba, width, height, points, cell_scale, blend_alpha)?;
-    build_visualization(rgba, width, height, mask_rgba, blend_rgba)
+    let pixels = validate_rgba_dimensions(rgba, width, height)?;
+    build_visualization(
+        rgba,
+        width,
+        height,
+        mask_rgba,
+        blend_rgba,
+        mask_pixel_count,
+        pixels,
+    )
 }
 
 fn validate_rgba_dimensions(rgba: &[u8], width: usize, height: usize) -> Result<usize> {
@@ -230,15 +262,19 @@ fn mask_and_blend_rgba(
     points: &[FixationPoint],
     cell_scale: f32,
     blend_alpha: f32,
-) -> Result<(Vec<u8>, Vec<u8>)> {
+) -> Result<(Vec<u8>, Vec<u8>, usize)> {
     let pixels = validate_rgba_dimensions(rgba, width, height)?;
     let alpha = fixation_alpha_mask(width, height, points, cell_scale);
     let mut mask_rgba = vec![0u8; pixels * 4];
     let mut blend_rgba = vec![0u8; pixels * 4];
     let blend_alpha = blend_alpha.clamp(0.0, 1.0);
+    let mut mask_pixel_count = 0usize;
 
     for (pixel, mask) in alpha.iter().copied().enumerate() {
         let src = pixel * 4;
+        if mask > 0 {
+            mask_pixel_count += 1;
+        }
         mask_rgba[src] = mask;
         mask_rgba[src + 1] = mask;
         mask_rgba[src + 2] = mask;
@@ -252,7 +288,7 @@ fn mask_and_blend_rgba(
         blend_rgba[src + 3] = rgba[src + 3];
     }
 
-    Ok((mask_rgba, blend_rgba))
+    Ok((mask_rgba, blend_rgba, mask_pixel_count))
 }
 
 fn build_visualization(
@@ -261,6 +297,8 @@ fn build_visualization(
     height: usize,
     mask_rgba: Vec<u8>,
     blend_rgba: Vec<u8>,
+    mask_pixel_count: usize,
+    updated_pixel_count: usize,
 ) -> Result<AutoGazeVisualization> {
     let _ = validate_rgba_dimensions(rgba, width, height)?;
     ensure!(
@@ -311,7 +349,17 @@ fn build_visualization(
         mask_rgba,
         blend_rgba,
         side_by_side_rgba,
+        mask_pixel_count,
+        updated_pixel_count,
     })
+}
+
+fn ratio(count: usize, total: usize) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        count as f64 / total as f64
+    }
 }
 
 fn pixel_range(min: f32, max: f32, extent: usize) -> (usize, usize) {
@@ -368,6 +416,10 @@ mod tests {
         assert_eq!(&visualization.mask_rgba[4..8], &[0, 0, 0, 255]);
         assert_eq!(&visualization.blend_rgba[0..4], &[178, 153, 128, 255]);
         assert_eq!(&visualization.blend_rgba[4..8], &[10, 20, 30, 255]);
+        assert_eq!(visualization.mask_pixel_count, 1);
+        assert_eq!(visualization.updated_pixel_count, 2);
+        assert_eq!(visualization.mask_ratio(), 0.5);
+        assert_eq!(visualization.update_ratio(), 1.0);
     }
 
     #[test]
@@ -381,6 +433,8 @@ mod tests {
             .expect("first visualization");
         assert_eq!(&first_visualization.blend_rgba[0..4], &[255, 255, 255, 255]);
         assert_eq!(&first_visualization.blend_rgba[4..8], &[20, 0, 0, 255]);
+        assert_eq!(first_visualization.mask_ratio(), 0.5);
+        assert_eq!(first_visualization.update_ratio(), 1.0);
 
         let second = [30, 0, 0, 255, 40, 0, 0, 255];
         let second_visualization = state
@@ -390,6 +444,8 @@ mod tests {
             &second_visualization.blend_rgba[0..8],
             &[255, 255, 255, 255, 20, 0, 0, 255]
         );
+        assert_eq!(second_visualization.mask_ratio(), 0.5);
+        assert_eq!(second_visualization.update_ratio(), 0.5);
 
         let third = [50, 0, 0, 255, 60, 0, 0, 255];
         let third_visualization = state
@@ -399,6 +455,8 @@ mod tests {
             &third_visualization.blend_rgba[0..8],
             &[255, 255, 255, 255, 20, 0, 0, 255]
         );
+        assert_eq!(third_visualization.mask_ratio(), 0.0);
+        assert_eq!(third_visualization.update_ratio(), 0.0);
 
         let fourth = [70, 0, 0, 255, 80, 0, 0, 255];
         let fourth_visualization = state
@@ -408,5 +466,7 @@ mod tests {
             &fourth_visualization.blend_rgba[0..8],
             &[70, 0, 0, 255, 80, 0, 0, 255]
         );
+        assert_eq!(fourth_visualization.mask_ratio(), 0.0);
+        assert_eq!(fourth_visualization.update_ratio(), 1.0);
     }
 }
