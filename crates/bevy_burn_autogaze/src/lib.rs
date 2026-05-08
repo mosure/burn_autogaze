@@ -103,7 +103,7 @@ impl Default for BevyBurnAutoGazeConfig {
             top_k: 4,
             max_gaze_tokens_each_frame: 4,
             frames_per_clip: 2,
-            mask_radius_scale: 3.0,
+            mask_radius_scale: 1.0,
             blend_alpha: 0.72,
         }
     }
@@ -750,6 +750,8 @@ fn visualize_points(
         }
     }
 
+    normalize_alpha(&mut alpha);
+
     let input = rgba.as_raw();
     let out_width = width * 3;
     let mut out = vec![0u8; out_width * height * 4];
@@ -784,6 +786,16 @@ fn visualize_points(
 fn write_pixel(out: &mut [u8], out_width: usize, x_offset: usize, x: usize, y: usize, rgba: &[u8]) {
     let dst = (y * out_width + x_offset + x) * 4;
     out[dst..dst + 4].copy_from_slice(rgba);
+}
+
+fn normalize_alpha(alpha: &mut [f32]) {
+    let max_alpha = alpha.iter().copied().fold(0.0, f32::max);
+    if max_alpha <= 0.0 {
+        return;
+    }
+    for value in alpha {
+        *value = (*value / max_alpha).clamp(0.0, 1.0);
+    }
 }
 
 fn burn_device() -> AutoGazeBevyDevice {

@@ -43,7 +43,7 @@ impl WasmAutoGaze {
             device,
             mode: AutoGazeInferenceMode::ResizeToModelInput,
             top_k: 4,
-            mask_radius_scale: 3.0,
+            mask_radius_scale: 1.0,
             blend_alpha: 0.72,
         })
     }
@@ -291,6 +291,8 @@ fn visualize_points(
         }
     }
 
+    normalize_alpha(&mut alpha);
+
     let mut mask_rgba = vec![0u8; pixels * 4];
     let mut blend_rgba = vec![0u8; pixels * 4];
     let mut side_by_side_rgba = vec![0u8; width * 3 * height * 4];
@@ -364,6 +366,16 @@ fn write_side_by_side(
     let out_x = column * width + x;
     let dst = (y.min(height - 1) * out_width + out_x) * 4;
     out[dst..dst + 4].copy_from_slice(rgba);
+}
+
+fn normalize_alpha(alpha: &mut [f32]) {
+    let max_alpha = alpha.iter().copied().fold(0.0, f32::max);
+    if max_alpha <= 0.0 {
+        return;
+    }
+    for value in alpha {
+        *value = (*value / max_alpha).clamp(0.0, 1.0);
+    }
 }
 
 fn mode_label(mode: AutoGazeInferenceMode) -> String {

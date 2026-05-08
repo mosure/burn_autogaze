@@ -31,7 +31,7 @@ struct NativeArgs {
     #[arg(long, default_value_t = 2)]
     frames_per_clip: usize,
 
-    #[arg(long, default_value_t = 3.0)]
+    #[arg(long, default_value_t = 1.0)]
     mask_radius_scale: f32,
 
     #[arg(long, default_value_t = 0.72)]

@@ -8,9 +8,9 @@
 burn-native [nvidia autogaze](https://huggingface.co/nvidia/AutoGaze) model
 inference, fixation traces, white-mask visualization, and bevy/webgpu demos.
 
-| input | autogaze mask + blend |
-|---|---|
-| ![example input](./docs/example_input.svg) | ![example autogaze output](./docs/example_output.svg) |
+| input | mask | output |
+|---|---|---|
+| <img src="./docs/autogaze_birds_input.gif" alt="birds input clip" title="https://www.vecteezy.com/free-videos Wildlife Stock Videos by Vecteezy"> | <img src="./docs/autogaze_birds_mask.gif" alt="autogaze white mask"> | <img src="./docs/autogaze_birds_output.gif" alt="autogaze alpha-blended output"> |
 
 ## vibes
 
