@@ -1,7 +1,11 @@
+#[cfg(target_arch = "wasm32")]
+use std::cell::RefCell;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::OnceLock;
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex},
 };
 
 use bevy::{
@@ -33,6 +37,11 @@ pub mod platform;
 
 pub type AutoGazeBevyBackend = burn::backend::WebGpu<f32, i32>;
 pub type AutoGazeBevyDevice = burn::backend::wgpu::WgpuDevice;
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static BURN_DEVICE: RefCell<Option<AutoGazeBevyDevice>> = const { RefCell::new(None) };
+}
 
 pub const DEFAULT_NATIVE_MODEL_DIR: &str = "/home/mosure/.cache/huggingface/hub/models--nvidia--AutoGaze/snapshots/5100fae739ec1bf3f875914fa1b703846a18943a";
 pub const DEFAULT_CONFIG_URL: &str =
@@ -81,6 +90,7 @@ pub struct BevyBurnAutoGazeConfig {
     pub model_dir: PathBuf,
     pub config_url: String,
     pub weights_url: String,
+    pub load_model: bool,
     pub image_path: Option<PathBuf>,
     pub mode: BevyAutoGazeMode,
     pub top_k: usize,
@@ -98,6 +108,7 @@ impl Default for BevyBurnAutoGazeConfig {
             model_dir: PathBuf::from(DEFAULT_NATIVE_MODEL_DIR),
             config_url: DEFAULT_CONFIG_URL.to_string(),
             weights_url: DEFAULT_WEIGHTS_URL.to_string(),
+            load_model: true,
             image_path: None,
             mode: BevyAutoGazeMode::Resize224,
             top_k: 4,
@@ -132,6 +143,10 @@ impl BevyBurnAutoGazeConfig {
             }
             "weights-url" | "weights" | "model-url" => {
                 self.weights_url = value.to_string();
+                Ok(())
+            }
+            "load-model" => {
+                self.load_model = parse_bool_option(&key, value)?;
                 Ok(())
             }
             "image-path" => {
@@ -379,6 +394,7 @@ pub fn viewer_app(config: BevyBurnAutoGazeConfig) -> App {
             begin_model_load,
             finish_model_load,
             handle_tasks,
+            preview_frames,
             process_frames,
         )
             .chain(),
@@ -477,6 +493,9 @@ fn setup_ui(
 }
 
 fn begin_model_load(mut state: ResMut<AutoGazeModelState>) {
+    if !state.config.load_model {
+        return;
+    }
     if state.pipeline.is_some() || state.load_task.is_some() {
         return;
     }
@@ -586,6 +605,55 @@ fn process_frames(
     commands.entity(task_entity).insert(ProcessAutoGaze(task));
 }
 
+fn preview_frames(
+    model: Res<AutoGazeModelState>,
+    config: Res<BevyBurnAutoGazeConfig>,
+    mut texture: ResMut<AutoGazeTexture>,
+    static_frame: Res<StaticFrame>,
+    mut frame_queue: ResMut<FrameQueue>,
+    image_nodes: Query<&ImageNode>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    if model.pipeline.is_some() {
+        return;
+    }
+
+    let Some(image_entity) = texture.entity else {
+        return;
+    };
+
+    let frame = if let Some(frame) = static_frame.0.as_ref() {
+        Some((**frame).clone())
+    } else {
+        receive_frame()
+    };
+
+    let Some(frame) = frame else {
+        return;
+    };
+
+    frame_queue.push(frame, config.frames_per_clip);
+    let Some(frame) = frame_queue.frames.back() else {
+        return;
+    };
+
+    let visualization = visualize_points(
+        frame,
+        frame.width() as usize,
+        frame.height() as usize,
+        &[],
+        config.mask_radius_scale,
+        config.blend_alpha,
+    );
+    apply_visualization_to_texture(
+        image_entity,
+        visualization,
+        &mut texture,
+        &image_nodes,
+        &mut images,
+    );
+}
+
 fn handle_tasks(
     mut commands: Commands,
     mut diagnostics: Diagnostics,
@@ -610,9 +678,32 @@ fn spawn_model_load_task(
     config: BevyBurnAutoGazeConfig,
 ) -> Task<Result<AutoGazePipeline<AutoGazeBevyBackend>, String>> {
     AsyncComputeTaskPool::get().spawn(async move {
-        let device = burn_device();
+        let device = initialize_burn_device().await;
         load_model(config, &device).await
     })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn initialize_burn_device() -> AutoGazeBevyDevice {
+    burn_device()
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn initialize_burn_device() -> AutoGazeBevyDevice {
+    if let Some(device) = BURN_DEVICE.with(|slot| slot.borrow().clone()) {
+        return device;
+    }
+
+    let device = AutoGazeBevyDevice::default();
+    burn::backend::wgpu::init_setup_async::<burn::backend::wgpu::graphics::WebGpu>(
+        &device,
+        Default::default(),
+    )
+    .await;
+    BURN_DEVICE.with(|slot| {
+        *slot.borrow_mut() = Some(device.clone());
+    });
+    device
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -788,6 +879,33 @@ fn write_pixel(out: &mut [u8], out_width: usize, x_offset: usize, x: usize, y: u
     out[dst..dst + 4].copy_from_slice(rgba);
 }
 
+fn apply_visualization_to_texture(
+    image_entity: Entity,
+    visualization: Visualization,
+    texture: &mut AutoGazeTexture,
+    image_nodes: &Query<&ImageNode>,
+    images: &mut Assets<Image>,
+) {
+    let Ok(image_node) = image_nodes.get(image_entity) else {
+        return;
+    };
+
+    let image = Image::new(
+        Extent3d {
+            width: visualization.width,
+            height: visualization.height,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        visualization.rgba,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    let _ = images.insert(image_node.image.id(), image);
+    texture.width = visualization.width;
+    texture.height = visualization.height;
+}
+
 fn normalize_alpha(alpha: &mut [f32]) {
     let max_alpha = alpha.iter().copied().fold(0.0, f32::max);
     if max_alpha <= 0.0 {
@@ -798,6 +916,7 @@ fn normalize_alpha(alpha: &mut [f32]) {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn burn_device() -> AutoGazeBevyDevice {
     static DEVICE: OnceLock<AutoGazeBevyDevice> = OnceLock::new();
     DEVICE
@@ -810,6 +929,15 @@ fn burn_device() -> AutoGazeBevyDevice {
             device
         })
         .clone()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn burn_device() -> AutoGazeBevyDevice {
+    BURN_DEVICE.with(|slot| {
+        slot.borrow()
+            .clone()
+            .expect("Burn WebGPU device should be initialized asynchronously before inference")
+    })
 }
 
 fn receive_frame() -> Option<RgbaImage> {
@@ -956,7 +1084,7 @@ mod tests {
     fn applies_url_query_to_viewer_config() {
         let mut config = BevyBurnAutoGazeConfig::default();
         let errors = config.apply_query_string(
-            "?mode=full-res&top_k=2&frames-per-clip=3&show-fps=false&config-url=%2Fconfig.json&weights-url=%2Fmodel.safetensors&mask-radius-scale=2.5&blend-alpha=0.5",
+            "?mode=full-res&top_k=2&frames-per-clip=3&show-fps=false&config-url=%2Fconfig.json&weights-url=%2Fmodel.safetensors&load-model=false&mask-radius-scale=2.5&blend-alpha=0.5",
         );
 
         assert!(errors.is_empty(), "{errors:?}");
@@ -966,6 +1094,7 @@ mod tests {
         assert!(!config.show_fps);
         assert_eq!(config.config_url, "/config.json");
         assert_eq!(config.weights_url, "/model.safetensors");
+        assert!(!config.load_model);
         assert_eq!(config.mask_radius_scale, 2.5);
         assert_eq!(config.blend_alpha, 0.5);
     }

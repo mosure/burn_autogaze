@@ -64,6 +64,18 @@ jobs:
         working-directory: crates/bevy_burn_autogaze
         run: npm run build:wasm
 
+      - name: install bevy browser test dependencies
+        working-directory: crates/bevy_burn_autogaze
+        run: npm ci
+
+      - name: install playwright chromium
+        working-directory: crates/bevy_burn_autogaze
+        run: npx playwright install --with-deps chromium
+
+      - name: browser smoke static source
+        working-directory: crates/bevy_burn_autogaze
+        run: npm run test:browser
+
       - name: prepare pages artifact
         run: |
           touch crates/bevy_burn_autogaze/www/.nojekyll

@@ -37,5 +37,9 @@ the same viewer/inference knobs as query parameters:
 http://localhost:8080/?mode=tile-224&top-k=2&frames-per-clip=2&show-fps=true
 ```
 
+Use `?source=static` for a generated static frame, or `?image-url=./frame.png`
+to drive the Bevy UI from an image without requesting a webcam. `load-model=false`
+keeps the viewer in preview mode for browser smoke tests.
+
 Use `config-url` and `weights-url` query parameters to point the wasm build at
 alternate model assets.

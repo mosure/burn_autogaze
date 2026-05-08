@@ -46,35 +46,150 @@
   </head>
   <body>
     <div class="loading"></div>
+    <div id="status" aria-live="polite" hidden>booting</div>
     <video id="webcam" autoplay muted playsinline></video>
     <canvas id="bevy"></canvas>
     <script type="module">
       import init, { frame_input } from "./out/bevy_burn_autogaze.js";
 
-      await init();
-      document.querySelector(".loading").style.display = "none";
-
+      const params = new URLSearchParams(window.location.search);
+      const loading = document.querySelector(".loading");
+      const status = document.getElementById("status");
       const video = document.getElementById("webcam");
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
-          frameRate: { ideal: 30, max: 30 },
-        },
-        audio: false,
-      });
-      video.srcObject = stream;
-      await video.play();
 
-      if ("MediaStreamTrackProcessor" in window) {
-        const [track] = stream.getVideoTracks();
-        const processor = new MediaStreamTrackProcessor(track);
-        const reader = processor.readable.getReader();
-        readVideoFrames(reader);
-      } else {
-        const capture = document.createElement("canvas");
-        const context = capture.getContext("2d", { willReadFrequently: true });
-        captureWithCanvas(capture, context);
+      boot();
+
+      async function boot() {
+        try {
+          setStatus("loading wasm");
+          await init();
+          loading.style.display = "none";
+
+          if (usesStaticSource()) {
+            await startStaticSource();
+          } else {
+            await startCameraSource();
+          }
+        } catch (error) {
+          console.error(error);
+          loading.style.display = "none";
+          const message = error?.message || String(error);
+          if (isWebGpuUnavailable(message)) {
+            setStatus(`webgpu unavailable: ${message}`);
+          } else {
+            setStatus(`runtime error: ${message}`);
+          }
+        }
+      }
+
+      function setStatus(message) {
+        status.textContent = message;
+        status.dataset.state = message;
+      }
+
+      function usesStaticSource() {
+        const source = params.get("source")?.toLowerCase();
+        return (
+          source === "static" ||
+          source === "image" ||
+          params.has("image-url") ||
+          params.has("static-frame")
+        );
+      }
+
+      async function startCameraSource() {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: {
+              width: { ideal: 1280 },
+              height: { ideal: 720 },
+              frameRate: { ideal: 30, max: 30 },
+            },
+            audio: false,
+          });
+          video.srcObject = stream;
+          await video.play();
+
+          if ("MediaStreamTrackProcessor" in window) {
+            const [track] = stream.getVideoTracks();
+            const processor = new MediaStreamTrackProcessor(track);
+            const reader = processor.readable.getReader();
+            setStatus("camera source running");
+            readVideoFrames(reader);
+          } else {
+            const capture = document.createElement("canvas");
+            const context = capture.getContext("2d", { willReadFrequently: true });
+            setStatus("camera source running");
+            captureWithCanvas(capture, context);
+          }
+        } catch (error) {
+          console.warn(error);
+          await startStaticSource();
+        }
+      }
+
+      async function startStaticSource() {
+        const frame = await loadStaticFrame();
+        const fps = clampNumber(params.get("static-fps"), 1, 60, 15);
+        const frameInterval = 1000 / fps;
+        let lastFrame = 0;
+        setStatus("static source running");
+
+        function pump(now) {
+          if (now - lastFrame >= frameInterval) {
+            frame_input(frame.data, frame.width, frame.height);
+            lastFrame = now;
+          }
+          requestAnimationFrame(pump);
+        }
+
+        requestAnimationFrame(pump);
+      }
+
+      async function loadStaticFrame() {
+        const imageUrl = params.get("image-url");
+        if (imageUrl) {
+          return loadImageFrame(imageUrl);
+        }
+
+        const width = clampNumber(params.get("static-width"), 64, 3840, 1280);
+        const height = clampNumber(params.get("static-height"), 64, 2160, 720);
+        return generatedFrame(width, height);
+      }
+
+      async function loadImageFrame(url) {
+        const image = new Image();
+        image.crossOrigin = "anonymous";
+        image.decoding = "async";
+        image.src = url;
+        await image.decode();
+
+        const canvas = document.createElement("canvas");
+        canvas.width = image.naturalWidth || image.width;
+        canvas.height = image.naturalHeight || image.height;
+        const context = canvas.getContext("2d", { willReadFrequently: true });
+        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+        const pixels = context.getImageData(0, 0, canvas.width, canvas.height);
+        return {
+          data: new Uint8Array(pixels.data),
+          width: canvas.width,
+          height: canvas.height,
+        };
+      }
+
+      function generatedFrame(width, height) {
+        const data = new Uint8Array(width * height * 4);
+        for (let y = 0; y < height; y += 1) {
+          for (let x = 0; x < width; x += 1) {
+            const offset = (y * width + x) * 4;
+            const checker = ((x >> 6) + (y >> 6)) & 1;
+            data[offset] = Math.round((x / Math.max(1, width - 1)) * 220 + checker * 25);
+            data[offset + 1] = Math.round((y / Math.max(1, height - 1)) * 220 + 20);
+            data[offset + 2] = checker ? 230 : 90;
+            data[offset + 3] = 255;
+          }
+        }
+        return { data, width, height };
       }
 
       async function readVideoFrames(reader) {
@@ -105,6 +220,19 @@
           frame_input(new Uint8Array(image.data), canvas.width, canvas.height);
         }
         requestAnimationFrame(() => captureWithCanvas(canvas, context));
+      }
+
+      function clampNumber(value, min, max, fallback) {
+        const number = Number.parseInt(value, 10);
+        if (!Number.isFinite(number)) {
+          return fallback;
+        }
+        return Math.min(max, Math.max(min, number));
+      }
+
+      function isWebGpuUnavailable(message) {
+        const lower = message.toLowerCase();
+        return lower.includes("webgpu") || lower.includes("adapter");
       }
 
       document.addEventListener("contextmenu", (event) => event.preventDefault());

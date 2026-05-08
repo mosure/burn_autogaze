@@ -19,6 +19,9 @@ struct NativeArgs {
     #[arg(long)]
     image_path: Option<std::path::PathBuf>,
 
+    #[arg(long, default_value = "true")]
+    load_model: bool,
+
     #[arg(long, default_value = "resize-224")]
     mode: String,
 
@@ -47,6 +50,7 @@ impl From<NativeArgs> for BevyBurnAutoGazeConfig {
             show_fps: args.show_fps,
             model_dir: args.model_dir,
             image_path: args.image_path,
+            load_model: args.load_model,
             mode,
             top_k: args.top_k,
             max_gaze_tokens_each_frame: args.max_gaze_tokens_each_frame,

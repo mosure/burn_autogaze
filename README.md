@@ -112,6 +112,14 @@ knobs through query parameters:
 http://localhost:8080/?mode=tile-224&top-k=2&frames-per-clip=2&show-fps=true
 ```
 
+For headless browsers or machines without a webcam, run the same Bevy UI from a
+static source:
+
+```text
+http://localhost:8080/?source=static&frames-per-clip=1
+http://localhost:8080/?image-url=./frame.png&frames-per-clip=1
+```
+
 The web build fetches NVIDIA AutoGaze from Hugging Face by default. override
 URLs with `config-url` and `weights-url` query parameters. the bevy crate pins
 bevy to

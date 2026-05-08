@@ -42,3 +42,38 @@ jobs:
 
       - name: check bevy wasm
         run: cargo check -p bevy_burn_autogaze --target wasm32-unknown-unknown --no-default-features --features web
+
+      - name: install wasm-bindgen-cli
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(awk '
+            $0 == "[[package]]" { in_package = 0 }
+            $0 == "name = \"wasm-bindgen\"" { in_package = 1 }
+            in_package && $1 == "version" {
+              gsub("\"", "", $3)
+              print $3
+              exit
+            }
+          ' Cargo.lock)"
+          if [[ -z "${version}" ]]; then
+            echo "failed to find wasm-bindgen version in Cargo.lock" >&2
+            exit 1
+          fi
+          cargo install wasm-bindgen-cli --version "${version}" --locked
+
+      - name: install bevy browser test dependencies
+        working-directory: crates/bevy_burn_autogaze
+        run: npm ci
+
+      - name: install playwright chromium
+        working-directory: crates/bevy_burn_autogaze
+        run: npx playwright install --with-deps chromium
+
+      - name: build bevy wasm artifacts
+        working-directory: crates/bevy_burn_autogaze
+        run: npm run build:wasm
+
+      - name: browser smoke static source
+        working-directory: crates/bevy_burn_autogaze
+        run: npm run test:browser
