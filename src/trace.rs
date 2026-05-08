@@ -12,6 +12,8 @@ pub struct FixationPoint {
     pub width: f32,
     #[serde(default)]
     pub height: f32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub grid: usize,
 }
 
 impl FixationPoint {
@@ -29,7 +31,25 @@ impl FixationPoint {
             confidence: confidence.clamp(0.0, 1.0),
             width,
             height,
+            grid: 0,
         }
+    }
+
+    pub fn with_grid_extent(
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        confidence: f32,
+        grid: usize,
+    ) -> Self {
+        let mut point = Self::with_extent(x, y, width, height, confidence);
+        point.grid = grid;
+        point
+    }
+
+    pub fn cell_grid(&self) -> Option<usize> {
+        (self.grid > 0).then_some(self.grid)
     }
 
     pub fn cell_width(&self) -> f32 {
@@ -63,6 +83,10 @@ impl FixationPoint {
             y_max: (self.y + half_height).clamp(0.0, 1.0),
         }
     }
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

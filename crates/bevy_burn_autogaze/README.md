@@ -16,7 +16,9 @@ native camera. `--mode tile-224` runs the tiled full-resolution path. Common
 viewer/inference knobs include `--top-k`, `--frames-per-clip`,
 `--max-gaze-tokens-each-frame`, `--inference-width`, `--inference-height`,
 `--mask-cell-scale`, `--blend-alpha`, and `--show-fps`. `--show-gaze-ratio`
-toggles the text overlay for per-frame and EMA output update ratio.
+toggles the text overlay for per-frame and EMA output update ratio. In
+`tile-224` mode, `--top-k` is a per-tile budget, so the frame budget is
+`top-k * tile-count`.
 Use `--load-model=false` to verify camera/preview rendering without waiting for
 model load or inference.
 

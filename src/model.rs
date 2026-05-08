@@ -1216,7 +1216,9 @@ fn token_to_fixation_point(
             let x = (col as f32 + 0.5) / grid as f32;
             let y = (row as f32 + 0.5) / grid as f32;
             let cell = (1.0 / grid as f32).clamp(1.0e-6, 1.0);
-            return Some(FixationPoint::with_extent(x, y, cell, cell, confidence));
+            return Some(FixationPoint::with_grid_extent(
+                x, y, cell, cell, confidence, grid,
+            ));
         }
         offset += layout.token_count;
     }
@@ -1324,12 +1326,14 @@ mod tests {
         assert_eq!(coarse.y, 0.25);
         assert_eq!(coarse.cell_width(), 0.5);
         assert_eq!(coarse.cell_height(), 0.5);
+        assert_eq!(coarse.cell_grid(), Some(2));
 
         let mid = token_to_fixation_point(4, &scale_layouts, 1.0).expect("second-scale token");
         assert_eq!(mid.x, 0.125);
         assert_eq!(mid.y, 0.125);
         assert_eq!(mid.cell_width(), 0.25);
         assert_eq!(mid.cell_height(), 0.25);
+        assert_eq!(mid.cell_grid(), Some(4));
 
         let fine_offset = scale_layouts[..3]
             .iter()
@@ -1341,6 +1345,7 @@ mod tests {
         assert!((fine.y - 0.5 / 14.0).abs() < 1.0e-6);
         assert!((fine.cell_width() - 1.0 / 14.0).abs() < 1.0e-6);
         assert!((fine.cell_height() - 1.0 / 14.0).abs() < 1.0e-6);
+        assert_eq!(fine.cell_grid(), Some(14));
     }
 
     #[test]

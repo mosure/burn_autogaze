@@ -4,8 +4,8 @@ use burn::module::{Module, ModuleMapper, Param};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, TensorData};
 use burn_autogaze::{
-    AutoGazeConfig, AutoGazeInferenceMode, AutoGazePipeline, ConnectorConfig, GazeDecoderConfig,
-    GazeModelConfig, NativeAutoGazeModel, VisionModelConfig,
+    AutoGazeConfig, AutoGazeInferenceMode, AutoGazePipeline, ConnectorConfig, FixationPoint,
+    FrameFixationTrace, GazeDecoderConfig, GazeModelConfig, NativeAutoGazeModel, VisionModelConfig,
 };
 use std::panic::{self, AssertUnwindSafe};
 #[cfg(feature = "webgpu")]
@@ -23,6 +23,12 @@ struct ParityCase {
     height: usize,
     width: usize,
     mode: AutoGazeInferenceMode,
+}
+
+#[derive(Clone, Debug)]
+struct PipelineOutput {
+    embeddings: Vec<f32>,
+    traces: Vec<FrameFixationTrace>,
 }
 
 #[test]
@@ -81,7 +87,9 @@ fn accelerator_embeddings_match_ndarray_reference() {
 
     for case in cases {
         let cpu_device = Default::default();
-        let expected = embedding_output::<CpuBackend>(case, &cpu_device);
+        let expected = pipeline_output::<CpuBackend>(case, &cpu_device);
+        assert_trace_shapes("ndarray", case, &expected.traces);
+        assert_trace_confidences("ndarray", &expected.traces);
 
         #[cfg(feature = "webgpu")]
         if let Some(device) = webgpu_device.as_ref() {
@@ -144,32 +152,27 @@ fn assert_backend_matches<B: Backend>(
     backend: &str,
     case: ParityCase,
     device: &B::Device,
-    expected: &[f32],
+    expected: &PipelineOutput,
     tolerance: f32,
 ) {
-    let actual = embedding_output::<B>(case, device);
-    let diff = max_abs_diff(&actual, expected);
+    let actual = pipeline_output::<B>(case, device);
+    let diff = max_abs_diff(&actual.embeddings, &expected.embeddings);
     assert!(
         diff <= tolerance,
         "{backend} {} embedding drift: max_abs_diff={diff}, tolerance={tolerance}",
         case.name
     );
 
-    let traces = inference_output::<B>(case, device);
-    assert_eq!(traces.len(), 1, "{backend} should preserve batch size");
-    assert_eq!(
-        traces[0].len(),
-        2,
-        "{backend} should emit one trace set per frame"
-    );
-    assert_trace_confidences(backend, &traces);
+    assert_trace_shapes(backend, case, &actual.traces);
+    assert_trace_confidences(backend, &actual.traces);
+    assert_traces_match(backend, case, &actual.traces, &expected.traces, tolerance);
     B::sync(device).expect("backend sync");
 }
 
-fn embedding_output<B: Backend>(case: ParityCase, device: &B::Device) -> Vec<f32> {
+fn pipeline_output<B: Backend>(case: ParityCase, device: &B::Device) -> PipelineOutput {
     let pipeline = deterministic_pipeline::<B>(case, device);
-    let video = deterministic_video::<B>(1, 2, 3, case.height, case.width, device);
-    let output = pipeline.embed_video_with_mode(video, case.mode);
+    let embeddings_video = deterministic_video::<B>(1, 2, 3, case.height, case.width, device);
+    let output = pipeline.embed_video_with_mode(embeddings_video, case.mode);
     match case.mode {
         AutoGazeInferenceMode::ResizeToModelInput => assert_eq!(output.layout.tile_count(), 1),
         AutoGazeInferenceMode::TiledFullResolution { .. } => {
@@ -179,20 +182,14 @@ fn embedding_output<B: Backend>(case: ParityCase, device: &B::Device) -> Vec<f32
             );
         }
     }
-    output
+    let embeddings = output
         .embeddings
         .into_data()
         .to_vec::<f32>()
-        .expect("embedding vec")
-}
-
-fn inference_output<B: Backend>(
-    case: ParityCase,
-    device: &B::Device,
-) -> Vec<burn_autogaze::FrameFixationTrace> {
-    let pipeline = deterministic_pipeline::<B>(case, device);
+        .expect("embedding vec");
     let video = deterministic_video::<B>(1, 2, 3, case.height, case.width, device);
-    pipeline.trace_video_with_mode(video, 2, case.mode)
+    let traces = pipeline.trace_video_with_mode(video, 2, case.mode);
+    PipelineOutput { embeddings, traces }
 }
 
 fn deterministic_pipeline<B: Backend>(case: ParityCase, device: &B::Device) -> AutoGazePipeline<B> {
@@ -300,6 +297,186 @@ fn assert_trace_confidences(backend: &str, traces: &[burn_autogaze::FrameFixatio
             .flat_map(|set| set.points.iter())
             .all(|point| point.confidence.is_finite() && (0.0..=1.0).contains(&point.confidence)),
         "{backend} generated invalid trace confidences"
+    );
+}
+
+fn assert_trace_shapes(backend: &str, case: ParityCase, traces: &[FrameFixationTrace]) {
+    assert_eq!(traces.len(), 1, "{backend} should preserve batch size");
+    assert_eq!(
+        traces[0].len(),
+        2,
+        "{backend} should emit one trace set per frame"
+    );
+    let expected_budget = case.mode.fixation_budget(2, case.height, case.width);
+    for (frame_idx, set) in traces[0].frames.iter().enumerate() {
+        assert_eq!(
+            set.points.len(),
+            expected_budget,
+            "{backend} {} frame {frame_idx} should keep the configured fixation budget",
+            case.name
+        );
+        for point in &set.points {
+            assert_valid_point(backend, case, *point);
+        }
+    }
+}
+
+fn assert_valid_point(backend: &str, case: ParityCase, point: FixationPoint) {
+    assert!(
+        point.x.is_finite() && (0.0..=1.0).contains(&point.x),
+        "{backend} {} emitted invalid x: {}",
+        case.name,
+        point.x
+    );
+    assert!(
+        point.y.is_finite() && (0.0..=1.0).contains(&point.y),
+        "{backend} {} emitted invalid y: {}",
+        case.name,
+        point.y
+    );
+    assert!(
+        point.cell_width().is_finite() && point.cell_width() > 0.0 && point.cell_width() <= 1.0,
+        "{backend} {} emitted invalid cell width: {}",
+        case.name,
+        point.cell_width()
+    );
+    assert!(
+        point.cell_height().is_finite() && point.cell_height() > 0.0 && point.cell_height() <= 1.0,
+        "{backend} {} emitted invalid cell height: {}",
+        case.name,
+        point.cell_height()
+    );
+    if point.confidence > 0.0 && case.scales.contains('+') {
+        assert!(
+            point.cell_grid().is_some(),
+            "{backend} {} lost multi-scale grid metadata for positive point",
+            case.name
+        );
+    }
+}
+
+fn assert_traces_match(
+    backend: &str,
+    case: ParityCase,
+    actual: &[FrameFixationTrace],
+    expected: &[FrameFixationTrace],
+    tolerance: f32,
+) {
+    assert_eq!(actual.len(), expected.len(), "{backend} trace batch drift");
+    for (trace_idx, (actual_trace, expected_trace)) in actual.iter().zip(expected).enumerate() {
+        assert_eq!(
+            actual_trace.frames.len(),
+            expected_trace.frames.len(),
+            "{backend} {} trace {trace_idx} frame count drift",
+            case.name
+        );
+        for (frame_idx, (actual_set, expected_set)) in actual_trace
+            .frames
+            .iter()
+            .zip(&expected_trace.frames)
+            .enumerate()
+        {
+            assert!(
+                (actual_set.stop_probability - expected_set.stop_probability).abs() <= tolerance,
+                "{backend} {} frame {frame_idx} stop probability drift: actual={} expected={}",
+                case.name,
+                actual_set.stop_probability,
+                expected_set.stop_probability
+            );
+            assert_eq!(
+                actual_set.points.len(),
+                expected_set.points.len(),
+                "{backend} {} frame {frame_idx} point count drift",
+                case.name
+            );
+            for (point_idx, (actual_point, expected_point)) in actual_set
+                .points
+                .iter()
+                .zip(&expected_set.points)
+                .enumerate()
+            {
+                assert_point_matches(
+                    backend,
+                    case,
+                    frame_idx,
+                    point_idx,
+                    *actual_point,
+                    *expected_point,
+                    tolerance,
+                );
+            }
+        }
+    }
+}
+
+fn assert_point_matches(
+    backend: &str,
+    case: ParityCase,
+    frame_idx: usize,
+    point_idx: usize,
+    actual: FixationPoint,
+    expected: FixationPoint,
+    tolerance: f32,
+) {
+    let context = PointAssertContext {
+        backend,
+        case,
+        frame_idx,
+        point_idx,
+    };
+    assert_close(actual.x, expected.x, 1.0e-6, context, "x");
+    assert_close(actual.y, expected.y, 1.0e-6, context, "y");
+    assert_close(
+        actual.cell_width(),
+        expected.cell_width(),
+        1.0e-6,
+        context,
+        "cell_width",
+    );
+    assert_close(
+        actual.cell_height(),
+        expected.cell_height(),
+        1.0e-6,
+        context,
+        "cell_height",
+    );
+    assert_close(
+        actual.confidence,
+        expected.confidence,
+        tolerance,
+        context,
+        "confidence",
+    );
+    assert_eq!(
+        actual.cell_grid(),
+        expected.cell_grid(),
+        "{backend} {} frame {frame_idx} point {point_idx} grid drift",
+        case.name
+    );
+}
+
+#[derive(Clone, Copy)]
+struct PointAssertContext<'a> {
+    backend: &'a str,
+    case: ParityCase,
+    frame_idx: usize,
+    point_idx: usize,
+}
+
+fn assert_close(
+    actual: f32,
+    expected: f32,
+    tolerance: f32,
+    context: PointAssertContext<'_>,
+    field: &str,
+) {
+    assert!(
+        (actual - expected).abs() <= tolerance,
+        "{} {} frame {} point {} {field} drift: actual={actual} expected={expected} tolerance={tolerance}",
+        context.backend,
+        context.case.name,
+        context.frame_idx,
+        context.point_idx
     );
 }
 

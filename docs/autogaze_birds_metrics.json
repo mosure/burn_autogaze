@@ -14,22 +14,23 @@
   "top_k": 16,
   "max_gaze_tokens_each_frame": 16,
   "tile_count": 45,
+  "fixation_budget_each_frame": 720,
   "scales": "32+64+112+224",
   "num_vision_tokens_each_frame": 265,
   "mask_cell_scale": 1.0,
   "blend_alpha": 0.55,
   "keyframe_duration": 12,
-  "average_mask_ratio": 0.055008770978009255,
-  "average_update_ratio": 0.17539375964506174,
-  "final_update_ratio_ema": 0.22512536331316577,
-  "min_update_ratio": 0.04643132716049383,
+  "average_mask_ratio": 0.6180021158854168,
+  "average_update_ratio": 0.6729663688753859,
+  "final_update_ratio_ema": 0.689638635075269,
+  "min_update_ratio": 0.6024040316358025,
   "max_update_ratio": 1.0,
-  "positive_fixations": 256,
+  "positive_fixations": 11520,
   "cell_grid_histogram": {
-    "14x14": 1,
-    "2x2": 141,
-    "4x4": 106,
-    "7x7": 8
+    "14x14": 11,
+    "2x2": 343,
+    "4x4": 5494,
+    "7x7": 5672
   },
   "mask_palette": {
     "14x14": [

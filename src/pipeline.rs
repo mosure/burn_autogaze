@@ -44,6 +44,20 @@ impl AutoGazeInferenceMode {
             }
         }
     }
+
+    pub fn fixation_budget(self, k: usize, source_height: usize, source_width: usize) -> usize {
+        let k = k.max(1);
+        match self.normalized() {
+            Self::ResizeToModelInput => k,
+            Self::TiledFullResolution { tile_size, stride } => {
+                let tile_count =
+                    AutoGazeTileLayout::tiled(source_height, source_width, tile_size, stride)
+                        .tile_count()
+                        .max(1);
+                k.saturating_mul(tile_count)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -368,6 +382,7 @@ impl<B: Backend> AutoGazePipeline<B> {
             AutoGazeInferenceMode::ResizeToModelInput => self.trace_video_resize(video, k),
             AutoGazeInferenceMode::TiledFullResolution { tile_size, stride } => {
                 let layout = AutoGazeTileLayout::tiled(height, width, tile_size, stride);
+                let frame_budget = k.max(1).saturating_mul(layout.tile_count().max(1));
                 let mut frame_points = (0..batch)
                     .map(|_| (0..time).map(|_| Vec::<FixationPoint>::new()).collect())
                     .collect::<Vec<Vec<Vec<FixationPoint>>>>();
@@ -404,7 +419,7 @@ impl<B: Backend> AutoGazePipeline<B> {
                                 points.sort_by(|left, right| {
                                     right.confidence.total_cmp(&left.confidence)
                                 });
-                                FixationSet::new(points, stop_probability, k)
+                                FixationSet::new(points, stop_probability, frame_budget)
                             })
                             .collect();
                         FrameFixationTrace::new(frames)
@@ -539,12 +554,13 @@ fn remap_tile_point(
 ) -> FixationPoint {
     let source_width = layout.source_width.max(1) as f32;
     let source_height = layout.source_height.max(1) as f32;
-    FixationPoint::with_extent(
+    FixationPoint::with_grid_extent(
         (tile.x as f32 + point.x * tile.width as f32) / source_width,
         (tile.y as f32 + point.y * tile.height as f32) / source_height,
         point.cell_width() * tile.width.max(1) as f32 / source_width,
         point.cell_height() * tile.height.max(1) as f32 / source_height,
         point.confidence,
+        point.cell_grid().unwrap_or(0),
     )
 }
 
@@ -577,7 +593,7 @@ mod tests {
 
     #[test]
     fn remap_tile_point_preserves_source_space_cell_extent() {
-        let point = FixationPoint::with_extent(0.5, 0.5, 1.0 / 14.0, 1.0 / 14.0, 1.0);
+        let point = FixationPoint::with_grid_extent(0.5, 0.5, 1.0 / 14.0, 1.0 / 14.0, 1.0, 14);
         let tile = AutoGazeTile::new(224, 112, 224, 224);
         let layout = AutoGazeTileLayout::tiled(1080, 1920, 224, 224);
 
@@ -587,5 +603,19 @@ mod tests {
         assert!((remapped.y - 224.0 / 1080.0).abs() < 1.0e-6);
         assert!((remapped.cell_width() - (224.0 / 14.0) / 1920.0).abs() < 1.0e-6);
         assert!((remapped.cell_height() - (224.0 / 14.0) / 1080.0).abs() < 1.0e-6);
+        assert_eq!(remapped.cell_grid(), Some(14));
+    }
+
+    #[test]
+    fn tiled_fixation_budget_scales_with_tile_count() {
+        let mode = AutoGazeInferenceMode::tiled_full_resolution(16, 16);
+        let layout = AutoGazeTileLayout::tiled(32, 48, 16, 16);
+
+        assert_eq!(layout.tile_count(), 6);
+        assert_eq!(mode.fixation_budget(2, 32, 48), 12);
+        assert_eq!(
+            AutoGazeInferenceMode::resize_to_model_input().fixation_budget(2, 32, 48),
+            2
+        );
     }
 }

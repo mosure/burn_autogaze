@@ -20,6 +20,8 @@ bevy/webgpu demos.
 - default fast path downsamples frames to the model's `224` input
 - optional tiled full-resolution mode remaps local 224px tile predictions and
   token-cell extents back into source-frame coordinates
+- tiled mode treats `top_k` as a per-tile budget, matching the recovered
+  multi-tile mask instead of truncating the whole frame to a sparse global list
 - mask visualizations preserve the model's multi-scale `2x2`/`4x4`/`7x7`/`14x14`
   token cells with nearest sampling
 - optional `interframe` visualization keeps stale output outside the mask and
@@ -93,7 +95,8 @@ let rgba_trace = pipeline.trace_rgba_clip_with_mode(
 
 `ResizeToModelInput` is the recommended realtime path. `TiledFullResolution`
 keeps local full-res evidence, but it is much slower because every covered tile
-runs through the model.
+runs through the model. In tiled mode, `top_k` is applied per tile; the returned
+fixation budget for each frame is `top_k * tile_count`.
 
 ## visualization
 
@@ -115,9 +118,10 @@ The README GIFs are generated from `/home/mosure/Videos/birds.mp4` at
 `1920x1080` inference resolution with the NVIDIA AutoGaze weights and the same
 Rust pipeline exposed by the crate. `trace_rgba_clip_with_mode(..., tile-224)`
 fully tiles the clip before the resulting stream is downsampled for README
-display. The mask GIF uses scale colors from the model trace, drawing larger
-cells first and smaller cells on top. The per-run ratios and detected cell scale
-histogram are checked in at
+display, using `top_k=16` over 45 tiles for a `720` fixation budget per frame.
+The mask GIF uses scale colors from the decoded model grid metadata, drawing
+larger cells first and smaller cells on top. The per-run ratios and detected
+cell scale histogram are checked in at
 [`docs/autogaze_birds_metrics.json`](./docs/autogaze_birds_metrics.json).
 
 ```sh

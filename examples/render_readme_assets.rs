@@ -167,6 +167,7 @@ struct RenderMetrics {
     top_k: usize,
     max_gaze_tokens_each_frame: usize,
     tile_count: usize,
+    fixation_budget_each_frame: usize,
     scales: String,
     num_vision_tokens_each_frame: usize,
     mask_cell_scale: f32,
@@ -324,6 +325,11 @@ where
             args.stride,
         )
         .tile_count(),
+        fixation_budget_each_frame: mode.fixation_budget(
+            args.top_k,
+            args.inference_height,
+            args.inference_width,
+        ),
         scales: config.scales,
         num_vision_tokens_each_frame: config.num_vision_tokens_each_frame,
         mask_cell_scale: args.mask_cell_scale,
@@ -488,7 +494,7 @@ fn frame_slice(frames: &[u8], frame_idx: usize, frame_bytes: usize) -> &[u8] {
 fn record_points(points: &[FixationPoint], stats: &mut RatioStats, args: &Args) {
     for point in points.iter().filter(|point| point.confidence > 0.0) {
         stats.positive_fixations += 1;
-        let grid = grid_for_point(
+        let grid = point_grid(
             *point,
             args.inference_width,
             args.inference_height,
@@ -546,7 +552,7 @@ fn scale_colored_mask_rgba(
 }
 
 fn color_for_point(point: FixationPoint, width: usize, height: usize, tile_size: usize) -> [u8; 3] {
-    match grid_for_point(point, width, height, tile_size) {
+    match point_grid(point, width, height, tile_size) {
         0..=2 => [255, 180, 0],
         3..=4 => [60, 220, 120],
         5..=7 => [0, 185, 255],
@@ -563,7 +569,18 @@ fn mask_palette() -> BTreeMap<String, [u8; 3]> {
     ])
 }
 
-fn grid_for_point(point: FixationPoint, width: usize, height: usize, tile_size: usize) -> usize {
+fn point_grid(point: FixationPoint, width: usize, height: usize, tile_size: usize) -> usize {
+    point
+        .cell_grid()
+        .unwrap_or_else(|| grid_for_point_extent(point, width, height, tile_size))
+}
+
+fn grid_for_point_extent(
+    point: FixationPoint,
+    width: usize,
+    height: usize,
+    tile_size: usize,
+) -> usize {
     let cell_width_px = point.cell_width() * width.max(1) as f32;
     let cell_height_px = point.cell_height() * height.max(1) as f32;
     let cell_px = cell_width_px.max(cell_height_px).max(1.0);
