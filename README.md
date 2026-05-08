@@ -9,11 +9,9 @@ burn-native [nvidia autogaze](https://huggingface.co/nvidia/AutoGaze) model
 inference, fixation traces, crisp multi-scale token-cell mask visualization, and
 bevy/webgpu demos.
 
-| input | multi-scale mask | alpha-blended output |
+| input | actual multi-scale mask | actual interframe output |
 |---|---|---|
-| <img src="./docs/autogaze_birds_input.gif" alt="birds input clip" title="https://www.vecteezy.com/free-videos Wildlife Stock Videos by Vecteezy"> | <img src="./docs/autogaze_birds_mask.gif" alt="crisp multi-scale autogaze white mask"> | <img src="./docs/autogaze_birds_output.gif" alt="autogaze alpha-blended output"> |
-
-<img src="./docs/autogaze_capabilities.svg" alt="burn_autogaze multi-scale mask, interframe output, and gaze ratio capability overview">
+| <img src="./docs/autogaze_birds_input.gif" alt="birds input clip" title="https://www.vecteezy.com/free-videos Wildlife Stock Videos by Vecteezy"> | <img src="./docs/autogaze_birds_mask.gif" alt="actual crisp multi-scale autogaze white mask"> | <img src="./docs/autogaze_birds_output.gif" alt="actual autogaze interframe alpha-blended output"> |
 
 ## vibes
 
@@ -112,6 +110,20 @@ quad-tree-like cell structure stays crisp.
 The gaze ratio metric reports how much of the output frame changed compared to
 a full-frame redraw. The Bevy overlay shows the current frame ratio plus an EMA
 across processed frames.
+
+The README GIFs are generated from `/home/mosure/Videos/birds.mp4` with the
+real NVIDIA AutoGaze weights and the same Rust pipeline exposed by the crate:
+`trace_rgba_clip_with_mode(..., tile-224)` feeds actual model traces into
+`AutoGazeVisualizationState::Interframe`. The per-run ratios and detected cell
+scale histogram are checked in at
+[`docs/autogaze_birds_metrics.json`](./docs/autogaze_birds_metrics.json).
+
+```sh
+cargo run --example render_readme_assets --features cuda -- \
+  --input /home/mosure/Videos/birds.mp4 \
+  --model-dir /path/to/AutoGaze \
+  --out-dir docs
+```
 
 ## wasm
 
