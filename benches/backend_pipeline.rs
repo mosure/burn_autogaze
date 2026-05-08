@@ -2,8 +2,9 @@ use burn::module::{Module, ModuleMapper, Param};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, TensorData};
 use burn_autogaze::{
-    AutoGazeConfig, AutoGazeInferenceMode, AutoGazePipeline, ConnectorConfig, GazeDecoderConfig,
-    GazeModelConfig, NativeAutoGazeModel, VisionModelConfig,
+    AutoGazeConfig, AutoGazeInferenceMode, AutoGazePipeline, AutoGazeVisualizationMode,
+    AutoGazeVisualizationState, ConnectorConfig, FixationPoint, GazeDecoderConfig, GazeModelConfig,
+    NativeAutoGazeModel, VisionModelConfig,
 };
 use criterion::{
     BatchSize, BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
@@ -38,6 +39,20 @@ struct ModeCase {
     mode: AutoGazeInferenceMode,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ModelCase {
+    name: &'static str,
+    scales: &'static str,
+    num_vision_tokens_each_frame: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct VisualizationCase {
+    name: &'static str,
+    mode: AutoGazeVisualizationMode,
+    force_delta_frame: bool,
+}
+
 const VIDEO_CASES: &[VideoCase] = &[
     VideoCase {
         name: "720p",
@@ -63,11 +78,45 @@ const MODE_CASES: &[ModeCase] = &[
         },
     },
 ];
+const MODEL_CASES: &[ModelCase] = &[
+    ModelCase {
+        name: "single-scale-224",
+        scales: "224",
+        num_vision_tokens_each_frame: CONNECTOR_TOKENS,
+    },
+    ModelCase {
+        name: "multiscale-32-64-112-224",
+        scales: "32+64+112+224",
+        num_vision_tokens_each_frame: 265,
+    },
+];
+const VISUALIZATION_CASES: &[VisualizationCase] = &[
+    VisualizationCase {
+        name: "full-blend",
+        mode: AutoGazeVisualizationMode::FullBlend,
+        force_delta_frame: false,
+    },
+    VisualizationCase {
+        name: "interframe-keyframe",
+        mode: AutoGazeVisualizationMode::Interframe,
+        force_delta_frame: false,
+    },
+    VisualizationCase {
+        name: "interframe-delta",
+        mode: AutoGazeVisualizationMode::Interframe,
+        force_delta_frame: true,
+    },
+];
 const MODEL_INPUT_SIZE: usize = 224;
+const PATCH_SIZE: usize = 16;
+const MODEL_GRID: usize = MODEL_INPUT_SIZE / PATCH_SIZE;
+const CONNECTOR_TOKENS: usize = MODEL_GRID * MODEL_GRID;
 const BATCH: usize = 1;
 const FRAMES: usize = 2;
 const CHANNELS: usize = 3;
 const REAL_TOP_K: usize = 4;
+const BLEND_ALPHA: f32 = 0.55;
+const KEYFRAME_DURATION: usize = 30;
 
 fn bench_embed_video(c: &mut Criterion) {
     let mut group = c.benchmark_group("autogaze_embed_video");
@@ -119,12 +168,32 @@ fn bench_real_trace_video(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_visualization(c: &mut Criterion) {
+    let mut group = c.benchmark_group("autogaze_visualization");
+    group.sample_size(10);
+
+    for &case in VIDEO_CASES {
+        group.throughput(Throughput::Elements((case.width * case.height) as u64));
+        for &model in MODEL_CASES {
+            for &visualization in VISUALIZATION_CASES {
+                bench_visualization_case(&mut group, case, model, visualization);
+            }
+        }
+    }
+
+    group.finish();
+}
+
 #[cfg(feature = "ndarray")]
 fn register_ndarray_embed(group: &mut BenchmarkGroup<'_, WallTime>) {
     for &case in VIDEO_CASES {
-        for &mode in MODE_CASES {
-            let device = Default::default();
-            bench_embed_case::<burn::backend::NdArray<f32>>(group, "ndarray", case, mode, device);
+        for &model in MODEL_CASES {
+            for &mode in MODE_CASES {
+                let device = Default::default();
+                bench_embed_case::<burn::backend::NdArray<f32>>(
+                    group, "ndarray", case, model, mode, device,
+                );
+            }
         }
     }
 }
@@ -135,9 +204,13 @@ fn register_ndarray_embed(_group: &mut BenchmarkGroup<'_, WallTime>) {}
 #[cfg(feature = "ndarray")]
 fn register_ndarray_trace(group: &mut BenchmarkGroup<'_, WallTime>) {
     for &case in VIDEO_CASES {
-        for &mode in MODE_CASES {
-            let device = Default::default();
-            bench_trace_case::<burn::backend::NdArray<f32>>(group, "ndarray", case, mode, device);
+        for &model in MODEL_CASES {
+            for &mode in MODE_CASES {
+                let device = Default::default();
+                bench_trace_case::<burn::backend::NdArray<f32>>(
+                    group, "ndarray", case, model, mode, device,
+                );
+            }
         }
     }
 }
@@ -151,16 +224,19 @@ fn register_webgpu_embed(group: &mut BenchmarkGroup<'_, WallTime>) {
         return;
     };
     for &case in VIDEO_CASES {
-        for &mode in MODE_CASES {
-            if let Some(device) = warm_backend::<burn::backend::WebGpu<f32, i32>>(
-                "webgpu",
-                case,
-                mode,
-                device.clone(),
-            ) {
-                bench_embed_case::<burn::backend::WebGpu<f32, i32>>(
-                    group, "webgpu", case, mode, device,
-                );
+        for &model in MODEL_CASES {
+            for &mode in MODE_CASES {
+                if let Some(device) = warm_backend::<burn::backend::WebGpu<f32, i32>>(
+                    "webgpu",
+                    case,
+                    model,
+                    mode,
+                    device.clone(),
+                ) {
+                    bench_embed_case::<burn::backend::WebGpu<f32, i32>>(
+                        group, "webgpu", case, model, mode, device,
+                    );
+                }
             }
         }
     }
@@ -172,16 +248,19 @@ fn register_webgpu_trace(group: &mut BenchmarkGroup<'_, WallTime>) {
         return;
     };
     for &case in VIDEO_CASES {
-        for &mode in MODE_CASES {
-            if let Some(device) = warm_backend::<burn::backend::WebGpu<f32, i32>>(
-                "webgpu",
-                case,
-                mode,
-                device.clone(),
-            ) {
-                bench_trace_case::<burn::backend::WebGpu<f32, i32>>(
-                    group, "webgpu", case, mode, device,
-                );
+        for &model in MODEL_CASES {
+            for &mode in MODE_CASES {
+                if let Some(device) = warm_backend::<burn::backend::WebGpu<f32, i32>>(
+                    "webgpu",
+                    case,
+                    model,
+                    mode,
+                    device.clone(),
+                ) {
+                    bench_trace_case::<burn::backend::WebGpu<f32, i32>>(
+                        group, "webgpu", case, model, mode, device,
+                    );
+                }
             }
         }
     }
@@ -191,13 +270,19 @@ fn register_webgpu_trace(group: &mut BenchmarkGroup<'_, WallTime>) {
 fn register_cuda_embed(group: &mut BenchmarkGroup<'_, WallTime>) {
     let device = burn::backend::cuda::CudaDevice::default();
     for &case in VIDEO_CASES {
-        for &mode in MODE_CASES {
-            if let Some(device) =
-                warm_backend::<burn::backend::Cuda<f32, i32>>("cuda", case, mode, device.clone())
-            {
-                bench_embed_case::<burn::backend::Cuda<f32, i32>>(
-                    group, "cuda", case, mode, device,
-                );
+        for &model in MODEL_CASES {
+            for &mode in MODE_CASES {
+                if let Some(device) = warm_backend::<burn::backend::Cuda<f32, i32>>(
+                    "cuda",
+                    case,
+                    model,
+                    mode,
+                    device.clone(),
+                ) {
+                    bench_embed_case::<burn::backend::Cuda<f32, i32>>(
+                        group, "cuda", case, model, mode, device,
+                    );
+                }
             }
         }
     }
@@ -207,13 +292,19 @@ fn register_cuda_embed(group: &mut BenchmarkGroup<'_, WallTime>) {
 fn register_cuda_trace(group: &mut BenchmarkGroup<'_, WallTime>) {
     let device = burn::backend::cuda::CudaDevice::default();
     for &case in VIDEO_CASES {
-        for &mode in MODE_CASES {
-            if let Some(device) =
-                warm_backend::<burn::backend::Cuda<f32, i32>>("cuda", case, mode, device.clone())
-            {
-                bench_trace_case::<burn::backend::Cuda<f32, i32>>(
-                    group, "cuda", case, mode, device,
-                );
+        for &model in MODEL_CASES {
+            for &mode in MODE_CASES {
+                if let Some(device) = warm_backend::<burn::backend::Cuda<f32, i32>>(
+                    "cuda",
+                    case,
+                    model,
+                    mode,
+                    device.clone(),
+                ) {
+                    bench_trace_case::<burn::backend::Cuda<f32, i32>>(
+                        group, "cuda", case, model, mode, device,
+                    );
+                }
             }
         }
     }
@@ -268,17 +359,18 @@ fn bench_embed_case<B>(
     group: &mut BenchmarkGroup<'_, WallTime>,
     backend: &str,
     case: VideoCase,
+    model: ModelCase,
     mode: ModeCase,
     device: B::Device,
 ) where
     B: Backend,
     B::Device: Clone,
 {
-    let pipeline = deterministic_pipeline::<B>(&device);
+    let pipeline = deterministic_pipeline::<B>(model, &device);
     let video = deterministic_video::<B>(BATCH, FRAMES, CHANNELS, case.height, case.width, &device);
     group.throughput(Throughput::Elements(case.frames_per_batch()));
     group.bench_with_input(
-        BenchmarkId::new(format!("{backend}/{}", mode.name), case.name),
+        BenchmarkId::new(format!("{backend}/{}/{}", model.name, mode.name), case.name),
         &case,
         |b, _| {
             b.iter_batched(
@@ -299,17 +391,18 @@ fn bench_trace_case<B>(
     group: &mut BenchmarkGroup<'_, WallTime>,
     backend: &str,
     case: VideoCase,
+    model: ModelCase,
     mode: ModeCase,
     device: B::Device,
 ) where
     B: Backend,
     B::Device: Clone,
 {
-    let pipeline = deterministic_pipeline::<B>(&device);
+    let pipeline = deterministic_pipeline::<B>(model, &device);
     let video = deterministic_video::<B>(BATCH, FRAMES, CHANNELS, case.height, case.width, &device);
     group.throughput(Throughput::Elements(case.frames_per_batch()));
     group.bench_with_input(
-        BenchmarkId::new(format!("{backend}/{}", mode.name), case.name),
+        BenchmarkId::new(format!("{backend}/{}/{}", model.name, mode.name), case.name),
         &case,
         |b, _| {
             b.iter_batched(
@@ -317,6 +410,66 @@ fn bench_trace_case<B>(
                 |video| {
                     black_box(pipeline.trace_video_with_mode(video, 2, mode.mode));
                     B::sync(&device).expect("backend sync");
+                },
+                BatchSize::SmallInput,
+            );
+        },
+    );
+}
+
+fn bench_visualization_case(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    case: VideoCase,
+    model: ModelCase,
+    visualization: VisualizationCase,
+) {
+    let rgba = deterministic_rgba(FRAMES, case.height, case.width);
+    let previous_rgba = deterministic_rgba_frame(case.height, case.width, 17);
+    let current_rgba = &rgba[rgba.len() - case.height * case.width * 4..];
+    let points = deterministic_fixations(model);
+    group.bench_with_input(
+        BenchmarkId::new(format!("{}/{}", model.name, visualization.name), case.name),
+        &case,
+        |b, _| {
+            b.iter_batched(
+                || {
+                    let mut state = AutoGazeVisualizationState::new(
+                        visualization.mode,
+                        if visualization.force_delta_frame {
+                            usize::MAX
+                        } else {
+                            KEYFRAME_DURATION
+                        },
+                    );
+                    if visualization.force_delta_frame {
+                        state
+                            .visualize_rgba(
+                                &previous_rgba,
+                                case.width,
+                                case.height,
+                                &points,
+                                1.0,
+                                BLEND_ALPHA,
+                            )
+                            .expect("prime interframe visualization state");
+                    }
+                    state
+                },
+                |mut state| {
+                    let output = state
+                        .visualize_rgba(
+                            current_rgba,
+                            case.width,
+                            case.height,
+                            &points,
+                            1.0,
+                            BLEND_ALPHA,
+                        )
+                        .expect("visualize autogaze mask");
+                    black_box(output.mask_pixel_count);
+                    black_box(output.updated_pixel_count);
+                    black_box(output.update_ratio());
+                    black_box(output.side_by_side_rgba.len());
                 },
                 BatchSize::SmallInput,
             );
@@ -356,6 +509,7 @@ fn bench_real_trace_case<B>(
 fn warm_backend<B: Backend>(
     backend: &str,
     case: VideoCase,
+    model: ModelCase,
     mode: ModeCase,
     device: B::Device,
 ) -> Option<B::Device>
@@ -363,7 +517,7 @@ where
     B::Device: Clone,
 {
     run_optional(backend, || {
-        let pipeline = deterministic_pipeline::<B>(&device);
+        let pipeline = deterministic_pipeline::<B>(model, &device);
         let video =
             deterministic_video::<B>(BATCH, FRAMES, CHANNELS, case.height, case.width, &device);
         let output = pipeline.embed_video_with_mode(video, mode.mode);
@@ -404,55 +558,71 @@ fn webgpu_device() -> Option<burn::backend::wgpu::WgpuDevice> {
     }
 }
 
-fn deterministic_pipeline<B: Backend>(device: &B::Device) -> AutoGazePipeline<B> {
-    let config = tiny_config();
+fn deterministic_pipeline<B: Backend>(model: ModelCase, device: &B::Device) -> AutoGazePipeline<B> {
+    let config = tiny_config(model);
     let mut mapper = DeterministicParamMapper { cursor: 0 };
     let model = NativeAutoGazeModel::new(&config, device).map(&mut mapper);
     AutoGazePipeline::new(model).with_max_gaze_tokens_each_frame(2)
 }
 
-fn tiny_config() -> AutoGazeConfig {
-    let kernel_size = 16;
-    let grid = MODEL_INPUT_SIZE / kernel_size;
-    let tokens = grid * grid;
+fn tiny_config(model: ModelCase) -> AutoGazeConfig {
     let hidden = 8;
     let heads = 2;
+    let vocab_size = model.num_vision_tokens_each_frame + 1;
     AutoGazeConfig {
-        scales: MODEL_INPUT_SIZE.to_string(),
+        scales: model.scales.to_string(),
         max_num_frames: FRAMES,
-        num_vision_tokens_each_frame: tokens,
+        num_vision_tokens_each_frame: model.num_vision_tokens_each_frame,
         gaze_model_config: GazeModelConfig {
             input_img_size: MODEL_INPUT_SIZE,
-            num_vision_tokens_each_frame: tokens,
+            num_vision_tokens_each_frame: model.num_vision_tokens_each_frame,
             attn_mode: "sdpa".to_string(),
             vision_model_config: VisionModelConfig {
                 hidden_dim: hidden,
                 out_dim: hidden,
                 depth: 1,
-                kernel_size,
+                kernel_size: PATCH_SIZE,
                 temporal_patch_size: 1,
                 trunk_temporal_kernel_size: 3,
                 trunk_spatial_kernel_size: 1,
             },
             connector_config: ConnectorConfig {
                 hidden_dim: hidden,
-                num_tokens: tokens,
+                num_tokens: CONNECTOR_TOKENS,
             },
             gaze_decoder_config: GazeDecoderConfig {
-                vocab_size: 128,
+                vocab_size,
                 hidden_size: hidden,
                 intermediate_size: hidden * 2,
                 num_hidden_layers: 1,
                 num_attention_heads: heads,
                 num_key_value_heads: heads,
                 max_position_embeddings: 512,
-                eos_token_id: 127,
+                bos_token_id: 0,
+                eos_token_id: model.num_vision_tokens_each_frame as i64,
                 head_dim: hidden / heads,
                 num_multi_token_pred: 2,
                 ..GazeDecoderConfig::default()
             },
         },
         ..AutoGazeConfig::default()
+    }
+}
+
+fn deterministic_fixations(model: ModelCase) -> Vec<FixationPoint> {
+    if model.scales.contains('+') {
+        vec![
+            FixationPoint::with_extent(0.25, 0.25, 0.5, 0.5, 0.98),
+            FixationPoint::with_extent(0.625, 0.125, 0.25, 0.25, 0.91),
+            FixationPoint::with_extent(3.5 / 7.0, 5.5 / 7.0, 1.0 / 7.0, 1.0 / 7.0, 0.84),
+            FixationPoint::with_extent(11.5 / 14.0, 8.5 / 14.0, 1.0 / 14.0, 1.0 / 14.0, 0.77),
+        ]
+    } else {
+        vec![
+            FixationPoint::with_extent(3.5 / 14.0, 4.5 / 14.0, 1.0 / 14.0, 1.0 / 14.0, 0.95),
+            FixationPoint::with_extent(10.5 / 14.0, 7.5 / 14.0, 1.0 / 14.0, 1.0 / 14.0, 0.82),
+            FixationPoint::with_extent(6.5 / 14.0, 11.5 / 14.0, 1.0 / 14.0, 1.0 / 14.0, 0.71),
+        ]
     }
 }
 
@@ -472,6 +642,25 @@ fn deterministic_video<B: Backend>(
         TensorData::new(values, [batch, frames, channels, height, width]),
         device,
     )
+}
+
+fn deterministic_rgba(frames: usize, height: usize, width: usize) -> Vec<u8> {
+    (0..frames)
+        .flat_map(|frame| deterministic_rgba_frame(height, width, frame))
+        .collect()
+}
+
+fn deterministic_rgba_frame(height: usize, width: usize, frame: usize) -> Vec<u8> {
+    let mut rgba = Vec::with_capacity(height * width * 4);
+    for y in 0..height {
+        for x in 0..width {
+            rgba.push(((x + frame * 13) % 256) as u8);
+            rgba.push(((y + frame * 29) % 256) as u8);
+            rgba.push(((x + y + frame * 7) % 256) as u8);
+            rgba.push(255);
+        }
+    }
+    rgba
 }
 
 struct DeterministicParamMapper {
@@ -562,6 +751,7 @@ criterion_group!(
     benches,
     bench_embed_video,
     bench_trace_video,
-    bench_real_trace_video
+    bench_real_trace_video,
+    bench_visualization
 );
 criterion_main!(benches);

@@ -180,7 +180,19 @@ AUTOGAZE_HF_DIR=/path/to/AutoGaze cargo bench --bench backend_pipeline --feature
 
 the benchmark suite covers full-resolution source clips (`1280x720` and
 `1920x1080`), `resize-224`, `tile-224`, embedding, trace generation, and a
-real-model group when the autogaze hugging face snapshot is available.
+real-model group when the autogaze hugging face snapshot is available. synthetic
+backend benches run the full matrix across `single-scale-224` and
+`multiscale-32-64-112-224` model layouts, so tiled full-resolution runs are
+measured with the same multi-scale gaze-token layout used by the NVIDIA config.
+the visualization group also measures `full-blend`, `interframe-keyframe`, and
+`interframe-delta` output paths for single-scale and multi-scale crisp masks.
+
+useful filters:
+
+```sh
+cargo bench --bench backend_pipeline -- autogaze_trace_video/webgpu/multiscale-32-64-112-224/tile-224
+cargo bench --bench backend_pipeline -- autogaze_visualization/multiscale-32-64-112-224/interframe-delta
+```
 
 ## validation
 

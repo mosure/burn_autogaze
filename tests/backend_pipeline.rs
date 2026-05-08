@@ -17,6 +17,9 @@ type CpuBackend = burn::backend::NdArray<f32>;
 struct ParityCase {
     name: &'static str,
     model_input: usize,
+    scales: &'static str,
+    connector_tokens: usize,
+    num_vision_tokens_each_frame: usize,
     height: usize,
     width: usize,
     mode: AutoGazeInferenceMode,
@@ -29,15 +32,44 @@ fn accelerator_embeddings_match_ndarray_reference() {
 
     let cases = [
         ParityCase {
-            name: "resize",
+            name: "single-scale-resize",
             model_input: 16,
+            scales: "16",
+            connector_tokens: 4,
+            num_vision_tokens_each_frame: 4,
             height: 32,
             width: 48,
             mode: AutoGazeInferenceMode::ResizeToModelInput,
         },
         ParityCase {
-            name: "tile",
+            name: "single-scale-tile",
             model_input: 16,
+            scales: "16",
+            connector_tokens: 4,
+            num_vision_tokens_each_frame: 4,
+            height: 32,
+            width: 48,
+            mode: AutoGazeInferenceMode::TiledFullResolution {
+                tile_size: 16,
+                stride: 16,
+            },
+        },
+        ParityCase {
+            name: "multiscale-resize",
+            model_input: 16,
+            scales: "8+16",
+            connector_tokens: 4,
+            num_vision_tokens_each_frame: 5,
+            height: 32,
+            width: 48,
+            mode: AutoGazeInferenceMode::ResizeToModelInput,
+        },
+        ParityCase {
+            name: "multiscale-tile",
+            model_input: 16,
+            scales: "8+16",
+            connector_tokens: 4,
+            num_vision_tokens_each_frame: 5,
             height: 32,
             width: 48,
             mode: AutoGazeInferenceMode::TiledFullResolution {
@@ -135,7 +167,7 @@ fn assert_backend_matches<B: Backend>(
 }
 
 fn embedding_output<B: Backend>(case: ParityCase, device: &B::Device) -> Vec<f32> {
-    let pipeline = deterministic_pipeline::<B>(case.model_input, device);
+    let pipeline = deterministic_pipeline::<B>(case, device);
     let video = deterministic_video::<B>(1, 2, 3, case.height, case.width, device);
     let output = pipeline.embed_video_with_mode(video, case.mode);
     match case.mode {
@@ -158,34 +190,29 @@ fn inference_output<B: Backend>(
     case: ParityCase,
     device: &B::Device,
 ) -> Vec<burn_autogaze::FrameFixationTrace> {
-    let pipeline = deterministic_pipeline::<B>(case.model_input, device);
+    let pipeline = deterministic_pipeline::<B>(case, device);
     let video = deterministic_video::<B>(1, 2, 3, case.height, case.width, device);
     pipeline.trace_video_with_mode(video, 2, case.mode)
 }
 
-fn deterministic_pipeline<B: Backend>(
-    model_input: usize,
-    device: &B::Device,
-) -> AutoGazePipeline<B> {
-    let config = tiny_config(model_input);
+fn deterministic_pipeline<B: Backend>(case: ParityCase, device: &B::Device) -> AutoGazePipeline<B> {
+    let config = tiny_config(case);
     let mut mapper = DeterministicParamMapper { cursor: 0 };
     let model = NativeAutoGazeModel::new(&config, device).map(&mut mapper);
     AutoGazePipeline::new(model).with_max_gaze_tokens_each_frame(2)
 }
 
-fn tiny_config(resolution: usize) -> AutoGazeConfig {
+fn tiny_config(case: ParityCase) -> AutoGazeConfig {
     let kernel_size = 8;
-    let grid = resolution / kernel_size;
-    let tokens = grid * grid;
     let hidden = 8;
     let heads = 2;
     AutoGazeConfig {
-        scales: resolution.to_string(),
+        scales: case.scales.to_string(),
         max_num_frames: 2,
-        num_vision_tokens_each_frame: tokens,
+        num_vision_tokens_each_frame: case.num_vision_tokens_each_frame,
         gaze_model_config: GazeModelConfig {
-            input_img_size: resolution,
-            num_vision_tokens_each_frame: tokens,
+            input_img_size: case.model_input,
+            num_vision_tokens_each_frame: case.num_vision_tokens_each_frame,
             attn_mode: "sdpa".to_string(),
             vision_model_config: VisionModelConfig {
                 hidden_dim: hidden,
@@ -198,17 +225,18 @@ fn tiny_config(resolution: usize) -> AutoGazeConfig {
             },
             connector_config: ConnectorConfig {
                 hidden_dim: hidden,
-                num_tokens: tokens,
+                num_tokens: case.connector_tokens,
             },
             gaze_decoder_config: GazeDecoderConfig {
-                vocab_size: 128,
+                vocab_size: case.num_vision_tokens_each_frame + 1,
                 hidden_size: hidden,
                 intermediate_size: hidden * 2,
                 num_hidden_layers: 1,
                 num_attention_heads: heads,
                 num_key_value_heads: heads,
                 max_position_embeddings: 512,
-                eos_token_id: 127,
+                bos_token_id: 0,
+                eos_token_id: case.num_vision_tokens_each_frame as i64,
                 head_dim: hidden / heads,
                 num_multi_token_pred: 2,
                 ..GazeDecoderConfig::default()
