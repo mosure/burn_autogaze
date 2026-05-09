@@ -1,7 +1,3 @@
-#[cfg(target_arch = "wasm32")]
-use std::cell::RefCell;
-#[cfg(not(target_arch = "wasm32"))]
-use std::sync::OnceLock;
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
@@ -21,20 +17,22 @@ use bevy::{
     prelude::*,
     render::{
         RenderPlugin,
-        render_resource::{Extent3d, TextureDimension, TextureFormat},
+        render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages},
         settings::{RenderCreation, WgpuFeatures, WgpuSettings},
     },
     tasks::{AsyncComputeTaskPool, Task, block_on, futures_lite::future},
     ui::widget::ImageNode,
     window::PrimaryWindow,
 };
+use bevy_burn::{BevyBurnBridgePlugin, BevyBurnHandle, BindingDirection, BurnDevice, TransferKind};
 #[cfg(not(target_arch = "wasm32"))]
 use burn::prelude::Backend;
+use burn::tensor::{Int, Tensor, TensorData};
 #[cfg(target_arch = "wasm32")]
 use burn_autogaze::{AutoGazeConfig, AutoGazeLoadOptions, NativeAutoGazeModel};
 use burn_autogaze::{
     AutoGazeInferenceMode, AutoGazePipeline, AutoGazeRgbaClipShape, AutoGazeVisualizationMode,
-    AutoGazeVisualizationState, FixationPoint,
+    FixationPoint, fixation_alpha_mask,
 };
 use image::{RgbaImage, imageops::FilterType};
 
@@ -42,11 +40,6 @@ pub mod platform;
 
 pub type AutoGazeBevyBackend = burn::backend::WebGpu<f32, i32>;
 pub type AutoGazeBevyDevice = burn::backend::wgpu::WgpuDevice;
-
-#[cfg(target_arch = "wasm32")]
-thread_local! {
-    static BURN_DEVICE: RefCell<Option<AutoGazeBevyDevice>> = const { RefCell::new(None) };
-}
 
 pub const DEFAULT_NATIVE_MODEL_DIR: &str = "/home/mosure/.cache/huggingface/hub/models--nvidia--AutoGaze/snapshots/5100fae739ec1bf3f875914fa1b703846a18943a";
 pub const DEFAULT_CONFIG_URL: &str =
@@ -422,8 +415,43 @@ impl FrameQueue {
 #[derive(Resource, Default, Clone)]
 struct StaticFrame(Option<Arc<RgbaImage>>);
 
-#[derive(Resource, Clone, Debug)]
-struct BevyVisualizationState(AutoGazeVisualizationState);
+#[derive(Resource, Clone)]
+struct BevyVisualizationState {
+    mode: AutoGazeVisualizationMode,
+    keyframe_duration: usize,
+    frame_index: usize,
+    interframe_output: Option<Tensor<AutoGazeBevyBackend, 3>>,
+    interframe_width: usize,
+    interframe_height: usize,
+}
+
+impl BevyVisualizationState {
+    fn new(mode: AutoGazeVisualizationMode, keyframe_duration: usize) -> Self {
+        Self {
+            mode,
+            keyframe_duration: keyframe_duration.max(1),
+            frame_index: 0,
+            interframe_output: None,
+            interframe_width: 0,
+            interframe_height: 0,
+        }
+    }
+
+    fn configure(&mut self, mode: AutoGazeVisualizationMode, keyframe_duration: usize) {
+        if self.mode != mode {
+            self.reset();
+        }
+        self.mode = mode;
+        self.keyframe_duration = keyframe_duration.max(1);
+    }
+
+    fn reset(&mut self) {
+        self.frame_index = 0;
+        self.interframe_output = None;
+        self.interframe_width = 0;
+        self.interframe_height = 0;
+    }
+}
 
 #[derive(Resource, Clone, Debug)]
 struct GazeRatioStats {
@@ -492,7 +520,7 @@ struct InferenceTiming {
     trace_ms: f64,
     sync_ms: f64,
     visualize_ms: f64,
-    texture_ms: f64,
+    display_ms: f64,
     total_ms: f64,
 }
 
@@ -520,7 +548,7 @@ impl InferenceTimingStats {
 
         self.last_log = Some(now);
         log(&format!(
-            "AutoGaze timing: {:.1} fps e2e ({:.1} ms) clip={} {}x{}, pack={:.1} ms, trace={:.1} ms, sync={:.1} ms, visualize={:.1} ms, texture={:.1} ms",
+            "AutoGaze timing: {:.1} fps e2e ({:.1} ms) clip={} {}x{}, pack={:.1} ms, trace={:.1} ms, sync={:.1} ms, visualize={:.1} ms, display={:.1} ms",
             timing.e2e_fps(),
             timing.total_ms,
             timing.clip_frames,
@@ -530,7 +558,7 @@ impl InferenceTimingStats {
             timing.trace_ms,
             timing.sync_ms,
             timing.visualize_ms,
-            timing.texture_ms,
+            timing.display_ms,
         ));
     }
 }
@@ -586,10 +614,10 @@ pub fn viewer_app(config: BevyBurnAutoGazeConfig) -> App {
     app.insert_resource(ClearColor(Color::BLACK));
     app.insert_resource(AutoGazeTexture::default());
     app.insert_resource(FrameQueue::default());
-    app.insert_resource(BevyVisualizationState(AutoGazeVisualizationState::new(
+    app.insert_resource(BevyVisualizationState::new(
         config.visualization_mode,
         config.keyframe_duration,
-    )));
+    ));
     app.insert_resource(GazeRatioStats::default());
     app.insert_resource(PsnrStats::default());
     app.insert_resource(InferenceTimingStats::default());
@@ -615,6 +643,7 @@ pub fn viewer_app(config: BevyBurnAutoGazeConfig) -> App {
                 ..default()
             }),
     );
+    app.add_plugins(BevyBurnBridgePlugin::<AutoGazeBevyBackend>::default());
 
     if config.press_esc_to_close {
         app.add_systems(Update, press_esc_close);
@@ -667,22 +696,23 @@ fn setup_ui(
     mut commands: Commands,
     mut texture: ResMut<AutoGazeTexture>,
     mut images: ResMut<Assets<Image>>,
+    burn_device: Option<Res<BurnDevice>>,
 ) {
     if texture.entity.is_some() {
         return;
     }
+    let Some(device) = burn_device.as_ref().and_then(|device| device.device()) else {
+        return;
+    };
 
     let size = Extent3d {
         width: texture.width.max(1),
         height: texture.height.max(1),
         depth_or_array_layers: 1,
     };
-    texture.image = images.add(Image::new_fill(
-        size,
-        TextureDimension::D2,
-        &[0, 0, 0, 255],
-        TextureFormat::Rgba8UnormSrgb,
-        RenderAssetUsages::default(),
+    texture.image = images.add(visualization_image(
+        texture.width.max(1),
+        texture.height.max(1),
     ));
 
     let mut image_entity = None;
@@ -705,6 +735,16 @@ fn setup_ui(
                         width: Val::Px(texture.width.max(1) as f32),
                         height: Val::Px(texture.height.max(1) as f32),
                         ..default()
+                    },
+                    BevyBurnHandle::<AutoGazeBevyBackend> {
+                        bevy_image: texture.image.clone(),
+                        tensor: Tensor::<AutoGazeBevyBackend, 3>::zeros(
+                            [size.height as usize, size.width as usize, 4],
+                            device,
+                        ),
+                        upload: true,
+                        direction: BindingDirection::BurnToBevy,
+                        xfer: TransferKind::Gpu,
                     },
                 ))
                 .id();
@@ -778,16 +818,23 @@ fn fit_visualization_node(
     node.height = Val::Px(display_height.max(1.0));
 }
 
-fn begin_model_load(mut state: ResMut<AutoGazeModelState>) {
+fn begin_model_load(mut state: ResMut<AutoGazeModelState>, burn_device: Option<Res<BurnDevice>>) {
     if !state.config.load_model {
         return;
     }
     if state.pipeline.is_some() || state.load_task.is_some() {
         return;
     }
+    let Some(device) = burn_device
+        .as_ref()
+        .and_then(|device| device.device())
+        .cloned()
+    else {
+        return;
+    };
 
     log("loading AutoGaze model...");
-    state.load_task = Some(spawn_model_load_task(state.config.clone()));
+    state.load_task = Some(spawn_model_load_task(state.config.clone(), device));
 }
 
 fn finish_model_load(
@@ -803,7 +850,7 @@ fn finish_model_load(
             Ok(pipeline) => {
                 log("AutoGaze model ready");
                 state.pipeline = Some(Arc::new(Mutex::new(pipeline)));
-                visualization_state.0.reset();
+                visualization_state.reset();
             }
             Err(err) => {
                 log(&format!("failed to load AutoGaze model: {err}"));
@@ -817,6 +864,7 @@ fn process_frames(
     mut commands: Commands,
     model: Res<AutoGazeModelState>,
     texture: Res<AutoGazeTexture>,
+    burn_device: Option<Res<BurnDevice>>,
     mut frame_input: FrameInputParams,
     active_tasks: Query<&ProcessAutoGaze>,
     mut logged_first_inference: Local<bool>,
@@ -825,6 +873,13 @@ fn process_frames(
         return;
     };
     let Some(image_entity) = texture.entity else {
+        return;
+    };
+    let Some(device) = burn_device
+        .as_ref()
+        .and_then(|device| device.device())
+        .cloned()
+    else {
         return;
     };
     if active_tasks.iter().count() >= MAX_IN_FLIGHT_TASKS {
@@ -858,11 +913,11 @@ fn process_frames(
         frame_input.config.blend_alpha,
         frame_input.config.show_psnr,
     );
-    frame_input.visualization_state.0.configure(
+    frame_input.visualization_state.configure(
         frame_input.config.visualization_mode,
         frame_input.config.keyframe_duration,
     );
-    let visualization_state = frame_input.visualization_state.0.clone();
+    let visualization_state = frame_input.visualization_state.clone();
     if !*logged_first_inference {
         log("AutoGaze inference started; the first native run may spend time tuning GPU kernels");
         *logged_first_inference = true;
@@ -877,6 +932,7 @@ fn process_frames(
             mode,
             visualization_options,
             visualization_state,
+            device,
         )
         .await;
 
@@ -888,29 +944,26 @@ fn process_frames(
             mode,
             visualization_options,
             visualization_state,
+            device,
         );
 
         let mut queue = CommandQueue::default();
         queue.push(move |world: &mut World| {
             match result {
                 Ok((visualization, visualization_state)) => {
-                    let width = visualization.width;
-                    let height = visualization.height;
-                    let gaze_update_ratio = visualization.gaze_update_ratio;
-                    let psnr_db = visualization.psnr_db;
-                    let mut timing = visualization.timing;
-                    if let Ok(entity) = world.get_entity_mut(image_entity)
-                        && let Some(image_node) = entity.get::<ImageNode>()
-                    {
-                        let handle = image_node.image.clone();
-                        if let Some(mut images) = world.get_resource_mut::<Assets<Image>>() {
-                            let texture_start = Instant::now();
-                            write_visualization_to_image(&handle, visualization, &mut images);
-                            if let Some(ref mut timing) = timing {
-                                timing.texture_ms = elapsed_ms(texture_start);
-                                timing.total_ms += timing.texture_ms;
-                            }
-                        }
+                    let Visualization {
+                        width,
+                        height,
+                        tensor,
+                        gaze_update_ratio,
+                        psnr_db,
+                        mut timing,
+                    } = visualization;
+                    let display_start = Instant::now();
+                    apply_visualization_to_world(world, image_entity, width, height, tensor);
+                    if let Some(ref mut timing) = timing {
+                        timing.display_ms = elapsed_ms(display_start);
+                        timing.total_ms += timing.display_ms;
                     }
 
                     if let Some(mut texture) = world.get_resource_mut::<AutoGazeTexture>() {
@@ -919,7 +972,7 @@ fn process_frames(
                     }
 
                     if let Some(mut state) = world.get_resource_mut::<BevyVisualizationState>() {
-                        state.0 = visualization_state;
+                        *state = visualization_state;
                     }
 
                     if let Some(mut stats) = world.get_resource_mut::<GazeRatioStats>() {
@@ -958,8 +1011,9 @@ fn process_frames(
 fn preview_frames(
     model: Res<AutoGazeModelState>,
     mut texture: ResMut<AutoGazeTexture>,
+    burn_device: Option<Res<BurnDevice>>,
     mut frame_input: FrameInputParams,
-    image_nodes: Query<&ImageNode>,
+    mut burn_handles: Query<&mut BevyBurnHandle<AutoGazeBevyBackend>>,
     active_tasks: Query<&ProcessAutoGaze>,
     mut images: ResMut<Assets<Image>>,
 ) {
@@ -970,6 +1024,9 @@ fn preview_frames(
     }
 
     let Some(image_entity) = texture.entity else {
+        return;
+    };
+    let Some(device) = burn_device.as_ref().and_then(|device| device.device()) else {
         return;
     };
 
@@ -992,33 +1049,39 @@ fn preview_frames(
     };
 
     if model_ready {
-        let visualization = live_preview_visualization(frame, frame_input.config.show_psnr);
+        let visualization =
+            match live_preview_visualization(frame, frame_input.config.show_psnr, device) {
+                Ok(visualization) => visualization,
+                Err(err) => {
+                    log(&format!("failed to draw AutoGaze live preview: {err}"));
+                    return;
+                }
+            };
         apply_visualization_to_texture(
             image_entity,
             visualization,
             &mut texture,
-            &image_nodes,
+            &mut burn_handles,
             &mut images,
         );
         return;
     }
 
-    frame_input.visualization_state.0.configure(
+    frame_input.visualization_state.configure(
         frame_input.config.visualization_mode,
         frame_input.config.keyframe_duration,
     );
     let visualization_options = VisualizationOptions::new(
         frame_input.config.mask_cell_scale,
         frame_input.config.blend_alpha,
-        frame_input.config.show_psnr,
+        false,
     );
     let visualization = match visualize_points(
         frame,
-        frame.width() as usize,
-        frame.height() as usize,
         &[],
         visualization_options,
-        &mut frame_input.visualization_state.0,
+        &mut frame_input.visualization_state,
+        device,
     ) {
         Ok(visualization) => visualization,
         Err(err) => {
@@ -1036,7 +1099,7 @@ fn preview_frames(
         image_entity,
         visualization,
         &mut texture,
-        &image_nodes,
+        &mut burn_handles,
         &mut images,
     );
 }
@@ -1063,34 +1126,9 @@ fn handle_tasks(
 
 fn spawn_model_load_task(
     config: BevyBurnAutoGazeConfig,
+    device: AutoGazeBevyDevice,
 ) -> Task<Result<AutoGazePipeline<AutoGazeBevyBackend>, String>> {
-    AsyncComputeTaskPool::get().spawn(async move {
-        let device = initialize_burn_device().await;
-        load_model(config, &device).await
-    })
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-async fn initialize_burn_device() -> AutoGazeBevyDevice {
-    burn_device()
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn initialize_burn_device() -> AutoGazeBevyDevice {
-    if let Some(device) = BURN_DEVICE.with(|slot| slot.borrow().clone()) {
-        return device;
-    }
-
-    let device = AutoGazeBevyDevice::default();
-    burn::backend::wgpu::init_setup_async::<burn::backend::wgpu::graphics::WebGpu>(
-        &device,
-        Default::default(),
-    )
-    .await;
-    BURN_DEVICE.with(|slot| {
-        *slot.borrow_mut() = Some(device.clone());
-    });
-    device
+    AsyncComputeTaskPool::get().spawn(async move { load_model(config, &device).await })
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1163,10 +1201,10 @@ fn run_autogaze_visualization(
     top_k: usize,
     mode: AutoGazeInferenceMode,
     visualization_options: VisualizationOptions,
-    mut visualization_state: AutoGazeVisualizationState,
-) -> Result<(Visualization, AutoGazeVisualizationState), String> {
+    mut visualization_state: BevyVisualizationState,
+    device: AutoGazeBevyDevice,
+) -> Result<(Visualization, BevyVisualizationState), String> {
     let total_start = Instant::now();
-    let device = burn_device();
     let first_frame = clip
         .first()
         .ok_or_else(|| "AutoGaze clip must contain at least one frame".to_string())?;
@@ -1208,11 +1246,10 @@ fn run_autogaze_visualization(
     let mut visualization = visualize_points(
         clip.last()
             .ok_or_else(|| "AutoGaze clip must contain at least one frame".to_string())?,
-        width,
-        height,
         &points,
         visualization_options,
         &mut visualization_state,
+        &device,
     )?;
     visualization.timing = Some(InferenceTiming {
         clip_frames: clip.len(),
@@ -1222,7 +1259,7 @@ fn run_autogaze_visualization(
         trace_ms: traces.1,
         sync_ms,
         visualize_ms: elapsed_ms(visualize_start),
-        texture_ms: 0.0,
+        display_ms: 0.0,
         total_ms: elapsed_ms(total_start),
     });
     Ok((visualization, visualization_state))
@@ -1235,10 +1272,10 @@ async fn run_autogaze_visualization(
     top_k: usize,
     mode: AutoGazeInferenceMode,
     visualization_options: VisualizationOptions,
-    mut visualization_state: AutoGazeVisualizationState,
-) -> Result<(Visualization, AutoGazeVisualizationState), String> {
+    mut visualization_state: BevyVisualizationState,
+    device: AutoGazeBevyDevice,
+) -> Result<(Visualization, BevyVisualizationState), String> {
     let total_start = Instant::now();
-    let device = burn_device();
     let first_frame = clip
         .first()
         .ok_or_else(|| "AutoGaze clip must contain at least one frame".to_string())?;
@@ -1275,15 +1312,15 @@ async fn run_autogaze_visualization(
         .map(|set| set.points.clone())
         .unwrap_or_default();
     let visualize_start = Instant::now();
-    let mut visualization = visualize_points(
+    let mut visualization = visualize_points_async(
         clip.last()
             .ok_or_else(|| "AutoGaze clip must contain at least one frame".to_string())?,
-        width,
-        height,
         &points,
         visualization_options,
         &mut visualization_state,
-    )?;
+        &device,
+    )
+    .await?;
     visualization.timing = Some(InferenceTiming {
         clip_frames: clip.len(),
         width,
@@ -1292,7 +1329,7 @@ async fn run_autogaze_visualization(
         trace_ms: traces.1,
         sync_ms: 0.0,
         visualize_ms: elapsed_ms(visualize_start),
-        texture_ms: 0.0,
+        display_ms: 0.0,
         total_ms: elapsed_ms(total_start),
     });
     Ok((visualization, visualization_state))
@@ -1318,7 +1355,7 @@ impl VisualizationOptions {
 struct Visualization {
     width: u32,
     height: u32,
-    rgba: Vec<u8>,
+    tensor: Tensor<AutoGazeBevyBackend, 3>,
     gaze_update_ratio: f64,
     psnr_db: Option<f64>,
     timing: Option<InferenceTiming>,
@@ -1326,160 +1363,361 @@ struct Visualization {
 
 fn visualize_points(
     rgba: &RgbaImage,
-    width: usize,
-    height: usize,
     points: &[FixationPoint],
     options: VisualizationOptions,
-    visualization_state: &mut AutoGazeVisualizationState,
+    visualization_state: &mut BevyVisualizationState,
+    device: &AutoGazeBevyDevice,
 ) -> Result<Visualization, String> {
-    let visualization = visualization_state
-        .visualize_rgba(
-            rgba.as_raw(),
-            width,
-            height,
-            points,
-            options.cell_scale,
-            options.blend_alpha,
-        )
-        .map_err(|err| format!("{err:#}"))?;
-    let gaze_update_ratio = visualization.update_ratio();
-    let psnr_db = if options.calculate_psnr {
-        Some(
-            visualization
-                .output_psnr_db(rgba.as_raw())
-                .map_err(|err| format!("{err:#}"))?,
-        )
-    } else {
-        None
+    let (mut visualization, mse) =
+        visualize_points_tensor(rgba, points, options, visualization_state, device)?;
+    visualization.psnr_db = mse.map(read_psnr_db).transpose()?;
+    Ok(visualization)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn visualize_points_async(
+    rgba: &RgbaImage,
+    points: &[FixationPoint],
+    options: VisualizationOptions,
+    visualization_state: &mut BevyVisualizationState,
+    device: &AutoGazeBevyDevice,
+) -> Result<Visualization, String> {
+    let (mut visualization, mse) =
+        visualize_points_tensor(rgba, points, options, visualization_state, device)?;
+    visualization.psnr_db = match mse {
+        Some(mse) => Some(read_psnr_db_async(mse).await?),
+        None => None,
     };
-    Ok(Visualization {
-        width: visualization.side_by_side_width as u32,
-        height: visualization.height as u32,
-        rgba: visualization.side_by_side_rgba,
-        gaze_update_ratio,
-        psnr_db,
-        timing: None,
-    })
+    Ok(visualization)
 }
 
-fn live_preview_visualization(rgba: &RgbaImage, calculate_psnr: bool) -> Visualization {
-    let width = rgba.width().max(1);
-    let height = rgba.height().max(1);
-    let side_by_side_width = width.saturating_mul(3).max(1);
-    let mut out = vec![0u8; side_by_side_width as usize * height as usize * 4];
+fn visualize_points_tensor(
+    rgba: &RgbaImage,
+    points: &[FixationPoint],
+    options: VisualizationOptions,
+    visualization_state: &mut BevyVisualizationState,
+    device: &AutoGazeBevyDevice,
+) -> Result<(Visualization, Option<Tensor<AutoGazeBevyBackend, 1>>), String> {
+    let width = rgba.width().max(1) as usize;
+    let height = rgba.height().max(1) as usize;
+    let pixels = width
+        .checked_mul(height)
+        .ok_or_else(|| "AutoGaze visualization dimensions overflow".to_string())?;
+    let expected_bytes = pixels
+        .checked_mul(4)
+        .ok_or_else(|| "AutoGaze visualization byte length overflow".to_string())?;
+    if rgba.as_raw().len() != expected_bytes {
+        return Err(format!(
+            "expected {expected_bytes} RGBA bytes for {width}x{height}, got {}",
+            rgba.as_raw().len()
+        ));
+    }
 
-    for y in 0..height as usize {
-        for x in 0..width as usize {
-            let src = (y * width as usize + x) * 4;
-            let pixel = &rgba.as_raw()[src..src + 4];
-            write_preview_column(&mut out, width as usize, 0, x, y, pixel);
-            write_preview_column(&mut out, width as usize, 1, x, y, &[0, 0, 0, 255]);
-            write_preview_column(&mut out, width as usize, 2, x, y, pixel);
+    let input = rgba_tensor(rgba.as_raw(), width, height, device);
+    let alpha = fixation_alpha_mask(width, height, points, options.cell_scale);
+    let mask_pixel_count = alpha.iter().filter(|&&mask| mask > 0).count();
+    let mask_visual = mask_visual_tensor(&alpha, width, height, device);
+    let blend_mask = mask_blend_tensor(&alpha, width, height, device);
+    let update_mask = mask_update_tensor(&alpha, width, height, device);
+    let blend_alpha = options.blend_alpha.clamp(0.0, 1.0);
+    let full_blend = input
+        .clone()
+        .mul(blend_mask.clone().mul_scalar(-blend_alpha).add_scalar(1.0))
+        .add(blend_mask.clone().mul_scalar(blend_alpha));
+
+    let dimensions_changed = visualization_state.interframe_width != width
+        || visualization_state.interframe_height != height;
+    let keyframe = dimensions_changed
+        || visualization_state.interframe_output.is_none()
+        || visualization_state.frame_index == 0
+        || visualization_state
+            .frame_index
+            .is_multiple_of(visualization_state.keyframe_duration);
+    let (output, updated_pixel_count) = match visualization_state.mode {
+        AutoGazeVisualizationMode::FullBlend => (full_blend, pixels),
+        AutoGazeVisualizationMode::Interframe if keyframe => {
+            let output = input.clone();
+            visualization_state.interframe_output = Some(output.clone());
+            visualization_state.interframe_width = width;
+            visualization_state.interframe_height = height;
+            (output, pixels)
         }
-    }
+        AutoGazeVisualizationMode::Interframe => {
+            let previous = visualization_state
+                .interframe_output
+                .as_ref()
+                .ok_or_else(|| "missing AutoGaze interframe tensor".to_string())?
+                .clone();
+            let output = previous
+                .mul(update_mask.clone().mul_scalar(-1.0).add_scalar(1.0))
+                .add(input.clone().mul(update_mask));
+            visualization_state.interframe_output = Some(output.clone());
+            (output, mask_pixel_count)
+        }
+    };
+    visualization_state.frame_index = visualization_state.frame_index.saturating_add(1);
 
-    Visualization {
-        width: side_by_side_width,
-        height,
-        rgba: out,
-        gaze_update_ratio: 0.0,
-        psnr_db: calculate_psnr.then_some(f64::INFINITY),
-        timing: None,
+    let mse = options
+        .calculate_psnr
+        .then(|| tensor_mse_rgb(input.clone(), output.clone()));
+    let tensor = Tensor::cat(vec![input, mask_visual, output], 1);
+    Ok((
+        Visualization {
+            width: (width * 3) as u32,
+            height: height as u32,
+            tensor,
+            gaze_update_ratio: ratio(updated_pixel_count, pixels),
+            psnr_db: None,
+            timing: None,
+        },
+        mse,
+    ))
+}
+
+fn live_preview_visualization(
+    rgba: &RgbaImage,
+    calculate_psnr: bool,
+    device: &AutoGazeBevyDevice,
+) -> Result<Visualization, String> {
+    let mut state = BevyVisualizationState::new(AutoGazeVisualizationMode::FullBlend, 1);
+    let mut visualization = visualize_points(
+        rgba,
+        &[],
+        VisualizationOptions::new(1.0, 0.0, false),
+        &mut state,
+        device,
+    )?;
+    visualization.gaze_update_ratio = 0.0;
+    visualization.psnr_db = calculate_psnr.then_some(f64::INFINITY);
+    Ok(visualization)
+}
+
+fn rgba_tensor(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    device: &AutoGazeBevyDevice,
+) -> Tensor<AutoGazeBevyBackend, 3> {
+    Tensor::<AutoGazeBevyBackend, 1, Int>::from_data(rgba, device)
+        .float()
+        .div_scalar(255.0)
+        .reshape([height, width, 4])
+}
+
+fn mask_visual_tensor(
+    alpha: &[u8],
+    width: usize,
+    height: usize,
+    device: &AutoGazeBevyDevice,
+) -> Tensor<AutoGazeBevyBackend, 3> {
+    Tensor::from_data(
+        TensorData::new(mask_visual_data(alpha), [height, width, 4]),
+        device,
+    )
+}
+
+fn mask_blend_tensor(
+    alpha: &[u8],
+    width: usize,
+    height: usize,
+    device: &AutoGazeBevyDevice,
+) -> Tensor<AutoGazeBevyBackend, 3> {
+    Tensor::from_data(
+        TensorData::new(mask_blend_data(alpha), [height, width, 4]),
+        device,
+    )
+}
+
+fn mask_update_tensor(
+    alpha: &[u8],
+    width: usize,
+    height: usize,
+    device: &AutoGazeBevyDevice,
+) -> Tensor<AutoGazeBevyBackend, 3> {
+    Tensor::from_data(
+        TensorData::new(mask_update_data(alpha), [height, width, 4]),
+        device,
+    )
+}
+
+fn mask_visual_data(alpha: &[u8]) -> Vec<f32> {
+    let mut data = Vec::with_capacity(alpha.len() * 4);
+    for &mask in alpha {
+        let value = mask_value(mask);
+        data.extend_from_slice(&[value, value, value, 1.0]);
+    }
+    data
+}
+
+fn mask_blend_data(alpha: &[u8]) -> Vec<f32> {
+    let mut data = Vec::with_capacity(alpha.len() * 4);
+    for &mask in alpha {
+        let value = mask_value(mask);
+        data.extend_from_slice(&[value, value, value, 0.0]);
+    }
+    data
+}
+
+fn mask_update_data(alpha: &[u8]) -> Vec<f32> {
+    let mut data = Vec::with_capacity(alpha.len() * 4);
+    for &mask in alpha {
+        let value = mask_value(mask);
+        data.extend_from_slice(&[value, value, value, value]);
+    }
+    data
+}
+
+fn mask_value(mask: u8) -> f32 {
+    if mask > 0 { 1.0 } else { 0.0 }
+}
+
+fn tensor_mse_rgb(
+    reference: Tensor<AutoGazeBevyBackend, 3>,
+    candidate: Tensor<AutoGazeBevyBackend, 3>,
+) -> Tensor<AutoGazeBevyBackend, 1> {
+    let diff = reference
+        .slice_dim(2, 0..3)
+        .sub(candidate.slice_dim(2, 0..3));
+    diff.clone().mul(diff).mean()
+}
+
+fn read_psnr_db(mse: Tensor<AutoGazeBevyBackend, 1>) -> Result<f64, String> {
+    let data = mse
+        .try_into_data()
+        .map_err(|err| format!("failed to read PSNR tensor: {err}"))?;
+    let values = data
+        .to_vec::<f32>()
+        .map_err(|err| format!("failed to decode PSNR tensor: {err}"))?;
+    values
+        .first()
+        .copied()
+        .map(|mse| psnr_db_from_mse(mse as f64))
+        .ok_or_else(|| "PSNR tensor was empty".to_string())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn read_psnr_db_async(mse: Tensor<AutoGazeBevyBackend, 1>) -> Result<f64, String> {
+    let data = mse
+        .into_data_async()
+        .await
+        .map_err(|err| format!("failed to read PSNR tensor: {err}"))?;
+    let values = data
+        .to_vec::<f32>()
+        .map_err(|err| format!("failed to decode PSNR tensor: {err}"))?;
+    values
+        .first()
+        .copied()
+        .map(|mse| psnr_db_from_mse(mse as f64))
+        .ok_or_else(|| "PSNR tensor was empty".to_string())
+}
+
+fn psnr_db_from_mse(mse: f64) -> f64 {
+    if mse == 0.0 {
+        f64::INFINITY
+    } else {
+        10.0 * (1.0 / mse).log10()
     }
 }
 
-fn write_preview_column(
-    out: &mut [u8],
-    width: usize,
-    column: usize,
-    x: usize,
-    y: usize,
-    rgba: &[u8],
-) {
-    let out_width = width * 3;
-    let out_x = column * width + x;
-    let dst = (y * out_width + out_x) * 4;
-    out[dst..dst + 4].copy_from_slice(rgba);
+fn ratio(count: usize, total: usize) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        count as f64 / total as f64
+    }
 }
 
 fn apply_visualization_to_texture(
     image_entity: Entity,
     visualization: Visualization,
     texture: &mut AutoGazeTexture,
-    image_nodes: &Query<&ImageNode>,
+    burn_handles: &mut Query<&mut BevyBurnHandle<AutoGazeBevyBackend>>,
     images: &mut Assets<Image>,
 ) {
-    let Ok(image_node) = image_nodes.get(image_entity) else {
+    let Ok(mut handle) = burn_handles.get_mut(image_entity) else {
         return;
     };
 
     let width = visualization.width;
     let height = visualization.height;
-    write_visualization_to_image(&image_node.image, visualization, images);
+    ensure_visualization_image(&handle.bevy_image, width, height, images);
+    handle.tensor = visualization.tensor;
+    handle.upload = true;
+    handle.direction = BindingDirection::BurnToBevy;
+    handle.xfer = TransferKind::Gpu;
     texture.width = width;
     texture.height = height;
 }
 
-fn write_visualization_to_image(
+fn apply_visualization_to_world(
+    world: &mut World,
+    image_entity: Entity,
+    width: u32,
+    height: u32,
+    tensor: Tensor<AutoGazeBevyBackend, 3>,
+) {
+    let image_handle = {
+        let Ok(mut entity) = world.get_entity_mut(image_entity) else {
+            return;
+        };
+        let Some(mut handle) = entity.get_mut::<BevyBurnHandle<AutoGazeBevyBackend>>() else {
+            return;
+        };
+        handle.tensor = tensor;
+        handle.upload = true;
+        handle.direction = BindingDirection::BurnToBevy;
+        handle.xfer = TransferKind::Gpu;
+        handle.bevy_image.clone()
+    };
+
+    if let Some(mut images) = world.get_resource_mut::<Assets<Image>>() {
+        ensure_visualization_image(&image_handle, width, height, &mut images);
+    }
+}
+
+fn ensure_visualization_image(
     handle: &Handle<Image>,
-    visualization: Visualization,
+    width: u32,
+    height: u32,
     images: &mut Assets<Image>,
 ) {
-    if let Some(mut image) = images.get_mut(handle.id())
-        && image.width() == visualization.width
-        && image.height() == visualization.height
-        && image.texture_descriptor.format == TextureFormat::Rgba8UnormSrgb
+    if let Some(image) = images.get(handle)
+        && image.width() == width
+        && image.height() == height
+        && image.texture_descriptor.format == TextureFormat::Rgba32Float
+        && image
+            .texture_descriptor
+            .usage
+            .contains(TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING)
     {
-        image.data = Some(visualization.rgba);
-        image.sampler = ImageSampler::nearest();
         return;
     }
 
-    let _ = images.insert(handle.id(), visualization_image(visualization));
+    let _ = images.insert(handle.id(), visualization_image(width, height));
 }
 
-fn visualization_image(visualization: Visualization) -> Image {
-    let mut image = Image::new(
+fn visualization_image(width: u32, height: u32) -> Image {
+    let mut image = Image::new_fill(
         Extent3d {
-            width: visualization.width,
-            height: visualization.height,
+            width: width.max(1),
+            height: height.max(1),
             depth_or_array_layers: 1,
         },
         TextureDimension::D2,
-        visualization.rgba,
-        TextureFormat::Rgba8UnormSrgb,
-        RenderAssetUsages::default(),
+        &[0; 16],
+        TextureFormat::Rgba32Float,
+        RenderAssetUsages::RENDER_WORLD,
     );
+    image.texture_descriptor.usage |= TextureUsages::COPY_SRC
+        | TextureUsages::COPY_DST
+        | TextureUsages::TEXTURE_BINDING
+        | TextureUsages::STORAGE_BINDING;
     image.sampler = ImageSampler::nearest();
     image
 }
 
 fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn burn_device() -> AutoGazeBevyDevice {
-    static DEVICE: OnceLock<AutoGazeBevyDevice> = OnceLock::new();
-    DEVICE
-        .get_or_init(|| {
-            let device = AutoGazeBevyDevice::default();
-            burn::backend::wgpu::init_setup::<burn::backend::wgpu::graphics::AutoGraphicsApi>(
-                &device,
-                Default::default(),
-            );
-            device
-        })
-        .clone()
-}
-
-#[cfg(target_arch = "wasm32")]
-fn burn_device() -> AutoGazeBevyDevice {
-    BURN_DEVICE.with(|slot| {
-        slot.borrow()
-            .clone()
-            .expect("Burn WebGPU device should be initialized asynchronously before inference")
-    })
 }
 
 fn receive_frame() -> Option<RgbaImage> {
@@ -1849,89 +2087,37 @@ mod tests {
     }
 
     #[test]
-    fn live_preview_keeps_input_visible_while_inference_is_busy() {
-        let frame =
-            RgbaImage::from_raw(2, 1, vec![10, 20, 30, 255, 40, 50, 60, 255]).expect("frame");
-        let visualization = live_preview_visualization(&frame, false);
+    fn tensor_mask_data_uses_crisp_visual_and_update_channels() {
+        let visual = mask_visual_data(&[255, 0]);
+        let blend = mask_blend_data(&[255, 0]);
+        let update = mask_update_data(&[255, 0]);
 
-        assert_eq!(visualization.width, 6);
-        assert_eq!(visualization.height, 1);
-        assert_eq!(&visualization.rgba[0..4], &[10, 20, 30, 255]);
-        assert_eq!(&visualization.rgba[8..12], &[0, 0, 0, 255]);
-        assert_eq!(&visualization.rgba[16..20], &[10, 20, 30, 255]);
-        assert!(visualization.psnr_db.is_none());
-
-        let visualization = live_preview_visualization(&frame, true);
-        assert!(visualization.psnr_db.expect("psnr").is_infinite());
+        assert_eq!(visual, vec![1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(blend, vec![1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(update, vec![1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
     }
 
     #[test]
-    fn bevy_visualization_uses_crisp_cell_mask() {
-        let frame = RgbaImage::from_raw(
-            4,
-            4,
-            vec![
-                0, 0, 0, 255, 10, 0, 0, 255, 20, 0, 0, 255, 30, 0, 0, 255, 0, 10, 0, 255, 10, 10,
-                0, 255, 20, 10, 0, 255, 30, 10, 0, 255, 0, 20, 0, 255, 10, 20, 0, 255, 20, 20, 0,
-                255, 30, 20, 0, 255, 0, 30, 0, 255, 10, 30, 0, 255, 20, 30, 0, 255, 30, 30, 0, 255,
-            ],
-        )
-        .expect("frame");
+    fn bevy_visualization_mask_data_uses_crisp_cell_bounds() {
         let point = FixationPoint::with_extent(0.25, 0.25, 0.5, 0.5, 1.0);
+        let alpha = fixation_alpha_mask(4, 4, &[point], 1.0);
+        let mask = mask_visual_data(&alpha);
 
-        let mut state = AutoGazeVisualizationState::new(AutoGazeVisualizationMode::FullBlend, 30);
-        let visualization = visualize_points(
-            &frame,
-            4,
-            4,
-            &[point],
-            VisualizationOptions::new(1.0, 0.5, false),
-            &mut state,
-        )
-        .expect("visualize");
-
-        assert_eq!(visualization.width, 12);
-        assert_eq!(visualization.height, 4);
-        assert_eq!(visualization.gaze_update_ratio, 1.0);
-        assert!(visualization.psnr_db.is_none());
         for y in 0..4 {
             for x in 0..4 {
-                let mask_src = (y * 12 + 4 + x) * 4;
-                let expected = if x < 2 && y < 2 { 255 } else { 0 };
-                assert_eq!(visualization.rgba[mask_src], expected, "mask {x},{y}");
-                assert_eq!(visualization.rgba[mask_src + 1], expected, "mask {x},{y}");
-                assert_eq!(visualization.rgba[mask_src + 2], expected, "mask {x},{y}");
+                let src = (y * 4 + x) * 4;
+                let expected = if x < 2 && y < 2 { 1.0 } else { 0.0 };
+                assert_eq!(mask[src], expected, "mask {x},{y}");
+                assert_eq!(mask[src + 1], expected, "mask {x},{y}");
+                assert_eq!(mask[src + 2], expected, "mask {x},{y}");
+                assert_eq!(mask[src + 3], 1.0, "mask alpha {x},{y}");
             }
         }
     }
 
     #[test]
-    fn bevy_visualization_calculates_psnr_only_when_requested() {
-        let frame =
-            RgbaImage::from_raw(2, 1, vec![10, 20, 30, 255, 40, 50, 60, 255]).expect("frame");
-        let point = FixationPoint::with_extent(0.25, 0.5, 0.5, 1.0, 1.0);
-        let mut state = AutoGazeVisualizationState::new(AutoGazeVisualizationMode::FullBlend, 30);
-
-        let without_psnr = visualize_points(
-            &frame,
-            2,
-            1,
-            &[point],
-            VisualizationOptions::new(1.0, 0.5, false),
-            &mut state,
-        )
-        .expect("visualize");
-        assert!(without_psnr.psnr_db.is_none());
-
-        let with_psnr = visualize_points(
-            &frame,
-            2,
-            1,
-            &[point],
-            VisualizationOptions::new(1.0, 0.5, true),
-            &mut state,
-        )
-        .expect("visualize");
-        assert!(with_psnr.psnr_db.expect("psnr").is_finite());
+    fn psnr_uses_unit_range_mse() {
+        assert!(psnr_db_from_mse(0.0).is_infinite());
+        assert!((psnr_db_from_mse(0.25) - 6.020_599_913).abs() < 1.0e-9);
     }
 }

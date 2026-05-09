@@ -19,6 +19,7 @@ web = ["dep:console_error_panic_hook", "dep:js-sys", "dep:wasm-bindgen", "dep:wa
 anyhow = "1"
 burn = { version = "0.21.0", default-features = false, features = ["fusion", "std", "webgpu"] }
 burn_autogaze = { path = "../..", default-features = false, features = ["webgpu"] }
+bevy_burn = { git = "https://github.com/mosure/bevy_burn", rev = "6875d23ed22d341767e37f0e3b02897e7ff3a1cd" }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 once_cell = "1"
 serde = { version = "1.0", features = ["derive"] }
