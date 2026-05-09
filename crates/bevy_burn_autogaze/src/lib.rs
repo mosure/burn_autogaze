@@ -6,6 +6,7 @@ use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use bevy::{
@@ -57,6 +58,7 @@ const MAX_IN_FLIGHT_TASKS: usize = 1;
 pub const DEFAULT_KEYFRAME_DURATION: usize = 30;
 const GAZE_RATIO_EMA_ALPHA: f64 = 0.15;
 const PSNR_EMA_ALPHA: f64 = 0.15;
+const TIMING_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const METRIC_OVERLAY_BOTTOM: f32 = 8.0;
 const METRIC_OVERLAY_STEP: f32 = 34.0;
 const INFERENCE_FPS: DiagnosticPath = DiagnosticPath::const_new("autogaze_inference_fps");
@@ -116,6 +118,7 @@ pub struct BevyBurnAutoGazeConfig {
     pub blend_alpha: f32,
     pub visualization_mode: AutoGazeVisualizationMode,
     pub keyframe_duration: usize,
+    pub log_pipeline_timing: bool,
 }
 
 impl Default for BevyBurnAutoGazeConfig {
@@ -132,7 +135,7 @@ impl Default for BevyBurnAutoGazeConfig {
             image_path: None,
             mode: BevyAutoGazeMode::Resize224,
             top_k: 4,
-            max_gaze_tokens_each_frame: 0,
+            max_gaze_tokens_each_frame: 4,
             tile_batch_size: 8,
             task_loss_requirement: None,
             disable_task_loss_requirement: false,
@@ -143,6 +146,7 @@ impl Default for BevyBurnAutoGazeConfig {
             blend_alpha: 0.72,
             visualization_mode: AutoGazeVisualizationMode::FullBlend,
             keyframe_duration: DEFAULT_KEYFRAME_DURATION,
+            log_pipeline_timing: false,
         }
     }
 }
@@ -254,6 +258,10 @@ impl BevyBurnAutoGazeConfig {
             }
             "keyframe-duration" | "keyframe-interval" => {
                 self.keyframe_duration = parse_usize_option(&key, value)?.max(1);
+                Ok(())
+            }
+            "log-pipeline-timing" | "log-timing" | "timing" => {
+                self.log_pipeline_timing = parse_bool_option(&key, value)?;
                 Ok(())
             }
             other => Err(format!("unsupported bevy_burn_autogaze option `{other}`")),
@@ -475,6 +483,68 @@ impl PsnrStats {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct InferenceTiming {
+    clip_frames: usize,
+    width: usize,
+    height: usize,
+    pack_ms: f64,
+    trace_ms: f64,
+    sync_ms: f64,
+    visualize_ms: f64,
+    texture_ms: f64,
+    total_ms: f64,
+}
+
+#[derive(Resource, Clone, Debug, Default)]
+struct InferenceTimingStats {
+    latest: Option<InferenceTiming>,
+    last_log: Option<Instant>,
+}
+
+impl InferenceTimingStats {
+    fn record(&mut self, timing: InferenceTiming, should_log: bool) {
+        self.latest = Some(timing);
+        if !should_log {
+            return;
+        }
+
+        let now = Instant::now();
+        let should_emit = self
+            .last_log
+            .map(|last_log| now.duration_since(last_log) >= TIMING_LOG_INTERVAL)
+            .unwrap_or(true);
+        if !should_emit {
+            return;
+        }
+
+        self.last_log = Some(now);
+        log(&format!(
+            "AutoGaze timing: {:.1} fps e2e ({:.1} ms) clip={} {}x{}, pack={:.1} ms, trace={:.1} ms, sync={:.1} ms, visualize={:.1} ms, texture={:.1} ms",
+            timing.e2e_fps(),
+            timing.total_ms,
+            timing.clip_frames,
+            timing.width,
+            timing.height,
+            timing.pack_ms,
+            timing.trace_ms,
+            timing.sync_ms,
+            timing.visualize_ms,
+            timing.texture_ms,
+        ));
+    }
+}
+
+impl InferenceTiming {
+    fn e2e_fps(self) -> f64 {
+        if self.total_ms > 0.0 {
+            1000.0 / self.total_ms
+        } else {
+            0.0
+        }
+    }
+}
+
 #[derive(SystemParam)]
 struct FrameInputParams<'w> {
     config: Res<'w, BevyBurnAutoGazeConfig>,
@@ -522,6 +592,7 @@ pub fn viewer_app(config: BevyBurnAutoGazeConfig) -> App {
     )));
     app.insert_resource(GazeRatioStats::default());
     app.insert_resource(PsnrStats::default());
+    app.insert_resource(InferenceTimingStats::default());
     app.insert_resource(AutoGazeModelState {
         config: config.clone(),
         pipeline: None,
@@ -781,6 +852,7 @@ fn process_frames(
     let pipeline = pipeline.clone();
     let mode = frame_input.config.mode.inference_mode();
     let top_k = frame_input.config.top_k.max(1);
+    let log_pipeline_timing = frame_input.config.log_pipeline_timing;
     let visualization_options = VisualizationOptions::new(
         frame_input.config.mask_cell_scale,
         frame_input.config.blend_alpha,
@@ -826,13 +898,18 @@ fn process_frames(
                     let height = visualization.height;
                     let gaze_update_ratio = visualization.gaze_update_ratio;
                     let psnr_db = visualization.psnr_db;
+                    let mut timing = visualization.timing;
                     if let Ok(entity) = world.get_entity_mut(image_entity)
                         && let Some(image_node) = entity.get::<ImageNode>()
                     {
                         let handle = image_node.image.clone();
                         if let Some(mut images) = world.get_resource_mut::<Assets<Image>>() {
-                            let image = visualization_image(visualization);
-                            let _ = images.insert(handle.id(), image);
+                            let texture_start = Instant::now();
+                            write_visualization_to_image(&handle, visualization, &mut images);
+                            if let Some(ref mut timing) = timing {
+                                timing.texture_ms = elapsed_ms(texture_start);
+                                timing.total_ms += timing.texture_ms;
+                            }
                         }
                     }
 
@@ -853,6 +930,12 @@ fn process_frames(
                         && let Some(mut stats) = world.get_resource_mut::<PsnrStats>()
                     {
                         stats.record(psnr_db);
+                    }
+
+                    if let Some(timing) = timing
+                        && let Some(mut stats) = world.get_resource_mut::<InferenceTimingStats>()
+                    {
+                        stats.record(timing, log_pipeline_timing);
                     }
                 }
                 Err(err) => {
@@ -1082,12 +1165,14 @@ fn run_autogaze_visualization(
     visualization_options: VisualizationOptions,
     mut visualization_state: AutoGazeVisualizationState,
 ) -> Result<(Visualization, AutoGazeVisualizationState), String> {
+    let total_start = Instant::now();
     let device = burn_device();
     let first_frame = clip
         .first()
         .ok_or_else(|| "AutoGaze clip must contain at least one frame".to_string())?;
     let width = first_frame.width() as usize;
     let height = first_frame.height() as usize;
+    let pack_start = Instant::now();
     let mut rgba = Vec::with_capacity(clip.len() * width * height * 4);
     for frame in &clip {
         if frame.width() as usize != width || frame.height() as usize != height {
@@ -1095,25 +1180,32 @@ fn run_autogaze_visualization(
         }
         rgba.extend_from_slice(frame.as_raw());
     }
+    let pack_ms = elapsed_ms(pack_start);
     let traces = {
         let pipeline = pipeline
             .lock()
             .map_err(|_| "AutoGaze model lock was poisoned".to_string())?;
         let shape = AutoGazeRgbaClipShape::new(clip.len(), height, width);
-        pipeline
+        let trace_start = Instant::now();
+        let traces = pipeline
             .trace_rgba_clip_with_mode(&rgba, shape, top_k, mode, &device)
-            .map_err(|err| format!("{err:#}"))?
+            .map_err(|err| format!("{err:#}"))?;
+        (traces, elapsed_ms(trace_start))
     };
+    let sync_start = Instant::now();
     AutoGazeBevyBackend::sync(&device)
         .map_err(|err| format!("failed to sync Burn WebGPU backend: {err}"))?;
+    let sync_ms = elapsed_ms(sync_start);
 
     let frame_index = clip.len().saturating_sub(1);
     let points = traces
+        .0
         .first()
         .and_then(|trace| trace.frames.get(frame_index))
         .map(|set| set.points.clone())
         .unwrap_or_default();
-    let visualization = visualize_points(
+    let visualize_start = Instant::now();
+    let mut visualization = visualize_points(
         clip.last()
             .ok_or_else(|| "AutoGaze clip must contain at least one frame".to_string())?,
         width,
@@ -1122,6 +1214,17 @@ fn run_autogaze_visualization(
         visualization_options,
         &mut visualization_state,
     )?;
+    visualization.timing = Some(InferenceTiming {
+        clip_frames: clip.len(),
+        width,
+        height,
+        pack_ms,
+        trace_ms: traces.1,
+        sync_ms,
+        visualize_ms: elapsed_ms(visualize_start),
+        texture_ms: 0.0,
+        total_ms: elapsed_ms(total_start),
+    });
     Ok((visualization, visualization_state))
 }
 
@@ -1134,12 +1237,14 @@ async fn run_autogaze_visualization(
     visualization_options: VisualizationOptions,
     mut visualization_state: AutoGazeVisualizationState,
 ) -> Result<(Visualization, AutoGazeVisualizationState), String> {
+    let total_start = Instant::now();
     let device = burn_device();
     let first_frame = clip
         .first()
         .ok_or_else(|| "AutoGaze clip must contain at least one frame".to_string())?;
     let width = first_frame.width() as usize;
     let height = first_frame.height() as usize;
+    let pack_start = Instant::now();
     let mut rgba = Vec::with_capacity(clip.len() * width * height * 4);
     for frame in &clip {
         if frame.width() as usize != width || frame.height() as usize != height {
@@ -1147,25 +1252,30 @@ async fn run_autogaze_visualization(
         }
         rgba.extend_from_slice(frame.as_raw());
     }
+    let pack_ms = elapsed_ms(pack_start);
     let traces = {
         let pipeline = pipeline
             .lock()
             .map_err(|_| "AutoGaze model lock was poisoned".to_string())?
             .clone();
         let shape = AutoGazeRgbaClipShape::new(clip.len(), height, width);
-        pipeline
+        let trace_start = Instant::now();
+        let traces = pipeline
             .trace_rgba_clip_with_mode_async(&rgba, shape, top_k, mode, &device)
             .await
-            .map_err(|err| format!("{err:#}"))?
+            .map_err(|err| format!("{err:#}"))?;
+        (traces, elapsed_ms(trace_start))
     };
 
     let frame_index = clip.len().saturating_sub(1);
     let points = traces
+        .0
         .first()
         .and_then(|trace| trace.frames.get(frame_index))
         .map(|set| set.points.clone())
         .unwrap_or_default();
-    let visualization = visualize_points(
+    let visualize_start = Instant::now();
+    let mut visualization = visualize_points(
         clip.last()
             .ok_or_else(|| "AutoGaze clip must contain at least one frame".to_string())?,
         width,
@@ -1174,6 +1284,17 @@ async fn run_autogaze_visualization(
         visualization_options,
         &mut visualization_state,
     )?;
+    visualization.timing = Some(InferenceTiming {
+        clip_frames: clip.len(),
+        width,
+        height,
+        pack_ms,
+        trace_ms: traces.1,
+        sync_ms: 0.0,
+        visualize_ms: elapsed_ms(visualize_start),
+        texture_ms: 0.0,
+        total_ms: elapsed_ms(total_start),
+    });
     Ok((visualization, visualization_state))
 }
 
@@ -1200,6 +1321,7 @@ struct Visualization {
     rgba: Vec<u8>,
     gaze_update_ratio: f64,
     psnr_db: Option<f64>,
+    timing: Option<InferenceTiming>,
 }
 
 fn visualize_points(
@@ -1236,6 +1358,7 @@ fn visualize_points(
         rgba: visualization.side_by_side_rgba,
         gaze_update_ratio,
         psnr_db,
+        timing: None,
     })
 }
 
@@ -1261,6 +1384,7 @@ fn live_preview_visualization(rgba: &RgbaImage, calculate_psnr: bool) -> Visuali
         rgba: out,
         gaze_update_ratio: 0.0,
         psnr_db: calculate_psnr.then_some(f64::INFINITY),
+        timing: None,
     }
 }
 
@@ -1291,10 +1415,27 @@ fn apply_visualization_to_texture(
 
     let width = visualization.width;
     let height = visualization.height;
-    let image = visualization_image(visualization);
-    let _ = images.insert(image_node.image.id(), image);
+    write_visualization_to_image(&image_node.image, visualization, images);
     texture.width = width;
     texture.height = height;
+}
+
+fn write_visualization_to_image(
+    handle: &Handle<Image>,
+    visualization: Visualization,
+    images: &mut Assets<Image>,
+) {
+    if let Some(mut image) = images.get_mut(handle.id())
+        && image.width() == visualization.width
+        && image.height() == visualization.height
+        && image.texture_descriptor.format == TextureFormat::Rgba8UnormSrgb
+    {
+        image.data = Some(visualization.rgba);
+        image.sampler = ImageSampler::nearest();
+        return;
+    }
+
+    let _ = images.insert(handle.id(), visualization_image(visualization));
 }
 
 fn visualization_image(visualization: Visualization) -> Image {
@@ -1311,6 +1452,10 @@ fn visualization_image(visualization: Visualization) -> Image {
     );
     image.sampler = ImageSampler::nearest();
     image
+}
+
+fn elapsed_ms(start: Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1000.0
 }
 
 #[cfg(not(target_arch = "wasm32"))]

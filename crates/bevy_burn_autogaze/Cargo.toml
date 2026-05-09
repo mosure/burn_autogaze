@@ -72,9 +72,16 @@ features = [
   "console",
 ]
 
+[dev-dependencies]
+criterion = "0.8.2"
+
 [lib]
 path = "src/lib.rs"
 
 [[bin]]
 name = "bevy_burn_autogaze"
 path = "src/main.rs"
+
+[[bench]]
+name = "viewer_pipeline"
+harness = false

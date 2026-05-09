@@ -193,7 +193,10 @@ wasm). both modes show the same bevy-rendered `input | mask | output`
 visualization plus toggleable FPS, gaze/update-ratio, and output-PSNR overlays.
 
 Set `--show-fps=false`, `--show-gaze-ratio=false`, or `--show-psnr=false` to
-hide individual text overlays.
+hide individual text overlays. Set `--log-pipeline-timing=true` to print Bevy
+viewer stage timing. The viewer defaults to
+`--max-gaze-tokens-each-frame 4` for realtime use; pass
+`--max-gaze-tokens-each-frame 0` to use the NVIDIA model default budget.
 
 The native app accepts CLI flags; the wasm app accepts the same viewer/inference
 knobs through query parameters:
@@ -222,6 +225,7 @@ bevy to
 cargo bench --bench backend_pipeline --features webgpu
 cargo bench --bench backend_pipeline --features cuda
 AUTOGAZE_HF_DIR=/path/to/AutoGaze cargo bench --bench backend_pipeline --features cuda -- autogaze_real_trace_video
+cargo bench -p bevy_burn_autogaze --bench viewer_pipeline
 ```
 
 the benchmark suite covers full-resolution source clips (`1280x720` and
@@ -230,15 +234,20 @@ real-model group when the autogaze hugging face snapshot is available. synthetic
 backend benches run the full matrix across `single-scale-224` and
 `multiscale-32-64-112-224` model layouts, so tiled full-resolution runs are
 measured with the same padded tile layout and multi-scale gaze-token layout used
-by the NVIDIA config. the visualization group also measures `full-blend`,
-`interframe-keyframe`, and `interframe-delta` output paths for single-scale and
-multi-scale crisp masks.
+by the NVIDIA config. the RGBA e2e group measures source RGBA conversion, trace
+generation, and crisp visualization together. the visualization group also
+measures `full-blend`, `interframe-keyframe`, and `interframe-delta` output
+paths for single-scale and multi-scale crisp masks. the Bevy viewer bench
+measures side-by-side visualization plus persistent image asset updates at 720p
+and 1080p.
 
 useful filters:
 
 ```sh
 cargo bench --bench backend_pipeline -- autogaze_trace_video/webgpu/multiscale-32-64-112-224/tile-224
+cargo bench --bench backend_pipeline -- autogaze_rgba_e2e_video/webgpu/multiscale-32-64-112-224/resize-224/720p
 cargo bench --bench backend_pipeline -- autogaze_visualization/multiscale-32-64-112-224/interframe-delta
+cargo bench -p bevy_burn_autogaze --bench viewer_pipeline -- bevy_autogaze_viewer_pipeline/full-blend/1080p
 ```
 
 ## validation

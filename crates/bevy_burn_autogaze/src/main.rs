@@ -34,7 +34,7 @@ struct NativeArgs {
     #[arg(long, default_value_t = 4)]
     top_k: usize,
 
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 4)]
     max_gaze_tokens_each_frame: usize,
 
     #[arg(long, default_value_t = 8)]
@@ -70,6 +70,9 @@ struct NativeArgs {
 
     #[arg(long, default_value_t = bevy_burn_autogaze::DEFAULT_KEYFRAME_DURATION)]
     keyframe_duration: usize,
+
+    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    log_pipeline_timing: bool,
 }
 
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
@@ -101,6 +104,7 @@ impl From<NativeArgs> for BevyBurnAutoGazeConfig {
             blend_alpha: args.blend_alpha,
             visualization_mode,
             keyframe_duration: args.keyframe_duration.max(1),
+            log_pipeline_timing: args.log_pipeline_timing,
             ..Default::default()
         }
     }

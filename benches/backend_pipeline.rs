@@ -2,9 +2,9 @@ use burn::module::{Module, ModuleMapper, Param};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, TensorData};
 use burn_autogaze::{
-    AutoGazeConfig, AutoGazeInferenceMode, AutoGazePipeline, AutoGazeVisualizationMode,
-    AutoGazeVisualizationState, ConnectorConfig, FixationPoint, GazeDecoderConfig, GazeModelConfig,
-    NativeAutoGazeModel, VisionModelConfig,
+    AutoGazeConfig, AutoGazeInferenceMode, AutoGazePipeline, AutoGazeRgbaClipShape,
+    AutoGazeVisualizationMode, AutoGazeVisualizationState, ConnectorConfig, FixationPoint,
+    GazeDecoderConfig, GazeModelConfig, NativeAutoGazeModel, VisionModelConfig,
 };
 use criterion::{
     BatchSize, BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
@@ -168,6 +168,22 @@ fn bench_real_trace_video(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_rgba_e2e_video(c: &mut Criterion) {
+    let mut group = c.benchmark_group("autogaze_rgba_e2e_video");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(5));
+    register_ndarray_rgba_e2e(&mut group);
+
+    #[cfg(feature = "webgpu")]
+    register_webgpu_rgba_e2e(&mut group);
+
+    #[cfg(feature = "cuda")]
+    register_cuda_rgba_e2e(&mut group);
+
+    group.finish();
+}
+
 fn bench_visualization(c: &mut Criterion) {
     let mut group = c.benchmark_group("autogaze_visualization");
     group.sample_size(10);
@@ -218,6 +234,23 @@ fn register_ndarray_trace(group: &mut BenchmarkGroup<'_, WallTime>) {
 #[cfg(not(feature = "ndarray"))]
 fn register_ndarray_trace(_group: &mut BenchmarkGroup<'_, WallTime>) {}
 
+#[cfg(feature = "ndarray")]
+fn register_ndarray_rgba_e2e(group: &mut BenchmarkGroup<'_, WallTime>) {
+    for &case in VIDEO_CASES {
+        for &model in MODEL_CASES {
+            for &mode in MODE_CASES {
+                let device = Default::default();
+                bench_rgba_e2e_case::<burn::backend::NdArray<f32>>(
+                    group, "ndarray", case, model, mode, device,
+                );
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "ndarray"))]
+fn register_ndarray_rgba_e2e(_group: &mut BenchmarkGroup<'_, WallTime>) {}
+
 #[cfg(feature = "webgpu")]
 fn register_webgpu_embed(group: &mut BenchmarkGroup<'_, WallTime>) {
     let Some(device) = webgpu_device() else {
@@ -266,6 +299,30 @@ fn register_webgpu_trace(group: &mut BenchmarkGroup<'_, WallTime>) {
     }
 }
 
+#[cfg(feature = "webgpu")]
+fn register_webgpu_rgba_e2e(group: &mut BenchmarkGroup<'_, WallTime>) {
+    let Some(device) = webgpu_device() else {
+        return;
+    };
+    for &case in VIDEO_CASES {
+        for &model in MODEL_CASES {
+            for &mode in MODE_CASES {
+                if let Some(device) = warm_backend::<burn::backend::WebGpu<f32, i32>>(
+                    "webgpu",
+                    case,
+                    model,
+                    mode,
+                    device.clone(),
+                ) {
+                    bench_rgba_e2e_case::<burn::backend::WebGpu<f32, i32>>(
+                        group, "webgpu", case, model, mode, device,
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[cfg(feature = "cuda")]
 fn register_cuda_embed(group: &mut BenchmarkGroup<'_, WallTime>) {
     let device = burn::backend::cuda::CudaDevice::default();
@@ -302,6 +359,28 @@ fn register_cuda_trace(group: &mut BenchmarkGroup<'_, WallTime>) {
                     device.clone(),
                 ) {
                     bench_trace_case::<burn::backend::Cuda<f32, i32>>(
+                        group, "cuda", case, model, mode, device,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn register_cuda_rgba_e2e(group: &mut BenchmarkGroup<'_, WallTime>) {
+    let device = burn::backend::cuda::CudaDevice::default();
+    for &case in VIDEO_CASES {
+        for &model in MODEL_CASES {
+            for &mode in MODE_CASES {
+                if let Some(device) = warm_backend::<burn::backend::Cuda<f32, i32>>(
+                    "cuda",
+                    case,
+                    model,
+                    mode,
+                    device.clone(),
+                ) {
+                    bench_rgba_e2e_case::<burn::backend::Cuda<f32, i32>>(
                         group, "cuda", case, model, mode, device,
                     );
                 }
@@ -470,6 +549,61 @@ fn bench_visualization_case(
                     black_box(output.updated_pixel_count);
                     black_box(output.update_ratio());
                     black_box(output.side_by_side_rgba.len());
+                },
+                BatchSize::SmallInput,
+            );
+        },
+    );
+}
+
+fn bench_rgba_e2e_case<B>(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    backend: &str,
+    case: VideoCase,
+    model: ModelCase,
+    mode: ModeCase,
+    device: B::Device,
+) where
+    B: Backend,
+    B::Device: Clone,
+{
+    let pipeline = deterministic_pipeline::<B>(model, &device);
+    let rgba = deterministic_rgba(FRAMES, case.height, case.width);
+    let current_frame_start = (FRAMES - 1) * case.height * case.width * 4;
+    group.throughput(Throughput::Elements(case.frames_per_batch()));
+    group.bench_with_input(
+        BenchmarkId::new(format!("{backend}/{}/{}", model.name, mode.name), case.name),
+        &case,
+        |b, _| {
+            b.iter_batched(
+                || AutoGazeVisualizationState::new(AutoGazeVisualizationMode::FullBlend, 1),
+                |mut state| {
+                    let traces = pipeline
+                        .trace_rgba_clip_with_mode(
+                            &rgba,
+                            AutoGazeRgbaClipShape::new(FRAMES, case.height, case.width),
+                            2,
+                            mode.mode,
+                            &device,
+                        )
+                        .expect("trace RGBA clip")
+                        .first()
+                        .and_then(|trace| trace.frames.last())
+                        .map(|set| set.points.clone())
+                        .unwrap_or_default();
+                    let output = state
+                        .visualize_rgba(
+                            &rgba[current_frame_start..],
+                            case.width,
+                            case.height,
+                            &traces,
+                            1.0,
+                            BLEND_ALPHA,
+                        )
+                        .expect("visualize e2e autogaze output");
+                    black_box(output.update_ratio());
+                    black_box(output.side_by_side_rgba.len());
+                    B::sync(&device).expect("backend sync");
                 },
                 BatchSize::SmallInput,
             );
@@ -752,6 +886,7 @@ criterion_group!(
     bench_embed_video,
     bench_trace_video,
     bench_real_trace_video,
+    bench_rgba_e2e_video,
     bench_visualization
 );
 criterion_main!(benches);

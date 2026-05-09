@@ -19,12 +19,15 @@ viewer/inference knobs include `--top-k`, `--frames-per-clip`,
 `--mask-cell-scale`, `--blend-alpha`, and `--show-fps`. `--show-gaze-ratio`
 toggles the text overlay for per-frame and EMA output update ratio.
 `--show-psnr` toggles PSNR in dB between the current input and rendered output;
-the pixel comparison is skipped when this overlay is disabled. In `tile-224`
-mode, source frames are padded to a non-overlapping 224px chunk grid and
-`--max-gaze-tokens-each-frame` controls the per-tile generation cap. A value of
-`0` uses the model default, which is `198` for the NVIDIA config. The maximum
-frame budget is `max-gaze-tokens-each-frame * tile-count`, before task-loss
-stopping and padded-edge filtering.
+the pixel comparison is skipped when this overlay is disabled.
+`--log-pipeline-timing=true` prints pack, trace, sync, visualization, and Bevy
+texture-update timing every few seconds. In `tile-224` mode, source frames are
+padded to a non-overlapping 224px chunk grid and
+`--max-gaze-tokens-each-frame` controls the per-tile generation cap. The viewer
+default is `4` for realtime use. A value of `0` uses the model default, which is
+`198` for the NVIDIA config and is not a realtime setting. The maximum frame
+budget is `max-gaze-tokens-each-frame * tile-count`, before task-loss stopping
+and padded-edge filtering.
 Use `--load-model=false` to verify camera/preview rendering without waiting for
 model load or inference.
 

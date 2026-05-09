@@ -657,6 +657,7 @@ dependencies = [
  "burn_autogaze",
  "clap",
  "console_error_panic_hook",
+ "criterion",
  "image",
  "js-sys",
  "nokhwa",
