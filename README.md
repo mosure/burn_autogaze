@@ -77,14 +77,14 @@ let frames = vec![0.0; shape.num_values()];
 let trace = pipeline.trace_clip_from_frames_with_mode(
     &frames,
     shape,
-    4,
+    10,
     AutoGazeInferenceMode::ResizeToModelInput,
 )?;
 
 let tiled_trace = pipeline.trace_clip_from_frames_with_mode(
     &frames,
     shape,
-    4,
+    10,
     AutoGazeInferenceMode::tiled_model_input(224),
 )?;
 
@@ -92,7 +92,7 @@ let rgba = vec![0_u8; shape.clip_len * shape.height * shape.width * 4];
 let rgba_trace = pipeline.trace_rgba_clip_with_mode(
     &rgba,
     AutoGazeRgbaClipShape::new(shape.clip_len, shape.height, shape.width),
-    4,
+    10,
     AutoGazeInferenceMode::ResizeToModelInput,
     &device,
 )?;
@@ -139,10 +139,10 @@ The README GIFs are generated from `/home/mosure/Videos/birds.mp4` at
 `1920x1080` inference resolution with the NVIDIA AutoGaze weights and the same
 Rust pipeline exposed by the crate. `trace_rgba_clip_with_mode(..., tile-224)`
 pads each 16-frame clip into 45 non-overlapping chunks before the resulting
-stream is downsampled for README display, using the NVIDIA default
-`max_gaze_tokens_each_frame=198` and `task_loss_requirement=0.7`. The maximum
-fixation budget is 8910 tokens per high-res frame before task-loss stopping and
-padded-edge filtering; tiles are generated in batches of 8. The RGBA
+stream is downsampled for README display, using the realtime viewer cap
+`max_gaze_tokens_each_frame=10` and `task_loss_requirement=0.7`.
+The maximum fixation budget is 450 tokens per high-res frame before task-loss
+stopping and padded-edge filtering; tiles are generated in batches of 8. The RGBA
 convenience path applies the upstream
 AutoGazeImageProcessor affine preprocessing (`image / 127.5 - 1`, then
 ImageNet mean/std normalization). The mask GIF uses scale colors from the
@@ -151,7 +151,7 @@ top. The per-run ratios, PSNR, and detected cell scale histogram are checked in 
 [`docs/autogaze_birds_metrics.json`](./docs/autogaze_birds_metrics.json).
 
 ```sh
-cargo run --example render_readme_assets --features cuda -- \
+cargo run --example render_readme_assets --features webgpu --no-default-features -- \
   --input /home/mosure/Videos/birds.mp4 \
   --model-dir /path/to/AutoGaze \
   --inference-width 1920 --inference-height 1080 \
@@ -194,12 +194,13 @@ visualization plus toggleable FPS, gaze/update-ratio, and output-PSNR overlays.
 
 Set `--show-fps=false` or `--show-gaze-ratio=false` to hide the default text
 overlays, or `--show-psnr=true` to enable output PSNR. Set
-`--log-pipeline-timing=true` to print Bevy viewer stage timing. The viewer
-defaults to
-`--max-gaze-tokens-each-frame 4` and a 224px-wide aspect-preserving source
-resize for realtime use; pass `--max-gaze-tokens-each-frame 0` to use the NVIDIA
-model default budget, or pass explicit `--inference-width` and
-`--inference-height` values for full-resolution inspection.
+`--log-pipeline-timing` to print Bevy viewer stage timing. The viewer defaults
+to `--max-gaze-tokens-each-frame 10` and a 224px-wide aspect-preserving source
+resize for realtime use; pass `--max-gaze-tokens-each-frame 0` to use the
+NVIDIA model default budget, or pass explicit `--inference-width` and
+`--inference-height` values for full-resolution inspection. Native `resize-224`
+requests a 640x360 camera stream before the final model resize so camera decode
+does not dominate the realtime path.
 
 The native app accepts CLI flags; the wasm app accepts the same viewer/inference
 knobs through query parameters:

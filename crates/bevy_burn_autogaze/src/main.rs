@@ -1,4 +1,6 @@
-use bevy_burn_autogaze::{BevyBurnAutoGazeConfig, run_app};
+#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+use bevy_burn_autogaze::{BevyAutoGazeMode, DEFAULT_REALTIME_INFERENCE_WIDTH};
+use bevy_burn_autogaze::{BevyBurnAutoGazeConfig, DEFAULT_REALTIME_TOP_K, run_app};
 
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 use clap::{ArgAction, Parser};
@@ -31,10 +33,10 @@ struct NativeArgs {
     #[arg(long, default_value = "resize-224")]
     mode: String,
 
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = DEFAULT_REALTIME_TOP_K)]
     top_k: usize,
 
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = DEFAULT_REALTIME_TOP_K)]
     max_gaze_tokens_each_frame: usize,
 
     #[arg(long, default_value_t = 8)]
@@ -75,7 +77,7 @@ struct NativeArgs {
     #[arg(long, default_value_t = bevy_burn_autogaze::DEFAULT_KEYFRAME_DURATION)]
     keyframe_duration: usize,
 
-    #[arg(long, default_value_t = false, action = ArgAction::Set)]
+    #[arg(long, default_value_t = false, action = ArgAction::SetTrue)]
     log_pipeline_timing: bool,
 }
 
@@ -123,7 +125,10 @@ fn main() {
     #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
     {
         if config.image_path.is_none() {
-            std::thread::spawn(bevy_burn_autogaze::platform::camera::native_camera_thread);
+            let request = camera_request_for_config(&config);
+            std::thread::spawn(move || {
+                bevy_burn_autogaze::platform::camera::native_camera_thread_with_request(request);
+            });
         }
     }
 
@@ -133,6 +138,32 @@ fn main() {
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 fn runtime_config() -> BevyBurnAutoGazeConfig {
     NativeArgs::parse().into()
+}
+
+#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+fn camera_request_for_config(
+    config: &BevyBurnAutoGazeConfig,
+) -> bevy_burn_autogaze::platform::camera::CameraRequest {
+    const DEFAULT_CAMERA_FPS: u32 = 30;
+    match config.mode {
+        BevyAutoGazeMode::Resize224 => {
+            bevy_burn_autogaze::platform::camera::CameraRequest::new(640, 360, DEFAULT_CAMERA_FPS)
+        }
+        BevyAutoGazeMode::Tile224 => {
+            let width = config
+                .inference_width
+                .filter(|width| *width > DEFAULT_REALTIME_INFERENCE_WIDTH)
+                .unwrap_or(1280);
+            let height = config
+                .inference_height
+                .unwrap_or(if width >= 1920 { 1080 } else { 720 });
+            bevy_burn_autogaze::platform::camera::CameraRequest::new(
+                width,
+                height,
+                DEFAULT_CAMERA_FPS,
+            )
+        }
+    }
 }
 
 #[cfg(target_arch = "wasm32")]

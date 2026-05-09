@@ -247,16 +247,58 @@ pub fn fixation_scale_mask_rgba(
         let bounds = point.scaled_bounds(cell_scale);
         let (x0, x1) = pixel_range(bounds.x_min, bounds.x_max, width);
         let (y0, y1) = pixel_range(bounds.y_min, bounds.y_max, height);
-        for y in y0..y1 {
-            let row = y * width;
-            for x in x0..x1 {
-                let offset = (row + x) * 4;
-                rgba[offset..offset + 3].copy_from_slice(&color);
-            }
-        }
+        let rect = CellRect { x0, x1, y0, y1 };
+        fill_cell(&mut rgba, width, rect, color, 0.42);
+        stroke_cell(&mut rgba, width, rect, color);
     }
 
     rgba
+}
+
+#[derive(Clone, Copy)]
+struct CellRect {
+    x0: usize,
+    x1: usize,
+    y0: usize,
+    y1: usize,
+}
+
+fn fill_cell(rgba: &mut [u8], width: usize, rect: CellRect, color: [u8; 3], opacity: f32) {
+    let opacity = opacity.clamp(0.0, 1.0);
+    for y in rect.y0..rect.y1 {
+        let row = y * width;
+        for x in rect.x0..rect.x1 {
+            let offset = (row + x) * 4;
+            for channel in 0..3 {
+                let current = rgba[offset + channel] as f32;
+                let overlay = color[channel] as f32;
+                rgba[offset + channel] =
+                    (current * (1.0 - opacity) + overlay * opacity).round() as u8;
+            }
+        }
+    }
+}
+
+fn stroke_cell(rgba: &mut [u8], width: usize, rect: CellRect, color: [u8; 3]) {
+    if rect.x0 >= rect.x1 || rect.y0 >= rect.y1 {
+        return;
+    }
+
+    for x in rect.x0..rect.x1 {
+        write_mask_pixel(rgba, width, x, rect.y0, color);
+        write_mask_pixel(rgba, width, x, rect.y1 - 1, color);
+    }
+    for y in rect.y0..rect.y1 {
+        write_mask_pixel(rgba, width, rect.x0, y, color);
+        write_mask_pixel(rgba, width, rect.x1 - 1, y, color);
+    }
+}
+
+fn write_mask_pixel(rgba: &mut [u8], width: usize, x: usize, y: usize, color: [u8; 3]) {
+    let offset = (y * width + x) * 4;
+    if offset + 3 <= rgba.len() {
+        rgba[offset..offset + 3].copy_from_slice(&color);
+    }
 }
 
 pub fn visualize_fixations_rgba(

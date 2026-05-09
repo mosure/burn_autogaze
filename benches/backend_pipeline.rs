@@ -114,7 +114,7 @@ const CONNECTOR_TOKENS: usize = MODEL_GRID * MODEL_GRID;
 const BATCH: usize = 1;
 const FRAMES: usize = 2;
 const CHANNELS: usize = 3;
-const REAL_TOP_K: usize = 4;
+const REAL_TOP_K: usize = 10;
 const BLEND_ALPHA: f32 = 0.55;
 const KEYFRAME_DURATION: usize = 30;
 

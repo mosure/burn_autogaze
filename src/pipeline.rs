@@ -902,6 +902,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "ndarray")]
     fn channel_processor_value(value: u8, channel: usize) -> f32 {
         let rescaled = value as f32 * AUTO_GAZE_RESCALE_FACTOR - 1.0;
         (rescaled - AUTO_GAZE_IMAGE_MEAN[channel]) / AUTO_GAZE_IMAGE_STD[channel]

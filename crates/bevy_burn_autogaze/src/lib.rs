@@ -26,8 +26,6 @@ use bevy::{
     window::PrimaryWindow,
 };
 use bevy_burn::{BevyBurnBridgePlugin, BevyBurnHandle, BindingDirection, BurnDevice, TransferKind};
-#[cfg(not(target_arch = "wasm32"))]
-use burn::prelude::Backend;
 use burn::tensor::{Int, Tensor};
 #[cfg(target_arch = "wasm32")]
 use burn_autogaze::{AutoGazeConfig, AutoGazeLoadOptions, NativeAutoGazeModel};
@@ -49,6 +47,7 @@ pub const DEFAULT_WEIGHTS_URL: &str =
     "https://huggingface.co/nvidia/AutoGaze/resolve/main/model.safetensors";
 const MODEL_INPUT_SIZE: usize = 224;
 pub const DEFAULT_REALTIME_INFERENCE_WIDTH: u32 = MODEL_INPUT_SIZE as u32;
+pub const DEFAULT_REALTIME_TOP_K: usize = 10;
 const MAX_IN_FLIGHT_TASKS: usize = 1;
 pub const DEFAULT_KEYFRAME_DURATION: usize = 30;
 const GAZE_RATIO_EMA_ALPHA: f64 = 0.15;
@@ -136,8 +135,8 @@ impl Default for BevyBurnAutoGazeConfig {
             load_model: true,
             image_path: None,
             mode: BevyAutoGazeMode::Resize224,
-            top_k: 4,
-            max_gaze_tokens_each_frame: 4,
+            top_k: DEFAULT_REALTIME_TOP_K,
+            max_gaze_tokens_each_frame: DEFAULT_REALTIME_TOP_K,
             tile_batch_size: 8,
             task_loss_requirement: None,
             disable_task_loss_requirement: false,
@@ -1240,11 +1239,6 @@ fn run_autogaze_visualization(
             .map_err(|err| format!("{err:#}"))?;
         (traces, elapsed_ms(trace_start))
     };
-    let sync_start = timestamp_now();
-    AutoGazeBevyBackend::sync(&device)
-        .map_err(|err| format!("failed to sync Burn WebGPU backend: {err}"))?;
-    let sync_ms = elapsed_ms(sync_start);
-
     let frame_index = clip.len().saturating_sub(1);
     let points = traces
         .0
@@ -1267,7 +1261,7 @@ fn run_autogaze_visualization(
         height,
         pack_ms,
         trace_ms: traces.1,
-        sync_ms,
+        sync_ms: 0.0,
         visualize_ms: elapsed_ms(visualize_start),
         display_ms: 0.0,
         total_ms: elapsed_ms(total_start),
@@ -1788,7 +1782,7 @@ fn prepare_frame_for_inference(frame: RgbaImage, config: &BevyBurnAutoGazeConfig
     if target_width == width && target_height == height {
         return frame;
     }
-    image::imageops::resize(&frame, target_width, target_height, FilterType::Lanczos3)
+    image::imageops::resize(&frame, target_width, target_height, FilterType::Triangle)
 }
 
 fn configured_inference_dimensions(
@@ -1856,10 +1850,13 @@ struct FpsText;
 
 fn fps_update_system(
     diagnostics: Res<DiagnosticsStore>,
+    timing: Res<InferenceTimingStats>,
     mut query: Query<&mut TextSpan, With<FpsText>>,
 ) {
     for mut text in &mut query {
-        if let Some(fps) = diagnostics.get(&INFERENCE_FPS)
+        if let Some(timing) = timing.latest {
+            **text = format!("{:.1}", timing.e2e_fps());
+        } else if let Some(fps) = diagnostics.get(&INFERENCE_FPS)
             && let Some(value) = fps.smoothed()
         {
             **text = format!("{value:.1}");

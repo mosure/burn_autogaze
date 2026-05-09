@@ -20,16 +20,18 @@ viewer/inference knobs include `--top-k`, `--frames-per-clip`,
 toggles the text overlay for per-frame and EMA output update ratio.
 `--show-psnr=true` toggles PSNR in dB between the current input and rendered
 output; the pixel comparison is skipped when this overlay is disabled.
-`--log-pipeline-timing=true` prints pack, trace, sync, visualization, and Bevy
+`--log-pipeline-timing` prints pack, trace, visualization, and Bevy
 texture-update timing every few seconds. In `tile-224` mode, source frames are
 padded to a non-overlapping 224px chunk grid and
 `--max-gaze-tokens-each-frame` controls the per-tile generation cap. The viewer
-default is `4` for realtime use. A value of `0` uses the model default, which is
-`198` for the NVIDIA config and is not a realtime setting. The maximum frame
-budget is `max-gaze-tokens-each-frame * tile-count`, before task-loss stopping
-and padded-edge filtering. The viewer also defaults source frames to 224px wide
-while preserving aspect ratio so the native camera path tracks the realtime
-resize-224 benchmark without an extra high-resolution visualization/upload cost.
+default is `10` for realtime use, matching one NVIDIA multi-token decoder step
+while exposing more of the multi-scale mask than the previous 4-token cap. A
+value of `0` uses the model default, which is `198` for the NVIDIA config and is
+not a realtime setting. The maximum frame budget is
+`max-gaze-tokens-each-frame * tile-count`, before task-loss stopping and
+padded-edge filtering. The viewer also defaults source frames to 224px wide
+while preserving aspect ratio, and the native camera path requests a 640x360
+stream for `resize-224` so camera decode does not dominate the realtime path.
 Pass explicit `--inference-width` and `--inference-height` values for
 full-resolution inspection.
 Use `--load-model=false` to verify camera/preview rendering without waiting for

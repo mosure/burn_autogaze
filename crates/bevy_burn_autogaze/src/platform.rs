@@ -21,6 +21,25 @@ pub mod camera {
     const CAMERA_HEIGHT: u32 = 720;
     const CAMERA_FPS: u32 = 30;
 
+    #[derive(Clone, Copy, Debug)]
+    pub struct CameraRequest {
+        pub width: u32,
+        pub height: u32,
+        pub fps: u32,
+    }
+
+    impl CameraRequest {
+        pub const fn new(width: u32, height: u32, fps: u32) -> Self {
+            Self { width, height, fps }
+        }
+    }
+
+    impl Default for CameraRequest {
+        fn default() -> Self {
+            Self::new(CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS)
+        }
+    }
+
     pub static SAMPLE_RECEIVER: OnceCell<Arc<Mutex<Receiver<RgbaImage>>>> = OnceCell::new();
     pub static SAMPLE_SENDER: OnceCell<SyncSender<RgbaImage>> = OnceCell::new();
 
@@ -28,6 +47,10 @@ pub mod camera {
     pub static APP_RUN_SENDER: OnceCell<Sender<()>> = OnceCell::new();
 
     pub fn native_camera_thread() {
+        native_camera_thread_with_request(CameraRequest::default());
+    }
+
+    pub fn native_camera_thread_with_request(request: CameraRequest) {
         let (sample_sender, sample_receiver) = mpsc::sync_channel(1);
         if SAMPLE_RECEIVER
             .set(Arc::new(Mutex::new(sample_receiver)))
@@ -74,7 +97,7 @@ pub mod camera {
             return;
         }
 
-        let Some(mut camera) = open_first_camera(&devices) else {
+        let Some(mut camera) = open_first_camera(&devices, request) else {
             crate::log("failed to open any native camera");
             return;
         };
@@ -131,34 +154,37 @@ pub mod camera {
 
     fn rgb_to_rgba(image: RgbImage) -> RgbaImage {
         let (width, height) = image.dimensions();
-        let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
-        for pixel in image.into_raw().chunks_exact(3) {
-            rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
+        let rgb = image.into_raw();
+        let mut rgba = vec![255u8; width as usize * height as usize * 4];
+        for (src, dst) in rgb.chunks_exact(3).zip(rgba.chunks_exact_mut(4)) {
+            dst[0] = src[0];
+            dst[1] = src[1];
+            dst[2] = src[2];
         }
         RgbaImage::from_raw(width, height, rgba).expect("valid rgba frame")
     }
 
-    fn open_first_camera(devices: &[CameraInfo]) -> Option<Camera> {
+    fn open_first_camera(devices: &[CameraInfo], request: CameraRequest) -> Option<Camera> {
         let requested_formats = [
             (
-                "closest 1280x720 MJPEG",
+                "closest requested MJPEG",
                 RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(
                     CameraFormat::new_from(
-                        CAMERA_WIDTH,
-                        CAMERA_HEIGHT,
+                        request.width.max(1),
+                        request.height.max(1),
                         FrameFormat::MJPEG,
-                        CAMERA_FPS,
+                        request.fps.max(1),
                     ),
                 )),
             ),
             (
-                "closest 1280x720 YUYV",
+                "closest requested YUYV",
                 RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(
                     CameraFormat::new_from(
-                        CAMERA_WIDTH,
-                        CAMERA_HEIGHT,
+                        request.width.max(1),
+                        request.height.max(1),
                         FrameFormat::YUYV,
-                        CAMERA_FPS,
+                        request.fps.max(1),
                     ),
                 )),
             ),
@@ -172,8 +198,11 @@ pub mod camera {
             for (label, requested_format) in requested_formats {
                 let index = camera_info.index().clone();
                 crate::log(&format!(
-                    "opening camera `{}` ({index}) with {label}",
-                    camera_info.human_name()
+                    "opening camera `{}` ({index}) with {label} near {}x{}@{}",
+                    camera_info.human_name(),
+                    request.width.max(1),
+                    request.height.max(1),
+                    request.fps.max(1),
                 ));
                 let mut camera = match Camera::new(index, requested_format) {
                     Ok(camera) => camera,

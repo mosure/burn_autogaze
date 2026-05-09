@@ -15,6 +15,7 @@ use std::{
 const DEFAULT_SOURCE_VIDEO: &str = "/home/mosure/Videos/birds.mp4";
 const DEFAULT_MODEL_DIR: &str = "/home/mosure/.cache/huggingface/hub/models--nvidia--AutoGaze/snapshots/5100fae739ec1bf3f875914fa1b703846a18943a";
 const DEFAULT_OUTPUT_DIR: &str = "docs";
+const DEFAULT_DOC_TOP_K: usize = 10;
 
 #[cfg(feature = "cuda")]
 type DocBackend = burn::backend::Cuda<f32, i32>;
@@ -87,8 +88,8 @@ impl Default for Args {
             fps: 8,
             frames: 16,
             clip_len: 16,
-            top_k: 4,
-            max_gaze_tokens_each_frame: None,
+            top_k: DEFAULT_DOC_TOP_K,
+            max_gaze_tokens_each_frame: Some(DEFAULT_DOC_TOP_K),
             task_loss_requirement: None,
             tile_size: 224,
             stride: 224,
