@@ -111,6 +111,58 @@ fn accelerator_embeddings_match_ndarray_reference() {
 }
 
 #[test]
+fn tiled_embedding_batching_preserves_batch_order() {
+    let case = batched_tiled_case();
+    let device = Default::default();
+    let single_tile_batches =
+        deterministic_pipeline::<CpuBackend>(case, &device).with_tile_batch_size(1);
+    let multi_tile_batches =
+        deterministic_pipeline::<CpuBackend>(case, &device).with_tile_batch_size(4);
+    let video = deterministic_video::<CpuBackend>(2, 2, 3, case.height, case.width, &device);
+
+    let expected = single_tile_batches.embed_video_with_mode(video.clone(), case.mode);
+    let actual = multi_tile_batches.embed_video_with_mode(video, case.mode);
+    let expected_shape = expected.embeddings.shape().dims::<4>();
+    let actual_shape = actual.embeddings.shape().dims::<4>();
+    assert_eq!(actual_shape, expected_shape);
+    assert_eq!(actual_shape[0], 2);
+    assert_eq!(actual.layout.tile_count(), expected.layout.tile_count());
+
+    let expected = expected
+        .embeddings
+        .into_data()
+        .to_vec::<f32>()
+        .expect("expected embeddings");
+    let actual = actual
+        .embeddings
+        .into_data()
+        .to_vec::<f32>()
+        .expect("actual embeddings");
+    let diff = max_abs_diff(&actual, &expected);
+    assert!(
+        diff <= 1.0e-6,
+        "batched tiled embedding drift: max_abs_diff={diff}"
+    );
+}
+
+#[test]
+fn tiled_trace_batching_preserves_batch_order() {
+    let case = batched_tiled_case();
+    let device = Default::default();
+    let single_tile_batches =
+        deterministic_pipeline::<CpuBackend>(case, &device).with_tile_batch_size(1);
+    let multi_tile_batches =
+        deterministic_pipeline::<CpuBackend>(case, &device).with_tile_batch_size(4);
+    let video = deterministic_video::<CpuBackend>(2, 2, 3, case.height, case.width, &device);
+
+    let expected = single_tile_batches.trace_video_with_mode(video.clone(), 2, case.mode);
+    let actual = multi_tile_batches.trace_video_with_mode(video, 2, case.mode);
+
+    assert_eq!(actual.len(), 2);
+    assert_traces_match("ndarray", case, &actual, &expected, 1.0e-6);
+}
+
+#[test]
 fn unavailable_backend_reason_matches_ci_adapter_failure() {
     assert!(is_unavailable_backend_reason(
         "No possible adapter available for backend"
@@ -240,6 +292,22 @@ fn tiny_config(case: ParityCase) -> AutoGazeConfig {
             },
         },
         ..AutoGazeConfig::default()
+    }
+}
+
+fn batched_tiled_case() -> ParityCase {
+    ParityCase {
+        name: "multiscale-tile-batched",
+        model_input: 16,
+        scales: "8+16",
+        connector_tokens: 4,
+        num_vision_tokens_each_frame: 5,
+        height: 32,
+        width: 48,
+        mode: AutoGazeInferenceMode::TiledFullResolution {
+            tile_size: 16,
+            stride: 16,
+        },
     }
 }
 

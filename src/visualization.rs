@@ -130,12 +130,14 @@ impl AutoGazeVisualizationState {
         cell_scale: f32,
         blend_alpha: f32,
     ) -> Result<AutoGazeVisualization> {
-        let mask_blend = mask_and_blend_rgba(rgba, width, height, points, cell_scale, blend_alpha)?;
+        let mask = mask_rgba_and_alpha(rgba, width, height, points, cell_scale)?;
         let pixels = validate_rgba_dimensions(rgba, width, height)?;
         let (output_rgba, updated_pixel_count) = match self.mode {
-            AutoGazeVisualizationMode::FullBlend => (mask_blend.blend_rgba.clone(), pixels),
+            AutoGazeVisualizationMode::FullBlend => {
+                (blend_masked_rgba(rgba, &mask.alpha, blend_alpha), pixels)
+            }
             AutoGazeVisualizationMode::Interframe => {
-                self.interframe_rgba(rgba, width, height, &mask_blend.alpha)?
+                self.interframe_rgba(rgba, width, height, &mask.alpha)?
             }
         };
         self.frame_index = self.frame_index.saturating_add(1);
@@ -143,9 +145,9 @@ impl AutoGazeVisualizationState {
             rgba,
             width,
             height,
-            mask_blend.mask_rgba,
+            mask.mask_rgba,
             output_rgba,
-            mask_blend.mask_pixel_count,
+            mask.mask_pixel_count,
             updated_pixel_count,
         )
     }
@@ -273,10 +275,8 @@ fn fill_cell(rgba: &mut [u8], width: usize, rect: CellRect, color: [u8; 3], opac
         for x in rect.x0..rect.x1 {
             let offset = (row + x) * 4;
             for channel in 0..3 {
-                let current = rgba[offset + channel] as f32;
                 let overlay = color[channel] as f32;
-                rgba[offset + channel] =
-                    (current * (1.0 - opacity) + overlay * opacity).round() as u8;
+                rgba[offset + channel] = (overlay * opacity).round() as u8;
             }
         }
     }
@@ -376,10 +376,34 @@ fn validate_rgba_dimensions(rgba: &[u8], width: usize, height: usize) -> Result<
     Ok(pixels)
 }
 
+struct MaskRgbaAndAlpha {
+    mask_rgba: Vec<u8>,
+    alpha: Vec<u8>,
+    mask_pixel_count: usize,
+}
+
+fn mask_rgba_and_alpha(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    points: &[FixationPoint],
+    cell_scale: f32,
+) -> Result<MaskRgbaAndAlpha> {
+    let _ = validate_rgba_dimensions(rgba, width, height)?;
+    let alpha = fixation_alpha_mask(width, height, points, cell_scale);
+    let mask_rgba = fixation_scale_mask_rgba(width, height, points, cell_scale);
+    let mask_pixel_count = alpha.iter().filter(|&&mask| mask > 0).count();
+
+    Ok(MaskRgbaAndAlpha {
+        mask_rgba,
+        alpha,
+        mask_pixel_count,
+    })
+}
+
 struct MaskBlendRgba {
     mask_rgba: Vec<u8>,
     blend_rgba: Vec<u8>,
-    alpha: Vec<u8>,
     mask_pixel_count: usize,
 }
 
@@ -391,19 +415,24 @@ fn mask_and_blend_rgba(
     cell_scale: f32,
     blend_alpha: f32,
 ) -> Result<MaskBlendRgba> {
-    let pixels = validate_rgba_dimensions(rgba, width, height)?;
-    let alpha = fixation_alpha_mask(width, height, points, cell_scale);
-    let mask_rgba = fixation_scale_mask_rgba(width, height, points, cell_scale);
+    let mask = mask_rgba_and_alpha(rgba, width, height, points, cell_scale)?;
+    let blend_rgba = blend_masked_rgba(rgba, &mask.alpha, blend_alpha);
+
+    Ok(MaskBlendRgba {
+        mask_rgba: mask.mask_rgba,
+        blend_rgba,
+        mask_pixel_count: mask.mask_pixel_count,
+    })
+}
+
+fn blend_masked_rgba(rgba: &[u8], alpha: &[u8], blend_alpha: f32) -> Vec<u8> {
+    debug_assert_eq!(rgba.len(), alpha.len() * 4);
+    let pixels = alpha.len();
     let mut blend_rgba = vec![0u8; pixels * 4];
     let blend_alpha = blend_alpha.clamp(0.0, 1.0);
-    let mut mask_pixel_count = 0usize;
 
     for (pixel, mask) in alpha.iter().copied().enumerate() {
         let src = pixel * 4;
-        if mask > 0 {
-            mask_pixel_count += 1;
-        }
-
         let overlay = if mask > 0 { blend_alpha } else { 0.0 };
         for channel in 0..3 {
             let base = rgba[src + channel] as f32;
@@ -412,12 +441,7 @@ fn mask_and_blend_rgba(
         blend_rgba[src + 3] = rgba[src + 3];
     }
 
-    Ok(MaskBlendRgba {
-        mask_rgba,
-        blend_rgba,
-        alpha,
-        mask_pixel_count,
-    })
+    blend_rgba
 }
 
 fn build_visualization(
@@ -448,27 +472,16 @@ fn build_visualization(
         .ok_or_else(|| anyhow::anyhow!("side-by-side visualization byte length overflow"))?;
     let mut side_by_side_rgba = vec![0u8; side_by_side_bytes];
 
+    let row_bytes = width * 4;
+    let out_row_bytes = side_by_side_width * 4;
     for y in 0..height {
-        for x in 0..width {
-            let src = (y * width + x) * 4;
-            write_side_by_side(&mut side_by_side_rgba, width, 0, x, y, &rgba[src..src + 4]);
-            write_side_by_side(
-                &mut side_by_side_rgba,
-                width,
-                1,
-                x,
-                y,
-                &mask_rgba[src..src + 4],
-            );
-            write_side_by_side(
-                &mut side_by_side_rgba,
-                width,
-                2,
-                x,
-                y,
-                &blend_rgba[src..src + 4],
-            );
-        }
+        let src = y * row_bytes;
+        let dst = y * out_row_bytes;
+        side_by_side_rgba[dst..dst + row_bytes].copy_from_slice(&rgba[src..src + row_bytes]);
+        side_by_side_rgba[dst + row_bytes..dst + 2 * row_bytes]
+            .copy_from_slice(&mask_rgba[src..src + row_bytes]);
+        side_by_side_rgba[dst + 2 * row_bytes..dst + 3 * row_bytes]
+            .copy_from_slice(&blend_rgba[src..src + row_bytes]);
     }
 
     Ok(AutoGazeVisualization {
@@ -525,20 +538,6 @@ fn pixel_range(min: f32, max: f32, extent: usize) -> (usize, usize) {
     (start, end)
 }
 
-fn write_side_by_side(
-    out: &mut [u8],
-    width: usize,
-    column: usize,
-    x: usize,
-    y: usize,
-    rgba: &[u8],
-) {
-    let out_width = width * 3;
-    let out_x = column * width + x;
-    let dst = (y * out_width + out_x) * 4;
-    out[dst..dst + 4].copy_from_slice(rgba);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,6 +567,23 @@ mod tests {
     }
 
     #[test]
+    fn scale_colored_cell_fill_uses_topmost_scale_without_color_mixing() {
+        let coarse = FixationPoint::with_grid_extent(0.5, 0.5, 1.0, 1.0, 0.9, 2);
+        let mid = FixationPoint::with_grid_extent(0.5, 0.5, 0.5, 0.5, 0.9, 4);
+        let fine = FixationPoint::with_grid_extent(0.5, 0.5, 0.25, 0.25, 0.9, 7);
+        let rgba = fixation_scale_mask_rgba(16, 16, &[coarse, mid, fine], 1.0);
+
+        let fine_interior = (8 * 16 + 8) * 4;
+        assert_eq!(&rgba[fine_interior..fine_interior + 4], &[0, 78, 107, 255]);
+
+        let mid_only_interior = (5 * 16 + 5) * 4;
+        assert_eq!(
+            &rgba[mid_only_interior..mid_only_interior + 4],
+            &[25, 92, 50, 255]
+        );
+    }
+
+    #[test]
     fn blends_selected_cells_with_white() {
         let rgba = [100, 50, 0, 255, 10, 20, 30, 255];
         let point = FixationPoint::with_extent(0.25, 0.5, 0.5, 1.0, 1.0);
@@ -582,6 +598,25 @@ mod tests {
         assert_eq!(visualization.updated_pixel_count, 2);
         assert_eq!(visualization.mask_ratio(), 0.5);
         assert_eq!(visualization.update_ratio(), 1.0);
+    }
+
+    #[test]
+    fn side_by_side_layout_uses_input_mask_output_columns() {
+        let rgba = [100, 50, 0, 255, 10, 20, 30, 255];
+        let point = FixationPoint::with_extent(0.25, 0.5, 0.5, 1.0, 1.0);
+        let visualization =
+            visualize_fixations_rgba(&rgba, 2, 1, &[point], 1.0, 0.5).expect("visualize");
+
+        assert_eq!(visualization.side_by_side_width, 6);
+        assert_eq!(&visualization.side_by_side_rgba[0..8], &rgba);
+        assert_eq!(
+            &visualization.side_by_side_rgba[8..16],
+            &visualization.mask_rgba
+        );
+        assert_eq!(
+            &visualization.side_by_side_rgba[16..24],
+            &visualization.blend_rgba
+        );
     }
 
     #[test]
@@ -650,6 +685,42 @@ mod tests {
 
         assert_eq!(&second_visualization.blend_rgba[0..4], &[50, 0, 0, 255]);
         assert_eq!(second_visualization.update_ratio(), 1.0);
+    }
+
+    #[test]
+    fn full_blend_opacity_controls_white_overlay_strength() {
+        let point = FixationPoint::with_extent(0.5, 0.5, 1.0, 1.0, 1.0);
+        let rgba = [100, 50, 0, 200];
+        let mut state = AutoGazeVisualizationState::new(AutoGazeVisualizationMode::FullBlend, 10);
+
+        let transparent = state
+            .visualize_rgba(&rgba, 1, 1, &[point], 1.0, 0.0)
+            .expect("transparent visualization");
+        assert_eq!(&transparent.blend_rgba[0..4], &rgba);
+
+        let subtle = state
+            .visualize_rgba(&rgba, 1, 1, &[point], 1.0, 0.25)
+            .expect("subtle visualization");
+        assert_eq!(&subtle.blend_rgba[0..4], &[139, 101, 64, 200]);
+    }
+
+    #[test]
+    fn interframe_updates_copy_source_pixels_without_alpha_overlay() {
+        let point = FixationPoint::with_extent(0.5, 0.5, 1.0, 1.0, 1.0);
+        let mut state = AutoGazeVisualizationState::new(AutoGazeVisualizationMode::Interframe, 10);
+
+        let first = [10, 10, 10, 255];
+        state
+            .visualize_rgba(&first, 1, 1, &[], 1.0, 0.0)
+            .expect("initial keyframe");
+
+        let second = [100, 50, 0, 255];
+        let visualization = state
+            .visualize_rgba(&second, 1, 1, &[point], 1.0, 0.25)
+            .expect("interframe update");
+
+        assert_eq!(&visualization.blend_rgba[0..4], &second);
+        assert_eq!(visualization.update_ratio(), 1.0);
     }
 
     #[test]

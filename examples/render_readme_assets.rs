@@ -70,6 +70,7 @@ struct Args {
     task_loss_requirement: Option<Option<f32>>,
     tile_size: usize,
     stride: usize,
+    tile_batch_size: usize,
     mask_cell_scale: f32,
     blend_alpha: f32,
     keyframe_duration: usize,
@@ -93,6 +94,7 @@ impl Default for Args {
             task_loss_requirement: None,
             tile_size: 224,
             stride: 224,
+            tile_batch_size: 8,
             mask_cell_scale: 1.0,
             blend_alpha: 0.55,
             keyframe_duration: 12,
@@ -134,6 +136,9 @@ impl Args {
                 }
                 "--tile-size" => args.tile_size = parse_usize(&key, &value)?,
                 "--stride" => args.stride = parse_usize(&key, &value)?,
+                "--tile-batch-size" | "--tile-batch" | "--tiles-per-batch" => {
+                    args.tile_batch_size = parse_usize(&key, &value)?;
+                }
                 "--mask-cell-scale" => args.mask_cell_scale = parse_f32(&key, &value)?,
                 "--blend-alpha" => args.blend_alpha = parse_f32(&key, &value)?,
                 "--keyframe-duration" => args.keyframe_duration = parse_usize(&key, &value)?,
@@ -160,6 +165,7 @@ impl Args {
         }
         ensure!(args.tile_size > 0, "tile size must be nonzero");
         ensure!(args.stride > 0, "stride must be nonzero");
+        ensure!(args.tile_batch_size > 0, "tile batch size must be nonzero");
         ensure!(
             args.keyframe_duration > 0,
             "keyframe duration must be nonzero"
@@ -246,6 +252,7 @@ where
     if let Some(task_loss_requirement) = args.task_loss_requirement {
         pipeline.set_task_loss_requirement(task_loss_requirement);
     }
+    pipeline.set_tile_batch_size(args.tile_batch_size);
     let config = pipeline.model().config.clone();
 
     let input_rgba = decode_source_video(&args)?;
@@ -619,14 +626,19 @@ fn mask_palette_index(rgb: [u8; 3]) -> u8 {
         [60, 220, 120] => 2,
         [0, 185, 255] => 3,
         [230, 110, 255] => 4,
-        _ => nearest_mask_palette_index(rgb),
+        [107, 76, 0] => 1,
+        [25, 92, 50] => 2,
+        [0, 78, 107] => 3,
+        [97, 46, 107] => 4,
+        _ => nearest_scale_palette_index(rgb),
     }
 }
 
-fn nearest_mask_palette_index(rgb: [u8; 3]) -> u8 {
+fn nearest_scale_palette_index(rgb: [u8; 3]) -> u8 {
     mask_gif_palette()
         .chunks_exact(3)
         .enumerate()
+        .skip(1)
         .min_by_key(|(_, color)| {
             color
                 .iter()
@@ -639,6 +651,43 @@ fn nearest_mask_palette_index(rgb: [u8; 3]) -> u8 {
         })
         .map(|(index, _)| index as u8)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn_autogaze::fixation_scale_mask_rgba;
+
+    #[test]
+    fn docs_mask_gif_palette_keeps_translucent_cell_fill_colored() {
+        let point = FixationPoint::with_grid_extent(0.5, 0.5, 1.0, 1.0, 1.0, 2);
+        let mask = fixation_scale_mask_rgba(8, 8, &[point], 1.0);
+        let interior = [
+            mask[(3 * 8 + 3) * 4],
+            mask[(3 * 8 + 3) * 4 + 1],
+            mask[(3 * 8 + 3) * 4 + 2],
+        ];
+
+        assert_ne!(interior, [0, 0, 0]);
+        assert_ne!(interior, [255, 180, 0]);
+        assert_eq!(mask_palette_index(interior), 1);
+    }
+
+    #[test]
+    fn docs_mask_gif_palette_keeps_overlapped_multiscale_fill_colored() {
+        let coarse = FixationPoint::with_grid_extent(0.5, 0.5, 1.0, 1.0, 1.0, 2);
+        let mid = FixationPoint::with_grid_extent(0.5, 0.5, 0.5, 0.5, 1.0, 4);
+        let fine = FixationPoint::with_grid_extent(0.5, 0.5, 0.25, 0.25, 1.0, 7);
+        let mask = fixation_scale_mask_rgba(16, 16, &[coarse, mid, fine], 1.0);
+        let interior = [
+            mask[(8 * 16 + 8) * 4],
+            mask[(8 * 16 + 8) * 4 + 1],
+            mask[(8 * 16 + 8) * 4 + 2],
+        ];
+
+        assert_ne!(interior, [0, 0, 0]);
+        assert_eq!(mask_palette_index(interior), 3);
+    }
 }
 
 fn clip_for_chunk(

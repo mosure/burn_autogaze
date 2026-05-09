@@ -48,10 +48,12 @@ pub const DEFAULT_CONFIG_URL: &str =
 pub const DEFAULT_WEIGHTS_URL: &str =
     "https://huggingface.co/nvidia/AutoGaze/resolve/main/model.safetensors";
 const MODEL_INPUT_SIZE: usize = 224;
-pub const DEFAULT_REALTIME_INFERENCE_WIDTH: u32 = MODEL_INPUT_SIZE as u32;
-pub const DEFAULT_REALTIME_TOP_K: usize = 10;
+pub const DEFAULT_REALTIME_INFERENCE_WIDTH: u32 = 640;
+pub const DEFAULT_REALTIME_TOP_K: usize = 24;
 const MAX_IN_FLIGHT_TASKS: usize = 1;
+const MAX_SPARE_CLIP_BUFFERS: usize = 2;
 pub const DEFAULT_KEYFRAME_DURATION: usize = 30;
+pub const DEFAULT_BLEND_ALPHA: f32 = 0.38;
 const GAZE_RATIO_EMA_ALPHA: f64 = 0.15;
 const PSNR_EMA_ALPHA: f64 = 0.15;
 const TIMING_LOG_INTERVAL_MS: f64 = 5_000.0;
@@ -74,6 +76,24 @@ pub enum BevyAutoGazeMode {
 }
 
 impl BevyAutoGazeMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Resize224 => "realtime",
+            Self::Tile224 => "tiled",
+        }
+    }
+
+    pub const fn valid_values() -> &'static [&'static str] {
+        &[
+            "realtime",
+            "resize",
+            "resize-224",
+            "tiled",
+            "tile-224",
+            "full-res",
+        ]
+    }
+
     pub const fn inference_mode(self) -> AutoGazeInferenceMode {
         match self {
             Self::Resize224 => AutoGazeInferenceMode::ResizeToModelInput,
@@ -89,11 +109,22 @@ impl std::str::FromStr for BevyAutoGazeMode {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "resize" | "resize-224" => Ok(Self::Resize224),
-            "tile" | "tile-224" | "tiled" | "full-res" | "fullres" => Ok(Self::Tile224),
-            other => Err(format!("unsupported autogaze mode `{other}`")),
+        match value.trim().to_ascii_lowercase().as_str() {
+            "realtime" | "resize" | "resize-224" | "resize-to-model" | "fast" => {
+                Ok(Self::Resize224)
+            }
+            "tile" | "tile-224" | "tiled" | "full-res" | "fullres" | "anyres" => Ok(Self::Tile224),
+            other => Err(format!(
+                "unsupported autogaze mode `{other}`; expected one of {}",
+                Self::valid_values().join(", ")
+            )),
         }
+    }
+}
+
+impl std::fmt::Display for BevyAutoGazeMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }
 
@@ -146,7 +177,7 @@ impl Default for BevyBurnAutoGazeConfig {
             inference_width: Some(DEFAULT_REALTIME_INFERENCE_WIDTH),
             inference_height: None,
             mask_cell_scale: 1.0,
-            blend_alpha: 0.72,
+            blend_alpha: DEFAULT_BLEND_ALPHA,
             visualization_mode: AutoGazeVisualizationMode::FullBlend,
             keyframe_duration: DEFAULT_KEYFRAME_DURATION,
             log_pipeline_timing: false,
@@ -401,14 +432,16 @@ struct FrameQueue {
     width: u32,
     height: u32,
     frames: VecDeque<RgbaImage>,
+    spare_clip_buffers: Vec<Vec<u8>>,
 }
 
 impl FrameQueue {
-    fn push(&mut self, frame: RgbaImage, max_len: usize) -> Option<Vec<RgbaImage>> {
+    fn push(&mut self, frame: RgbaImage, max_len: usize) {
         let max_len = max_len.max(1);
         let (width, height) = frame.dimensions();
         if self.width != width || self.height != height {
             self.frames.clear();
+            self.spare_clip_buffers.clear();
             self.width = width;
             self.height = height;
         }
@@ -417,13 +450,122 @@ impl FrameQueue {
         while self.frames.len() > max_len {
             self.frames.pop_front();
         }
-
-        (self.frames.len() == max_len).then(|| self.frames.iter().cloned().collect())
     }
+
+    fn latest(&self) -> Option<&RgbaImage> {
+        self.frames.back()
+    }
+
+    fn build_clip(&mut self, max_len: usize) -> Result<Option<FrameClip>, String> {
+        let max_len = max_len.max(1);
+        if self.frames.len() != max_len {
+            return Ok(None);
+        }
+        let width = self.width as usize;
+        let height = self.height as usize;
+        let frame_bytes = frame_byte_len(width, height)?;
+        let required_bytes = frame_bytes
+            .checked_mul(max_len)
+            .ok_or_else(|| "AutoGaze clip byte length overflow".to_string())?;
+        let pack_start = timestamp_now();
+        let mut rgba = self
+            .spare_clip_buffers
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(required_bytes));
+        rgba.clear();
+        if rgba.capacity() < required_bytes {
+            rgba.reserve_exact(required_bytes - rgba.capacity());
+        }
+
+        for frame in &self.frames {
+            if frame.width() as usize != width || frame.height() as usize != height {
+                return Err("AutoGaze clip frame dimensions changed".to_string());
+            }
+            if frame.as_raw().len() != frame_bytes {
+                return Err(format!(
+                    "expected {frame_bytes} RGBA bytes for {width}x{height}, got {}",
+                    frame.as_raw().len()
+                ));
+            }
+            rgba.extend_from_slice(frame.as_raw());
+        }
+
+        Ok(Some(FrameClip {
+            width,
+            height,
+            clip_len: max_len,
+            rgba,
+            pack_ms: elapsed_ms(pack_start),
+        }))
+    }
+
+    fn recycle_clip_buffer(&mut self, mut rgba: Vec<u8>) {
+        rgba.clear();
+        if self.spare_clip_buffers.len() < MAX_SPARE_CLIP_BUFFERS {
+            self.spare_clip_buffers.push(rgba);
+        }
+    }
+}
+
+struct FrameClip {
+    width: usize,
+    height: usize,
+    clip_len: usize,
+    rgba: Vec<u8>,
+    pack_ms: f64,
+}
+
+impl FrameClip {
+    fn shape(&self) -> AutoGazeRgbaClipShape {
+        AutoGazeRgbaClipShape::new(self.clip_len, self.height, self.width)
+    }
+
+    fn last_frame_rgba(&self) -> Result<&[u8], String> {
+        let frame_bytes = frame_byte_len(self.width, self.height)?;
+        let start = self
+            .clip_len
+            .saturating_sub(1)
+            .checked_mul(frame_bytes)
+            .ok_or_else(|| "AutoGaze last frame offset overflow".to_string())?;
+        let end = start
+            .checked_add(frame_bytes)
+            .ok_or_else(|| "AutoGaze last frame end overflow".to_string())?;
+        self.rgba
+            .get(start..end)
+            .ok_or_else(|| "AutoGaze clip is missing its last frame".to_string())
+    }
+}
+
+fn frame_byte_len(width: usize, height: usize) -> Result<usize, String> {
+    width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| "AutoGaze frame byte length overflow".to_string())
 }
 
 #[derive(Resource, Default, Clone)]
 struct StaticFrame(Option<Arc<RgbaImage>>);
+
+#[derive(Resource, Default, Clone, Debug)]
+struct InferenceSequencer {
+    next_sequence: u64,
+    latest_applied_sequence: u64,
+}
+
+impl InferenceSequencer {
+    fn reserve(&mut self) -> u64 {
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.next_sequence
+    }
+
+    fn accept(&mut self, sequence: u64) -> bool {
+        if sequence <= self.latest_applied_sequence {
+            return false;
+        }
+        self.latest_applied_sequence = sequence;
+        true
+    }
+}
 
 #[derive(Resource, Clone)]
 struct BevyVisualizationState(AutoGazeVisualizationState);
@@ -567,6 +709,7 @@ struct FrameInputParams<'w> {
     config: Res<'w, BevyBurnAutoGazeConfig>,
     static_frame: Res<'w, StaticFrame>,
     frame_queue: ResMut<'w, FrameQueue>,
+    inference_sequencer: ResMut<'w, InferenceSequencer>,
     visualization_state: ResMut<'w, BevyVisualizationState>,
     gaze_ratio_stats: ResMut<'w, GazeRatioStats>,
     psnr_stats: ResMut<'w, PsnrStats>,
@@ -610,12 +753,13 @@ pub fn viewer_app(config: BevyBurnAutoGazeConfig) -> App {
     app.insert_resource(GazeRatioStats::default());
     app.insert_resource(PsnrStats::default());
     app.insert_resource(InferenceTimingStats::default());
+    app.insert_resource(InferenceSequencer::default());
     app.insert_resource(AutoGazeModelState {
         config: config.clone(),
         pipeline: None,
         load_task: None,
     });
-    app.insert_resource(load_static_frame(config.image_path.as_deref()));
+    app.insert_resource(load_static_frame(config.image_path.as_deref(), &config));
 
     app.add_plugins(
         DefaultPlugins
@@ -885,11 +1029,19 @@ fn process_frames(
         return;
     };
     let frame = prepare_frame_for_inference(frame, &frame_input.config);
-    let Some(clip) = frame_input
+    frame_input
         .frame_queue
-        .push(frame, frame_input.config.frames_per_clip)
-    else {
-        return;
+        .push(frame, frame_input.config.frames_per_clip);
+    let clip = match frame_input
+        .frame_queue
+        .build_clip(frame_input.config.frames_per_clip)
+    {
+        Ok(Some(clip)) => clip,
+        Ok(None) => return,
+        Err(err) => {
+            log(&format!("failed to pack AutoGaze clip: {err}"));
+            return;
+        }
     };
 
     let task_entity = commands.spawn_empty().id();
@@ -911,12 +1063,13 @@ fn process_frames(
         log("AutoGaze inference started; the first native run may spend time tuning GPU kernels");
         *logged_first_inference = true;
     }
+    let sequence = frame_input.inference_sequencer.reserve();
 
     let task = AsyncComputeTaskPool::get().spawn(async move {
         #[cfg(target_arch = "wasm32")]
         let result = run_autogaze_visualization(
             pipeline,
-            clip,
+            &clip,
             top_k,
             mode,
             visualization_options,
@@ -928,16 +1081,30 @@ fn process_frames(
         #[cfg(not(target_arch = "wasm32"))]
         let result = run_autogaze_visualization(
             pipeline,
-            clip,
+            &clip,
             top_k,
             mode,
             visualization_options,
             visualization_state,
             device,
         );
+        let clip_rgba = clip.rgba;
 
         let mut queue = CommandQueue::default();
         queue.push(move |world: &mut World| {
+            if let Some(mut frame_queue) = world.get_resource_mut::<FrameQueue>() {
+                frame_queue.recycle_clip_buffer(clip_rgba);
+            }
+            if let Some(mut sequencer) = world.get_resource_mut::<InferenceSequencer>()
+                && !sequencer.accept(sequence)
+            {
+                if let Ok(mut tracker) = world.get_entity_mut(task_entity) {
+                    tracker.remove::<ProcessAutoGaze>();
+                    tracker.despawn();
+                }
+                return;
+            }
+
             match result {
                 Ok((visualization, visualization_state)) => {
                     let Visualization {
@@ -1033,51 +1200,22 @@ fn preview_frames(
     frame_input
         .frame_queue
         .push(frame, frame_input.config.frames_per_clip);
-    let Some(frame) = frame_input.frame_queue.frames.back() else {
+    let Some(frame) = frame_input.frame_queue.latest() else {
         return;
     };
 
-    if model_ready {
-        let visualization =
-            match live_preview_visualization(frame, frame_input.config.show_psnr, device) {
-                Ok(visualization) => visualization,
-                Err(err) => {
-                    log(&format!("failed to draw AutoGaze live preview: {err}"));
-                    return;
-                }
-            };
-        apply_visualization_to_texture(
-            image_entity,
-            visualization,
-            &mut texture,
-            &mut burn_handles,
-            &mut images,
-        );
+    if !should_draw_live_preview(model_ready, inference_busy) {
         return;
     }
 
-    frame_input.visualization_state.configure(
-        frame_input.config.visualization_mode,
-        frame_input.config.keyframe_duration,
-    );
-    let visualization_options = VisualizationOptions::new(
-        frame_input.config.mask_cell_scale,
-        frame_input.config.blend_alpha,
-        false,
-    );
-    let visualization = match visualize_points(
-        frame,
-        &[],
-        visualization_options,
-        &mut frame_input.visualization_state,
-        device,
-    ) {
-        Ok(visualization) => visualization,
-        Err(err) => {
-            log(&format!("failed to draw AutoGaze preview: {err}"));
-            return;
-        }
-    };
+    let visualization =
+        match live_preview_visualization(frame, frame_input.config.show_psnr, device) {
+            Ok(visualization) => visualization,
+            Err(err) => {
+                log(&format!("failed to draw AutoGaze preview: {err}"));
+                return;
+            }
+        };
     frame_input
         .gaze_ratio_stats
         .record(visualization.gaze_update_ratio);
@@ -1187,7 +1325,7 @@ fn apply_tile_batch_config<B: burn::tensor::backend::Backend>(
 #[cfg(not(target_arch = "wasm32"))]
 fn run_autogaze_visualization(
     pipeline: Arc<Mutex<AutoGazePipeline<AutoGazeBevyBackend>>>,
-    clip: Vec<RgbaImage>,
+    clip: &FrameClip,
     top_k: usize,
     mode: AutoGazeInferenceMode,
     visualization_options: VisualizationOptions,
@@ -1195,32 +1333,19 @@ fn run_autogaze_visualization(
     device: AutoGazeBevyDevice,
 ) -> Result<(Visualization, BevyVisualizationState), String> {
     let total_start = timestamp_now();
-    let first_frame = clip
-        .first()
-        .ok_or_else(|| "AutoGaze clip must contain at least one frame".to_string())?;
-    let width = first_frame.width() as usize;
-    let height = first_frame.height() as usize;
-    let pack_start = timestamp_now();
-    let mut rgba = Vec::with_capacity(clip.len() * width * height * 4);
-    for frame in &clip {
-        if frame.width() as usize != width || frame.height() as usize != height {
-            return Err("AutoGaze clip frame dimensions changed".to_string());
-        }
-        rgba.extend_from_slice(frame.as_raw());
-    }
-    let pack_ms = elapsed_ms(pack_start);
+    let width = clip.width;
+    let height = clip.height;
     let traces = {
         let pipeline = pipeline
             .lock()
             .map_err(|_| "AutoGaze model lock was poisoned".to_string())?;
-        let shape = AutoGazeRgbaClipShape::new(clip.len(), height, width);
         let trace_start = timestamp_now();
         let traces = pipeline
-            .trace_rgba_clip_with_mode(&rgba, shape, top_k, mode, &device)
+            .trace_rgba_clip_with_mode(&clip.rgba, clip.shape(), top_k, mode, &device)
             .map_err(|err| format!("{err:#}"))?;
         (traces, elapsed_ms(trace_start))
     };
-    let frame_index = clip.len().saturating_sub(1);
+    let frame_index = clip.clip_len.saturating_sub(1);
     let points = traces
         .0
         .first()
@@ -1228,24 +1353,25 @@ fn run_autogaze_visualization(
         .map(|set| set.points.clone())
         .unwrap_or_default();
     let visualize_start = timestamp_now();
-    let mut visualization = visualize_points(
-        clip.last()
-            .ok_or_else(|| "AutoGaze clip must contain at least one frame".to_string())?,
+    let mut visualization = visualize_rgba_bytes(
+        clip.last_frame_rgba()?,
+        width,
+        height,
         &points,
         visualization_options,
         &mut visualization_state,
         &device,
     )?;
     visualization.timing = Some(InferenceTiming {
-        clip_frames: clip.len(),
+        clip_frames: clip.clip_len,
         width,
         height,
-        pack_ms,
+        pack_ms: clip.pack_ms,
         trace_ms: traces.1,
         sync_ms: 0.0,
         visualize_ms: elapsed_ms(visualize_start),
         display_ms: 0.0,
-        total_ms: elapsed_ms(total_start),
+        total_ms: elapsed_ms(total_start) + clip.pack_ms,
     });
     Ok((visualization, visualization_state))
 }
@@ -1253,7 +1379,7 @@ fn run_autogaze_visualization(
 #[cfg(target_arch = "wasm32")]
 async fn run_autogaze_visualization(
     pipeline: Arc<Mutex<AutoGazePipeline<AutoGazeBevyBackend>>>,
-    clip: Vec<RgbaImage>,
+    clip: &FrameClip,
     top_k: usize,
     mode: AutoGazeInferenceMode,
     visualization_options: VisualizationOptions,
@@ -1261,35 +1387,22 @@ async fn run_autogaze_visualization(
     device: AutoGazeBevyDevice,
 ) -> Result<(Visualization, BevyVisualizationState), String> {
     let total_start = timestamp_now();
-    let first_frame = clip
-        .first()
-        .ok_or_else(|| "AutoGaze clip must contain at least one frame".to_string())?;
-    let width = first_frame.width() as usize;
-    let height = first_frame.height() as usize;
-    let pack_start = timestamp_now();
-    let mut rgba = Vec::with_capacity(clip.len() * width * height * 4);
-    for frame in &clip {
-        if frame.width() as usize != width || frame.height() as usize != height {
-            return Err("AutoGaze clip frame dimensions changed".to_string());
-        }
-        rgba.extend_from_slice(frame.as_raw());
-    }
-    let pack_ms = elapsed_ms(pack_start);
+    let width = clip.width;
+    let height = clip.height;
     let traces = {
         let pipeline = pipeline
             .lock()
             .map_err(|_| "AutoGaze model lock was poisoned".to_string())?
             .clone();
-        let shape = AutoGazeRgbaClipShape::new(clip.len(), height, width);
         let trace_start = timestamp_now();
         let traces = pipeline
-            .trace_rgba_clip_with_mode_async(&rgba, shape, top_k, mode, &device)
+            .trace_rgba_clip_with_mode_async(&clip.rgba, clip.shape(), top_k, mode, &device)
             .await
             .map_err(|err| format!("{err:#}"))?;
         (traces, elapsed_ms(trace_start))
     };
 
-    let frame_index = clip.len().saturating_sub(1);
+    let frame_index = clip.clip_len.saturating_sub(1);
     let points = traces
         .0
         .first()
@@ -1297,24 +1410,25 @@ async fn run_autogaze_visualization(
         .map(|set| set.points.clone())
         .unwrap_or_default();
     let visualize_start = timestamp_now();
-    let mut visualization = visualize_points(
-        clip.last()
-            .ok_or_else(|| "AutoGaze clip must contain at least one frame".to_string())?,
+    let mut visualization = visualize_rgba_bytes(
+        clip.last_frame_rgba()?,
+        width,
+        height,
         &points,
         visualization_options,
         &mut visualization_state,
         &device,
     )?;
     visualization.timing = Some(InferenceTiming {
-        clip_frames: clip.len(),
+        clip_frames: clip.clip_len,
         width,
         height,
-        pack_ms,
+        pack_ms: clip.pack_ms,
         trace_ms: traces.1,
         sync_ms: 0.0,
         visualize_ms: elapsed_ms(visualize_start),
         display_ms: 0.0,
-        total_ms: elapsed_ms(total_start),
+        total_ms: elapsed_ms(total_start) + clip.pack_ms,
     });
     Ok((visualization, visualization_state))
 }
@@ -1352,23 +1466,32 @@ fn visualize_points(
     visualization_state: &mut BevyVisualizationState,
     device: &AutoGazeBevyDevice,
 ) -> Result<Visualization, String> {
-    visualize_points_tensor(rgba, points, options, visualization_state, device)
+    visualize_rgba_bytes(
+        rgba.as_raw(),
+        rgba.width() as usize,
+        rgba.height() as usize,
+        points,
+        options,
+        visualization_state,
+        device,
+    )
 }
 
-fn visualize_points_tensor(
-    rgba: &RgbaImage,
+fn visualize_rgba_bytes(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
     points: &[FixationPoint],
     options: VisualizationOptions,
     visualization_state: &mut BevyVisualizationState,
     device: &AutoGazeBevyDevice,
 ) -> Result<Visualization, String> {
-    let width = rgba.width().max(1) as usize;
-    let height = rgba.height().max(1) as usize;
-    let input = rgba.as_raw();
+    let width = width.max(1);
+    let height = height.max(1);
     let visualization = visualization_state
         .0
         .visualize_rgba(
-            input,
+            rgba,
             width,
             height,
             points,
@@ -1380,7 +1503,7 @@ fn visualize_points_tensor(
         .calculate_psnr
         .then(|| {
             visualization
-                .output_psnr_db(input)
+                .output_psnr_db(rgba)
                 .map_err(|err| format!("{err:#}"))
         })
         .transpose()?;
@@ -1416,6 +1539,10 @@ fn live_preview_visualization(
     visualization.gaze_update_ratio = 0.0;
     visualization.psnr_db = calculate_psnr.then_some(f64::INFINITY);
     Ok(visualization)
+}
+
+fn should_draw_live_preview(model_ready: bool, _inference_busy: bool) -> bool {
+    !model_ready
 }
 
 fn rgba_tensor(
@@ -1563,13 +1690,12 @@ fn receive_frame() -> Option<RgbaImage> {
     }
 }
 
-fn load_static_frame(path: Option<&Path>) -> StaticFrame {
+fn load_static_frame(path: Option<&Path>, config: &BevyBurnAutoGazeConfig) -> StaticFrame {
     let frame = path.map(|path| {
-        Arc::new(
-            image::open(path)
-                .unwrap_or_else(|err| panic!("failed to load image `{}`: {err}", path.display()))
-                .to_rgba8(),
-        )
+        let frame = image::open(path)
+            .unwrap_or_else(|err| panic!("failed to load image `{}`: {err}", path.display()))
+            .to_rgba8();
+        Arc::new(prepare_frame_for_inference(frame, config))
     });
     StaticFrame(frame)
 }
@@ -1885,6 +2011,91 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(config.task_loss_requirement, None);
         assert!(config.disable_task_loss_requirement);
+    }
+
+    #[test]
+    fn bevy_mode_parser_accepts_documented_aliases() {
+        assert_eq!(
+            "realtime".parse::<BevyAutoGazeMode>().unwrap(),
+            BevyAutoGazeMode::Resize224
+        );
+        assert_eq!(
+            "resize-224".parse::<BevyAutoGazeMode>().unwrap(),
+            BevyAutoGazeMode::Resize224
+        );
+        assert_eq!(
+            "full-res".parse::<BevyAutoGazeMode>().unwrap(),
+            BevyAutoGazeMode::Tile224
+        );
+        assert_eq!(
+            "anyres".parse::<BevyAutoGazeMode>().unwrap(),
+            BevyAutoGazeMode::Tile224
+        );
+
+        let err = "bad-mode".parse::<BevyAutoGazeMode>().unwrap_err();
+        assert!(err.contains("realtime"), "{err}");
+        assert!(err.contains("full-res"), "{err}");
+    }
+
+    #[test]
+    fn default_blend_alpha_keeps_output_mask_subtle() {
+        let config = BevyBurnAutoGazeConfig::default();
+
+        assert_eq!(config.blend_alpha, DEFAULT_BLEND_ALPHA);
+        assert!(
+            config.blend_alpha <= 0.4,
+            "default blend alpha should keep the output panel interpretable"
+        );
+    }
+
+    #[test]
+    fn inference_sequence_rejects_stale_results() {
+        let mut sequencer = InferenceSequencer::default();
+        let first = sequencer.reserve();
+        let second = sequencer.reserve();
+
+        assert!(sequencer.accept(second));
+        assert!(!sequencer.accept(first));
+        assert!(sequencer.accept(second + 1));
+    }
+
+    #[test]
+    fn live_preview_only_draws_before_model_is_ready() {
+        assert!(should_draw_live_preview(false, false));
+        assert!(should_draw_live_preview(false, true));
+        assert!(!should_draw_live_preview(true, false));
+        assert!(!should_draw_live_preview(true, true));
+    }
+
+    #[test]
+    fn frame_queue_packs_static_clip_buffer_and_reuses_it() {
+        let mut queue = FrameQueue::default();
+        let first = RgbaImage::from_pixel(2, 1, image::Rgba([1, 2, 3, 255]));
+        let second = RgbaImage::from_pixel(2, 1, image::Rgba([4, 5, 6, 255]));
+        let third = RgbaImage::from_pixel(2, 1, image::Rgba([7, 8, 9, 255]));
+
+        queue.push(first.clone(), 2);
+        assert!(queue.build_clip(2).unwrap().is_none());
+        queue.push(second.clone(), 2);
+        let clip = queue.build_clip(2).unwrap().unwrap();
+
+        assert_eq!(clip.width, 2);
+        assert_eq!(clip.height, 1);
+        assert_eq!(clip.clip_len, 2);
+        assert_eq!(&clip.rgba[..first.as_raw().len()], first.as_raw());
+        assert_eq!(&clip.rgba[first.as_raw().len()..], second.as_raw());
+        assert_eq!(clip.last_frame_rgba().unwrap(), second.as_raw());
+
+        let capacity = clip.rgba.capacity();
+        queue.recycle_clip_buffer(clip.rgba);
+        assert_eq!(queue.spare_clip_buffers.len(), 1);
+
+        queue.push(third.clone(), 2);
+        let clip = queue.build_clip(2).unwrap().unwrap();
+        assert_eq!(queue.spare_clip_buffers.len(), 0);
+        assert_eq!(clip.rgba.capacity(), capacity);
+        assert_eq!(&clip.rgba[..second.as_raw().len()], second.as_raw());
+        assert_eq!(&clip.rgba[second.as_raw().len()..], third.as_raw());
     }
 
     #[test]

@@ -122,6 +122,53 @@ generated in one backend batch; the default is `8`, which keeps the 45-tile
 1080p path away from large CUDA/WebGPU fusion graphs while preserving the same
 tile layout.
 
+## tensor pipeline api
+
+The core crate exposes small, composable pipeline nodes for downstream video and
+codec integrations. `TensorClipInput` accepts already-normalized Burn video
+tensors in `[batch, time, channel, height, width]` layout. `RgbaClipInput`
+accepts packed RGBA clips and converts them through the same AutoGaze processor
+affine used by `trace_rgba_clip_with_mode`. Output nodes receive
+`AutoGazePipelinePacket`, which carries the source tensor clip, decoded traces,
+mode, and `top_k`; downstream crates can plug in `VecOutputNode`, `FnOutputNode`,
+or their own `AutoGazeOutputNode` for Bevy rendering, file writing, transport, or
+codec-side reconstruction. Packets also expose `frame_tensor`, `frame_mask`, and
+`frame_pyramid_tokens` helpers so output nodes can stay tensor-native.
+
+```rust,no_run
+use burn::backend::NdArray;
+use burn_autogaze::{
+    AutoGazeInferenceMode, AutoGazeRgbaClip, AutoGazeRgbaClipShape,
+    AutoGazeTensorPipeline, AutoGazeTensorPipelineConfig, RgbaClipInput,
+    VecOutputNode,
+};
+
+type B = NdArray<f32>;
+let device = Default::default();
+let pipeline = burn_autogaze::AutoGazePipeline::<B>::load("/path/to/AutoGaze", &device)?;
+let shape = AutoGazeRgbaClipShape::new(2, 720, 1280);
+let rgba = vec![0_u8; shape.clip_len * shape.height * shape.width * 4];
+let input = RgbaClipInput::new().with_clip(AutoGazeRgbaClip::new(rgba, shape)?);
+let output = VecOutputNode::new();
+let mut graph = AutoGazeTensorPipeline::new(pipeline, input, output).with_config(
+    AutoGazeTensorPipelineConfig {
+        mode: AutoGazeInferenceMode::ResizeToModelInput,
+        top_k: 10,
+    },
+);
+graph.run_next(&device)?;
+
+# Ok::<(), anyhow::Error>(())
+```
+
+For ViT-like image-pyramid or codec work, `fixation_image_mask_tensor` converts
+decoded AutoGaze points into a Burn mask tensor, `apply_image_mask` keeps or
+fills image regions without leaving the backend, and
+`tokenize_masked_image_pyramid` emits dense weighted tokens for requested
+`ImagePyramidLevel`s. `sparsify_image_pyramid_tokens` then selects the highest
+mask-density tokens with backend `topk`, avoiding synchronous host readback on
+wasm/WebGPU.
+
 ## visualization
 
 | mode | output behavior | update ratio |
@@ -161,6 +208,7 @@ cargo run --example render_readme_assets --features webgpu --no-default-features
   --input /home/mosure/Videos/birds.mp4 \
   --model-dir /path/to/AutoGaze \
   --inference-width 1920 --inference-height 1080 \
+  --tile-batch-size 8 \
   --out-dir docs
 ```
 
@@ -184,8 +232,8 @@ this is the low-level wasm-bindgen api demo.
 ## bevy
 
 ```sh
-cargo run -p bevy_burn_autogaze --features native -- --mode resize-224 --visualization-mode full-blend
-cargo run -p bevy_burn_autogaze --features native -- --mode tile-224 --visualization-mode interframe --keyframe-duration 12 --frames-per-clip 16 --inference-width 1920 --inference-height 1080 --task-loss-requirement 0.7 --tile-batch-size 8
+cargo run -p bevy_burn_autogaze --features native -- --mode realtime --visualization-mode full-blend
+cargo run -p bevy_burn_autogaze --features native -- --mode tiled --visualization-mode interframe --keyframe-duration 12 --frames-per-clip 16 --inference-width 1920 --inference-height 1080 --task-loss-requirement 0.7 --tile-batch-size 8
 
 cd crates/bevy_burn_autogaze
 npm run build:wasm
@@ -200,19 +248,26 @@ visualization plus toggleable FPS, gaze/update-ratio, and output-PSNR overlays.
 
 Set `--show-fps=false` or `--show-gaze-ratio=false` to hide the default text
 overlays, or `--show-psnr=true` to enable output PSNR. Set
-`--log-pipeline-timing` to print Bevy viewer stage timing. The viewer defaults
-to `--max-gaze-tokens-each-frame 10` and a 224px-wide aspect-preserving source
-resize for realtime use; pass `--max-gaze-tokens-each-frame 0` to use the
-NVIDIA model default budget, or pass explicit `--inference-width` and
-`--inference-height` values for full-resolution inspection. Native `resize-224`
-requests a 640x360 camera stream before the final model resize so camera decode
-does not dominate the realtime path.
+`--log-pipeline-timing` to print Bevy viewer stage timing. The native CLI
+defaults to `--max-gaze-tokens-each-frame 24` and a 640px-wide
+aspect-preserving source resize for realtime use. `--mode tiled` defaults to
+1280px-wide source frames and runs the non-overlapping 224px chunk path. Pass
+`--max-gaze-tokens-each-frame 0` to use the NVIDIA model default budget, or pass
+explicit `--inference-width` and `--inference-height` values for fixed
+full-resolution inspection. Native `realtime` requests a 640x360 camera stream
+when height is omitted so camera decode does not dominate the realtime path.
+The output panel uses a subtle `--blend-alpha` default, and processed inference
+frames are not overwritten by raw camera previews while a model task is in
+flight; this keeps wasm output monotonic and makes interframe accumulation
+easier to inspect.
+Run `cargo run -p bevy_burn_autogaze --features native -- --help` for accepted
+values, aliases, and value ranges.
 
 The native app accepts CLI flags; the wasm app accepts the same viewer/inference
 knobs through query parameters:
 
 ```text
-http://localhost:8080/?mode=tile-224&visualization-mode=interframe&keyframe-duration=12&frames-per-clip=16&inference-width=1920&inference-height=1080&task-loss-requirement=0.7&tile-batch-size=8&show-fps=true&show-gaze-ratio=true&show-psnr=true
+http://localhost:8080/?mode=tiled&visualization-mode=interframe&keyframe-duration=12&frames-per-clip=16&inference-width=1920&inference-height=1080&task-loss-requirement=0.7&tile-batch-size=8&show-fps=true&show-gaze-ratio=true&show-psnr=true
 ```
 
 For headless browsers or machines without a webcam, run the same Bevy UI from a
@@ -244,7 +299,10 @@ real-model group when the autogaze hugging face snapshot is available. synthetic
 backend benches run the full matrix across `single-scale-224` and
 `multiscale-32-64-112-224` model layouts, so tiled full-resolution runs are
 measured with the same padded tile layout and multi-scale gaze-token layout used
-by the NVIDIA config. the RGBA e2e group measures source RGBA conversion, trace
+by the NVIDIA config. the tile-batch group measures 1080p multiscale tiled
+embedding and trace generation across tile batch sizes `1`, `2`, `4`, `8`, and
+`16`, which is useful for finding the fastest batch that still fits the target
+backend and model. the RGBA e2e group measures source RGBA conversion, trace
 generation, and crisp visualization together. the visualization group also
 measures `full-blend`, `interframe-keyframe`, and `interframe-delta` output
 paths for single-scale and multi-scale crisp masks. the Bevy viewer bench
@@ -255,6 +313,7 @@ useful filters:
 
 ```sh
 cargo bench --bench backend_pipeline -- autogaze_trace_video/webgpu/multiscale-32-64-112-224/tile-224
+cargo bench --bench backend_pipeline -- autogaze_tile_batch_size/webgpu
 cargo bench --bench backend_pipeline -- autogaze_rgba_e2e_video/webgpu/multiscale-32-64-112-224/resize-224/720p
 cargo bench --bench backend_pipeline -- autogaze_visualization/multiscale-32-64-112-224/interframe-delta
 cargo bench -p bevy_burn_autogaze --bench viewer_pipeline -- bevy_autogaze_viewer_pipeline/full-blend/1080p

@@ -8,11 +8,11 @@ and UI layer; platform code only supplies frames and model bytes.
 ```sh
 cargo run -p bevy_burn_autogaze --features native -- \
   --model-dir /home/mosure/.cache/huggingface/hub/models--nvidia--AutoGaze/snapshots/5100fae739ec1bf3f875914fa1b703846a18943a \
-  --mode resize-224
+  --mode realtime
 ```
 
 Use `--image-path path/to/frame.png` to run from a static image instead of the
-native camera. `--mode tile-224` runs the tiled full-resolution path. Common
+native camera. `--mode tiled` runs the tiled full-resolution path. Common
 viewer/inference knobs include `--top-k`, `--frames-per-clip`,
 `--max-gaze-tokens-each-frame`, `--inference-width`, `--inference-height`,
 `--task-loss-requirement`, `--disable-task-loss-requirement`,
@@ -20,27 +20,30 @@ viewer/inference knobs include `--top-k`, `--frames-per-clip`,
 toggles the text overlay for per-frame and EMA output update ratio.
 `--show-psnr=true` toggles PSNR in dB between the current input and rendered
 output; the pixel comparison is skipped when this overlay is disabled.
+`--help` lists the accepted values and aliases for mode-like options.
 `--log-pipeline-timing` prints pack, trace, visualization, and Bevy
-texture-update timing every few seconds. In `tile-224` mode, source frames are
+texture-update timing every few seconds. In `tiled` mode, source frames are
 padded to a non-overlapping 224px chunk grid and
 `--max-gaze-tokens-each-frame` controls the per-tile generation cap. The output
 recovery stitches each tile-local scale grid into a full-frame grid for that
 scale before clipping padded edge cells, matching upstream's mask recovery
-semantics. The viewer default is `10` for realtime use, matching one NVIDIA
-multi-token decoder step while exposing more of the multi-scale mask than the
-previous 4-token cap. A value of `0` uses the model default, which is `198` for
-the NVIDIA config and is not a realtime setting. The maximum frame budget is
+semantics. The viewer default is `24` for realtime use, exposing more of the
+multi-scale mask while staying below the NVIDIA model default budget. A value of
+`0` uses the model default, which is `198` for the NVIDIA config and is not a
+realtime setting. The maximum frame budget is
 `max-gaze-tokens-each-frame * tile-count`, before task-loss stopping and
-padded-edge filtering. The viewer also defaults source frames to 224px wide
-while preserving aspect ratio, and the native camera path requests a 640x360
-stream for `resize-224` so camera decode does not dominate the realtime path.
-Pass explicit `--inference-width` and `--inference-height` values for
+padded-edge filtering. The native CLI defaults to a 640px-wide aspect-preserving
+source frame in `realtime` mode and 1280px-wide source frames in `tiled` mode.
+The native camera path requests a matching 16:9 stream when height is omitted.
+Pass explicit `--inference-width` and `--inference-height` values for fixed
 full-resolution inspection.
 Use `--load-model=false` to verify camera/preview rendering without waiting for
 model load or inference.
 
 `--visualization-mode full-blend` renders the current frame's alpha-blended
-mask. The center mask panel colors the decoded multi-scale AutoGaze cells by
+mask. The default `--blend-alpha` is intentionally subtle so the output panel
+keeps the input frame readable; raise it when you want a stronger white update
+overlay. The center mask panel colors the decoded multi-scale AutoGaze cells by
 scale and draws crisp cell bounds. `--visualization-mode interframe
 --keyframe-duration 30` preserves the previous output outside masked cells,
 updates masked cells to the current input, and redraws a full keyframe every 30
@@ -52,6 +55,10 @@ current input frame.
 In `full-blend` mode every processed frame is a full redraw, so the update ratio
 is `100%`. In `interframe` mode keyframes are also `100%`; intermediate frames
 report masked-cell coverage as a percentage of the full source frame.
+When the model is ready and inference is busy, camera frames continue to be
+buffered for the next clip but the displayed texture is not replaced by raw live
+preview frames; this keeps processed output monotonic and avoids apparent
+frame-order reversals in slower wasm runs.
 
 ## Web
 
@@ -70,7 +77,7 @@ UI is rendered by Bevy into the `#bevy` canvas, matching the native path. Pass
 the same viewer/inference knobs as query parameters:
 
 ```text
-http://localhost:8080/?mode=tile-224&visualization-mode=interframe&keyframe-duration=12&frames-per-clip=16&inference-width=1920&inference-height=1080&task-loss-requirement=0.7&show-fps=true&show-gaze-ratio=true&show-psnr=true
+http://localhost:8080/?mode=tiled&visualization-mode=interframe&keyframe-duration=12&frames-per-clip=16&inference-width=1920&inference-height=1080&task-loss-requirement=0.7&show-fps=true&show-gaze-ratio=true&show-psnr=true
 ```
 
 Use `?source=static` for a generated static frame, or `?image-url=./frame.png`

@@ -349,7 +349,7 @@ impl<B: Backend> AutoGazePipeline<B> {
         video: Tensor<B, 5>,
         mode: AutoGazeInferenceMode,
     ) -> AutoGazeEmbedOutput<B> {
-        let [_batch, _time, _channels, height, width] = video.shape().dims::<5>();
+        let [batch, _time, _channels, height, width] = video.shape().dims::<5>();
         match mode.normalized() {
             AutoGazeInferenceMode::ResizeToModelInput => {
                 let (embeddings, past_conv_values) = self.embed_video_resize(video);
@@ -361,13 +361,22 @@ impl<B: Backend> AutoGazePipeline<B> {
             }
             AutoGazeInferenceMode::TiledFullResolution { tile_size, stride } => {
                 let layout = AutoGazeTileLayout::tiled(height, width, tile_size, stride);
-                let mut tile_embeddings = Vec::with_capacity(layout.tile_count());
-                for tile in layout.tiles.iter().copied() {
-                    let crop = crop_video_tile(video.clone(), tile);
-                    let (embeddings, _) = self.embed_video_resize(crop);
-                    tile_embeddings.push(embeddings);
+                let mut tile_embedding_chunks =
+                    Vec::with_capacity(layout.tile_count().div_ceil(self.tile_batch_size));
+                for tiles in layout.tiles.chunks(self.tile_batch_size) {
+                    let crops = tiles
+                        .iter()
+                        .copied()
+                        .map(|tile| crop_video_tile(video.clone(), tile))
+                        .collect::<Vec<_>>();
+                    let (embeddings, _) = self.embed_video_resize(Tensor::cat(crops, 0));
+                    tile_embedding_chunks.push(reassemble_tile_embeddings(
+                        embeddings,
+                        tiles.len(),
+                        batch,
+                    ));
                 }
-                let embeddings = Tensor::cat(tile_embeddings, 2);
+                let embeddings = Tensor::cat(tile_embedding_chunks, 2);
                 AutoGazeEmbedOutput {
                     embeddings,
                     past_conv_values: Vec::new(),
@@ -828,6 +837,21 @@ fn crop_video_tile<B: Backend>(video: Tensor<B, 5>, tile: AutoGazeTile) -> Tenso
     }
 }
 
+fn reassemble_tile_embeddings<B: Backend>(
+    embeddings: Tensor<B, 4>,
+    tile_count: usize,
+    batch: usize,
+) -> Tensor<B, 4> {
+    let tile_count = tile_count.max(1);
+    let batch = batch.max(1);
+    let [batched_tiles, time, tokens, dim] = embeddings.shape().dims::<4>();
+    debug_assert_eq!(batched_tiles, tile_count * batch);
+    embeddings
+        .reshape([tile_count, batch, time, tokens, dim])
+        .permute([1, 2, 0, 3, 4])
+        .reshape([batch, time, tile_count * tokens, dim])
+}
+
 fn collect_tile_trace_points(
     tile_traces: &[FrameFixationTrace],
     tiles: &[AutoGazeTile],
@@ -1005,6 +1029,84 @@ mod tests {
         assert!((remapped.cell_width() - 1.0 / 120.0).abs() < 1.0e-6);
         assert!((remapped.cell_height() - 1.0 / 67.0).abs() < 1.0e-6);
         assert_eq!(remapped.cell_grid(), Some(14));
+    }
+
+    #[test]
+    fn remap_tile_point_recovers_all_anyres_scale_grids() {
+        let tile = AutoGazeTile::new(224, 224, 224, 224);
+        let layout = AutoGazeTileLayout::tiled(448, 448, 224, 224);
+
+        for (grid, expected_grid) in [(2, 4), (4, 8), (7, 14), (14, 28)] {
+            let point = FixationPoint::with_grid_extent(
+                (grid as f32 - 0.5) / grid as f32,
+                (grid as f32 - 0.5) / grid as f32,
+                1.0 / grid as f32,
+                1.0 / grid as f32,
+                1.0,
+                grid,
+            );
+            let remapped = remap_tile_point(point, tile, &layout).expect("valid tile point");
+
+            assert_eq!(remapped.cell_grid(), Some(grid));
+            assert!(
+                (remapped.x - (expected_grid as f32 - 0.5) / expected_grid as f32).abs() < 1.0e-6
+            );
+            assert!(
+                (remapped.y - (expected_grid as f32 - 0.5) / expected_grid as f32).abs() < 1.0e-6
+            );
+            assert!((remapped.cell_width() - 1.0 / expected_grid as f32).abs() < 1.0e-6);
+            assert!((remapped.cell_height() - 1.0 / expected_grid as f32).abs() < 1.0e-6);
+        }
+    }
+
+    #[test]
+    fn remap_tile_point_stitches_full_1080p_scale_grids_without_holes() {
+        use std::collections::HashSet;
+
+        let layout = AutoGazeTileLayout::tiled(1080, 1920, 224, 224);
+
+        for grid in [2, 4, 7, 14] {
+            let grid_width = recovered_scale_grid(layout.source_width, layout.tile_size, grid);
+            let grid_height = recovered_scale_grid(layout.source_height, layout.tile_size, grid);
+            let mut seen = HashSet::with_capacity(grid_width * grid_height);
+
+            for tile in layout.tiles.iter().copied() {
+                for row in 0..grid {
+                    for col in 0..grid {
+                        let point = FixationPoint::with_grid_extent(
+                            (col as f32 + 0.5) / grid as f32,
+                            (row as f32 + 0.5) / grid as f32,
+                            1.0 / grid as f32,
+                            1.0 / grid as f32,
+                            1.0,
+                            grid,
+                        );
+                        let Some(remapped) = remap_tile_point(point, tile, &layout) else {
+                            continue;
+                        };
+
+                        assert_eq!(remapped.cell_grid(), Some(grid));
+                        assert!((remapped.cell_width() - 1.0 / grid_width as f32).abs() < 1.0e-6);
+                        assert!((remapped.cell_height() - 1.0 / grid_height as f32).abs() < 1.0e-6);
+
+                        let global_col =
+                            ((remapped.x * grid_width as f32).floor() as usize).min(grid_width - 1);
+                        let global_row = ((remapped.y * grid_height as f32).floor() as usize)
+                            .min(grid_height - 1);
+                        assert!(
+                            seen.insert((global_col, global_row)),
+                            "duplicate {grid}x{grid} remap cell {global_col},{global_row}"
+                        );
+                    }
+                }
+            }
+
+            assert_eq!(
+                seen.len(),
+                grid_width * grid_height,
+                "{grid}x{grid} remap left holes in {grid_width}x{grid_height} full-frame grid"
+            );
+        }
     }
 
     #[test]

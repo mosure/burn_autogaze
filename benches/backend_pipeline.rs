@@ -117,6 +117,7 @@ const CHANNELS: usize = 3;
 const REAL_TOP_K: usize = 10;
 const BLEND_ALPHA: f32 = 0.55;
 const KEYFRAME_DURATION: usize = 30;
+const TILE_BATCH_CASES: &[usize] = &[1, 2, 4, 8, 16];
 
 fn bench_embed_video(c: &mut Criterion) {
     let mut group = c.benchmark_group("autogaze_embed_video");
@@ -195,6 +196,32 @@ fn bench_visualization(c: &mut Criterion) {
                 bench_visualization_case(&mut group, case, model, visualization);
             }
         }
+    }
+
+    group.finish();
+}
+
+fn bench_tile_batch_size(c: &mut Criterion) {
+    let mut group = c.benchmark_group("autogaze_tile_batch_size");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(5));
+
+    #[cfg(feature = "ndarray")]
+    {
+        let device = Default::default();
+        register_tile_batch_size::<burn::backend::NdArray<f32>>(&mut group, "ndarray", device);
+    }
+
+    #[cfg(feature = "webgpu")]
+    if let Some(device) = webgpu_device() {
+        register_tile_batch_size::<burn::backend::WebGpu<f32, i32>>(&mut group, "webgpu", device);
+    }
+
+    #[cfg(feature = "cuda")]
+    {
+        let device = burn::backend::cuda::CudaDevice::default();
+        register_tile_batch_size::<burn::backend::Cuda<f32, i32>>(&mut group, "cuda", device);
     }
 
     group.finish();
@@ -488,6 +515,136 @@ fn bench_trace_case<B>(
                 || video.clone(),
                 |video| {
                     black_box(pipeline.trace_video_with_mode(video, 2, mode.mode));
+                    B::sync(&device).expect("backend sync");
+                },
+                BatchSize::SmallInput,
+            );
+        },
+    );
+}
+
+fn register_tile_batch_size<B>(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    backend: &str,
+    device: B::Device,
+) where
+    B: Backend,
+    B::Device: Clone,
+{
+    let case = VideoCase {
+        name: "1080p",
+        width: 1920,
+        height: 1080,
+    };
+    let model = ModelCase {
+        name: "multiscale-32-64-112-224",
+        scales: "32+64+112+224",
+        num_vision_tokens_each_frame: 265,
+    };
+    let mode = AutoGazeInferenceMode::TiledFullResolution {
+        tile_size: MODEL_INPUT_SIZE,
+        stride: MODEL_INPUT_SIZE,
+    };
+
+    if run_optional(backend, || {
+        let pipeline = deterministic_pipeline::<B>(model, &device);
+        let video =
+            deterministic_video::<B>(BATCH, FRAMES, CHANNELS, case.height, case.width, &device);
+        let output = pipeline.embed_video_with_mode(video, mode);
+        black_box(output.embeddings.into_data());
+        B::sync(&device).expect("backend sync");
+    })
+    .is_none()
+    {
+        return;
+    }
+
+    for &tile_batch_size in TILE_BATCH_CASES {
+        bench_tile_batch_embed_case::<B>(
+            group,
+            backend,
+            case,
+            model,
+            mode,
+            tile_batch_size,
+            device.clone(),
+        );
+        bench_tile_batch_trace_case::<B>(
+            group,
+            backend,
+            case,
+            model,
+            mode,
+            tile_batch_size,
+            device.clone(),
+        );
+    }
+}
+
+fn bench_tile_batch_embed_case<B>(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    backend: &str,
+    case: VideoCase,
+    model: ModelCase,
+    mode: AutoGazeInferenceMode,
+    tile_batch_size: usize,
+    device: B::Device,
+) where
+    B: Backend,
+    B::Device: Clone,
+{
+    let pipeline =
+        deterministic_pipeline::<B>(model, &device).with_tile_batch_size(tile_batch_size);
+    let video = deterministic_video::<B>(BATCH, FRAMES, CHANNELS, case.height, case.width, &device);
+    group.throughput(Throughput::Elements(case.frames_per_batch()));
+    group.bench_with_input(
+        BenchmarkId::new(
+            format!("{backend}/embed/tile-batch-{tile_batch_size}"),
+            case.name,
+        ),
+        &case,
+        |b, _| {
+            b.iter_batched(
+                || video.clone(),
+                |video| {
+                    let output = pipeline.embed_video_with_mode(video, mode);
+                    black_box(output.layout.tile_count());
+                    black_box(output.embeddings.into_data());
+                    B::sync(&device).expect("backend sync");
+                },
+                BatchSize::SmallInput,
+            );
+        },
+    );
+}
+
+fn bench_tile_batch_trace_case<B>(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    backend: &str,
+    case: VideoCase,
+    model: ModelCase,
+    mode: AutoGazeInferenceMode,
+    tile_batch_size: usize,
+    device: B::Device,
+) where
+    B: Backend,
+    B::Device: Clone,
+{
+    let pipeline =
+        deterministic_pipeline::<B>(model, &device).with_tile_batch_size(tile_batch_size);
+    let video = deterministic_video::<B>(BATCH, FRAMES, CHANNELS, case.height, case.width, &device);
+    group.throughput(Throughput::Elements(case.frames_per_batch()));
+    group.bench_with_input(
+        BenchmarkId::new(
+            format!("{backend}/trace/tile-batch-{tile_batch_size}"),
+            case.name,
+        ),
+        &case,
+        |b, _| {
+            b.iter_batched(
+                || video.clone(),
+                |video| {
+                    black_box(pipeline.trace_video_with_mode(video, 2, mode));
                     B::sync(&device).expect("backend sync");
                 },
                 BatchSize::SmallInput,
@@ -887,6 +1044,7 @@ criterion_group!(
     bench_trace_video,
     bench_real_trace_video,
     bench_rgba_e2e_video,
-    bench_visualization
+    bench_visualization,
+    bench_tile_batch_size
 );
 criterion_main!(benches);

@@ -70,7 +70,7 @@ fn native_autogaze_generate_matches_official_fixture() {
     let fixture_path = fixture_root.join("fixture_outputs.safetensors");
     if !fixture_path.exists() {
         eprintln!(
-            "skipping AutoGaze generation parity: missing fixture {}; run scripts/vision/export_autogaze_official_generate_fixture.py",
+            "skipping AutoGaze generation parity: missing committed fixture {}",
             fixture_path.display()
         );
         return;
@@ -106,8 +106,14 @@ fn native_autogaze_generate_matches_official_fixture() {
         .into_data()
         .to_vec::<i64>()
         .expect("if_padded vec");
+    let max_gaze_tokens_each_frame = expected_num_gazing_each_frame
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(1)
+        .max(1) as usize;
 
-    let actual = model.generate(video, 8);
+    let actual = model.generate(video, max_gaze_tokens_each_frame);
     assert_eq!(actual.gazing_pos.len(), 1, "expected single batch fixture");
     assert_eq!(
         actual.gazing_pos[0], expected_gazing_pos,
