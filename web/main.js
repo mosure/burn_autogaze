@@ -229,7 +229,11 @@ function applyModelOptions() {
   model.set_keyframe_duration(clampInteger(keyframeDuration.value, 1, 300));
   model.set_visualization_mode(visualizationMode.value);
   if (mode.value === "tile") {
-    model.set_tiled_mode(224, 224);
+    if (typeof model.set_anyres_tiled_mode === 'function') {
+      model.set_anyres_tiled_mode(224);
+    } else {
+      model.set_tiled_mode(224, 224);
+    }
   } else {
     model.set_resize_mode();
   }

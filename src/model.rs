@@ -10,7 +10,7 @@ use burn::tensor::activation;
 use burn::tensor::backend::{Backend, ExecutionError};
 use burn::tensor::module::interpolate;
 use burn::tensor::ops::{InterpolateMode, InterpolateOptions, PadMode};
-use burn::tensor::{Int, Tensor, TensorData};
+use burn::tensor::{Bool, Int, Tensor, TensorData};
 use burn_store::{ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore};
 use std::path::Path;
 
@@ -232,6 +232,22 @@ pub struct AutoGazeCausalLmOutput<B: Backend> {
     pub hidden_states: Tensor<B, 3>,
 }
 
+#[derive(Clone, Debug)]
+struct AutoGazePastKeyValue<B: Backend> {
+    key: Tensor<B, 4>,
+    value: Tensor<B, 4>,
+    len: usize,
+}
+
+type AutoGazePastKeyValues<B> = Vec<AutoGazePastKeyValue<B>>;
+
+#[derive(Debug)]
+struct AutoGazeCachedCausalLmOutput<B: Backend> {
+    logits: Tensor<B, 3>,
+    task_loss_prediction: Tensor<B, 3>,
+    past_key_values: AutoGazePastKeyValues<B>,
+}
+
 #[derive(Module, Debug)]
 pub struct LlamaRmsNorm<B: Backend> {
     pub weight: Param<Tensor<B, 1>>,
@@ -339,6 +355,121 @@ impl<B: Backend> AutoGazeLlamaAttention<B> {
         self.o_proj.forward(merge_heads(out))
     }
 
+    fn forward_cached(
+        &self,
+        hidden_states: Tensor<B, 3>,
+        attention_mask: Option<Tensor<B, 2, Int>>,
+        position_ids: Tensor<B, 2, Int>,
+        past: Option<AutoGazePastKeyValue<B>>,
+        cache_capacity: usize,
+    ) -> (Tensor<B, 3>, AutoGazePastKeyValue<B>) {
+        let [batch, query_len, _] = hidden_states.shape().dims::<3>();
+        let q = split_heads(
+            self.q_proj.forward(hidden_states.clone()),
+            self.num_heads,
+            self.head_dim,
+        );
+        let k = split_heads(
+            self.k_proj.forward(hidden_states.clone()),
+            self.num_key_value_heads,
+            self.head_dim,
+        );
+        let v = split_heads(
+            self.v_proj.forward(hidden_states),
+            self.num_key_value_heads,
+            self.head_dim,
+        );
+
+        let q = self.apply_rope(q, position_ids.clone());
+        let next_k = self.apply_rope(k, position_ids);
+        let next_v = v;
+        let cache_device = next_k.device();
+        let past_len = past.as_ref().map(|past| past.len).unwrap_or(0);
+        let present_len = past_len + query_len;
+        let capacity = cache_capacity.max(present_len).max(1);
+        let (key_cache, value_cache, mut k, mut v) = if let Some(past) = past {
+            let key_cache = past.key.slice_assign(
+                [
+                    0..batch,
+                    0..self.num_key_value_heads,
+                    past_len..present_len,
+                    0..self.head_dim,
+                ],
+                next_k,
+            );
+            let value_cache = past.value.slice_assign(
+                [
+                    0..batch,
+                    0..self.num_key_value_heads,
+                    past_len..present_len,
+                    0..self.head_dim,
+                ],
+                next_v,
+            );
+            (
+                key_cache.clone(),
+                value_cache.clone(),
+                key_cache.slice_dim(2, 0..present_len),
+                value_cache.slice_dim(2, 0..present_len),
+            )
+        } else {
+            let key_cache = Tensor::<B, 4>::empty(
+                [batch, self.num_key_value_heads, capacity, self.head_dim],
+                &cache_device,
+            )
+            .slice_assign(
+                [
+                    0..batch,
+                    0..self.num_key_value_heads,
+                    0..present_len,
+                    0..self.head_dim,
+                ],
+                next_k.clone(),
+            );
+            let value_cache = Tensor::<B, 4>::empty(
+                [batch, self.num_key_value_heads, capacity, self.head_dim],
+                &cache_device,
+            )
+            .slice_assign(
+                [
+                    0..batch,
+                    0..self.num_key_value_heads,
+                    0..present_len,
+                    0..self.head_dim,
+                ],
+                next_v.clone(),
+            );
+            (key_cache, value_cache, next_k, next_v)
+        };
+        let present = AutoGazePastKeyValue {
+            key: key_cache,
+            value: value_cache,
+            len: present_len,
+        };
+        let key_len = present_len;
+
+        if self.num_key_value_heads != self.num_heads {
+            let repeat = (self.num_heads / self.num_key_value_heads.max(1)).max(1);
+            k = k.repeat_dim(1, repeat);
+            v = v.repeat_dim(1, repeat);
+        }
+
+        let scores = q
+            .matmul(k.swap_dims(2, 3))
+            .div_scalar((self.head_dim as f32).sqrt().max(1.0));
+        let bias = causal_attention_bias_for_query(
+            batch,
+            query_len,
+            key_len,
+            past_len,
+            attention_mask,
+            &scores.device(),
+        );
+        let attn = activation::softmax(scores + bias, 3);
+        let out = attn.matmul(v);
+        (self.o_proj.forward(merge_heads(out)), present)
+    }
+
     fn apply_rope(&self, x: Tensor<B, 4>, position_ids: Tensor<B, 2, Int>) -> Tensor<B, 4> {
         let [batch, heads, seq, dim] = x.shape().dims::<4>();
         let half = dim / 2;
@@ -430,6 +561,28 @@ impl<B: Backend> AutoGazeLlamaDecoderLayer<B> {
             .forward(self.post_attention_layernorm.forward(hidden_states.clone()));
         hidden_states + mlp
     }
+
+    fn forward_cached(
+        &self,
+        hidden_states: Tensor<B, 3>,
+        attention_mask: Option<Tensor<B, 2, Int>>,
+        position_ids: Tensor<B, 2, Int>,
+        past: Option<AutoGazePastKeyValue<B>>,
+        cache_capacity: usize,
+    ) -> (Tensor<B, 3>, AutoGazePastKeyValue<B>) {
+        let (attn, present) = self.self_attn.forward_cached(
+            self.input_layernorm.forward(hidden_states.clone()),
+            attention_mask,
+            position_ids,
+            past,
+            cache_capacity,
+        );
+        let hidden_states = hidden_states + attn;
+        let mlp = self
+            .mlp
+            .forward(self.post_attention_layernorm.forward(hidden_states.clone()));
+        (hidden_states + mlp, present)
+    }
 }
 
 #[derive(Module, Debug)]
@@ -464,6 +617,34 @@ impl<B: Backend> AutoGazeLlamaModel<B> {
                 layer.forward(hidden_states, attention_mask.clone(), position_ids.clone());
         }
         self.norm.forward(hidden_states)
+    }
+
+    fn forward_cached(
+        &self,
+        inputs_embeds: Tensor<B, 3>,
+        attention_mask: Option<Tensor<B, 2, Int>>,
+        position_ids: Tensor<B, 2, Int>,
+        past_key_values: Option<AutoGazePastKeyValues<B>>,
+        cache_capacity: usize,
+    ) -> (Tensor<B, 3>, AutoGazePastKeyValues<B>) {
+        let mut hidden_states = inputs_embeds;
+        let mut next_past = Vec::with_capacity(self.layers.len());
+        for (idx, layer) in self.layers.iter().enumerate() {
+            let past = past_key_values
+                .as_ref()
+                .and_then(|past_values| past_values.get(idx))
+                .cloned();
+            let (next_hidden_states, present) = layer.forward_cached(
+                hidden_states,
+                attention_mask.clone(),
+                position_ids.clone(),
+                past,
+                cache_capacity,
+            );
+            hidden_states = next_hidden_states;
+            next_past.push(present);
+        }
+        (self.norm.forward(hidden_states), next_past)
     }
 }
 
@@ -516,6 +697,32 @@ impl<B: Backend> AutoGazeLlamaForCausalLmMultiTokenPred<B> {
             logits,
             task_loss_prediction,
             hidden_states,
+        }
+    }
+
+    fn forward_cached(
+        &self,
+        inputs_embeds: Tensor<B, 3>,
+        attention_mask: Option<Tensor<B, 2, Int>>,
+        position_ids: Tensor<B, 2, Int>,
+        past_key_values: Option<AutoGazePastKeyValues<B>>,
+        cache_capacity: usize,
+    ) -> AutoGazeCachedCausalLmOutput<B> {
+        let (hidden_states, past_key_values) = self.model.forward_cached(
+            inputs_embeds,
+            attention_mask,
+            position_ids,
+            past_key_values,
+            cache_capacity,
+        );
+        let logits = self.lm_head.forward(hidden_states.clone());
+        let task_loss_prediction = self
+            .task_loss_prediction_head
+            .forward(hidden_states.clone());
+        AutoGazeCachedCausalLmOutput {
+            logits,
+            task_loss_prediction,
+            past_key_values,
         }
     }
 }
@@ -587,6 +794,199 @@ impl<B: Backend> AutoGazeGazingModel<B> {
         max_gaze_tokens_each_frame: usize,
         task_loss_requirement: Option<f32>,
     ) -> AutoGazeGenerateOutput {
+        let frames = video.shape().dims::<5>()[1];
+        if frames > 1 {
+            self.generate_cached(video, max_gaze_tokens_each_frame, task_loss_requirement)
+        } else {
+            self.generate_uncached(video, max_gaze_tokens_each_frame, task_loss_requirement)
+        }
+    }
+
+    pub fn generate_cached(
+        &self,
+        video: Tensor<B, 5>,
+        max_gaze_tokens_each_frame: usize,
+        task_loss_requirement: Option<f32>,
+    ) -> AutoGazeGenerateOutput {
+        let video = self.resize_video(video);
+        let (video_embeds, _) = self.embed_video(video, false, None);
+        let [batch, frames, vision_tokens, dim] = video_embeds.shape().dims::<4>();
+        let device = video_embeds.device();
+
+        let mut gazing_pos = vec![Vec::<i64>::new(); batch];
+        let mut if_padded_gazing = vec![Vec::<bool>::new(); batch];
+        let mut confidences = vec![Vec::<f32>::new(); batch];
+        let mut num_gazing_each_frame = Vec::with_capacity(frames);
+
+        let mut past_key_values: Option<AutoGazePastKeyValues<B>> = None;
+        let mut pending_query_embeds: Option<Tensor<B, 3>> = None;
+        let mut prefix_attention_mask = vec![vec![]; batch];
+        let mut prefix_position_ids = vec![vec![]; batch];
+        let mut pending_position_indices = vec![Vec::<usize>::new(); batch];
+        let max_tokens = max_gaze_tokens_each_frame.max(1);
+        let cache_capacity = frames * (vision_tokens + max_tokens);
+
+        for frame_idx in 0..frames {
+            commit_pending_position_ids(
+                &prefix_attention_mask,
+                &mut prefix_position_ids,
+                &pending_position_indices,
+            );
+            pending_position_indices.iter_mut().for_each(Vec::clear);
+
+            let frame_embed = video_embeds
+                .clone()
+                .slice_dim(1, frame_idx..(frame_idx + 1))
+                .reshape([batch, vision_tokens, dim]);
+            for batch_idx in 0..batch {
+                let valid_start = prefix_attention_mask[batch_idx]
+                    .iter()
+                    .filter(|&&mask| mask != 0)
+                    .count() as i64;
+                for valid_count in (valid_start..).take(vision_tokens) {
+                    prefix_attention_mask[batch_idx].push(1);
+                    prefix_position_ids[batch_idx].push(valid_count);
+                }
+            }
+            let initial_query_embeds = if let Some(pending) = pending_query_embeds.take() {
+                Tensor::cat(vec![pending, frame_embed], 1)
+            } else {
+                frame_embed
+            };
+
+            let mut frame_tokens = vec![Vec::<i64>::new(); batch];
+            let mut frame_padded = vec![Vec::<bool>::new(); batch];
+            let mut frame_confidences = vec![Vec::<f32>::new(); batch];
+            let mut finished = vec![false; batch];
+            let mut is_first_token = true;
+            let generation_prefix_len = prefix_attention_mask.first().map(Vec::len).unwrap_or(0);
+            let generation_tail_positions =
+                generation_tail_positions(&prefix_position_ids, self.num_multi_token_pred);
+            let mut last_generated_indices = vec![Vec::<usize>::new(); batch];
+            let mut next_query_embeds = Some(initial_query_embeds);
+
+            while frame_tokens.iter().map(Vec::len).max().unwrap_or(0) < max_tokens
+                && finished.iter().any(|done| !done)
+            {
+                let Some(query_embeds) = next_query_embeds.take() else {
+                    break;
+                };
+                let query_len = query_embeds.shape().dims::<3>()[1];
+                let query_start = cached_sequence_len(&past_key_values);
+                let key_len = query_start + query_len;
+                let attention_mask =
+                    attention_mask_tensor_or_none::<B>(&prefix_attention_mask, key_len, &device);
+                let position_ids = position_ids_slice_tensor_optimized::<B>(
+                    &prefix_position_ids,
+                    query_start,
+                    query_len,
+                    &device,
+                );
+                let outputs = self.gaze_decoder.forward_cached(
+                    query_embeds,
+                    attention_mask,
+                    position_ids,
+                    past_key_values,
+                    cache_capacity,
+                );
+                past_key_values = Some(outputs.past_key_values);
+                let last_logits = outputs
+                    .logits
+                    .slice_dim(1, query_len.saturating_sub(1)..query_len)
+                    .reshape([
+                        batch,
+                        self.num_multi_token_pred,
+                        self.gaze_decoder.vocab_size,
+                    ]);
+                let last_task = outputs
+                    .task_loss_prediction
+                    .slice_dim(1, query_len.saturating_sub(1)..query_len)
+                    .reshape([batch, self.num_multi_token_pred]);
+                let (next_tokens, next_valid, next_confidences) = greedy_select_multi_tokens(
+                    last_logits,
+                    last_task,
+                    &frame_tokens,
+                    &finished,
+                    self.eos_token_id,
+                    max_tokens,
+                    TaskLossStop {
+                        requirement: task_loss_requirement,
+                        is_first_token,
+                    },
+                );
+
+                let new_tokens = next_tokens.first().map(Vec::len).unwrap_or(0);
+                if new_tokens == 0 {
+                    break;
+                }
+                let flat_tokens: Vec<i64> = next_tokens
+                    .iter()
+                    .flat_map(|tokens| tokens.iter().copied())
+                    .collect();
+                let token_tensor = Tensor::<B, 2, Int>::from_data(
+                    TensorData::new(flat_tokens, [batch, new_tokens]),
+                    &device,
+                );
+                let token_embeds = self.gaze_decoder.model.embed_tokens.forward(token_tensor);
+
+                for batch_idx in 0..batch {
+                    last_generated_indices[batch_idx].clear();
+                    for local_idx in 0..new_tokens {
+                        last_generated_indices[batch_idx]
+                            .push(prefix_attention_mask[batch_idx].len());
+                        let token = next_tokens[batch_idx][local_idx];
+                        let valid = next_valid[batch_idx][local_idx];
+                        let confidence = next_confidences[batch_idx][local_idx];
+                        frame_tokens[batch_idx].push(token);
+                        frame_padded[batch_idx].push(!valid);
+                        frame_confidences[batch_idx].push(confidence);
+                        prefix_attention_mask[batch_idx].push(1);
+                        let tail = &generation_tail_positions[batch_idx];
+                        prefix_position_ids[batch_idx].push(tail[local_idx % tail.len()]);
+                        if !valid {
+                            finished[batch_idx] = true;
+                        }
+                    }
+                }
+                next_query_embeds = Some(token_embeds);
+                is_first_token = false;
+            }
+
+            let frame_count = frame_tokens.first().map(Vec::len).unwrap_or(0);
+            num_gazing_each_frame.push(frame_count);
+            let frame_offset = (frame_idx * self.num_vision_tokens_each_frame) as i64;
+            for batch_idx in 0..batch {
+                for (local_idx, padded) in frame_padded[batch_idx].iter().copied().enumerate() {
+                    if padded {
+                        prefix_attention_mask[batch_idx][generation_prefix_len + local_idx] = 0;
+                    }
+                }
+                gazing_pos[batch_idx].extend(
+                    frame_tokens[batch_idx]
+                        .iter()
+                        .map(|token| token + frame_offset),
+                );
+                if_padded_gazing[batch_idx].extend(frame_padded[batch_idx].iter().copied());
+                confidences[batch_idx].extend(frame_confidences[batch_idx].iter().copied());
+            }
+            pending_position_indices = last_generated_indices;
+            pending_query_embeds = next_query_embeds;
+        }
+
+        AutoGazeGenerateOutput {
+            gazing_pos,
+            num_gazing_each_frame,
+            if_padded_gazing,
+            confidences,
+        }
+    }
+
+    pub fn generate_uncached(
+        &self,
+        video: Tensor<B, 5>,
+        max_gaze_tokens_each_frame: usize,
+        task_loss_requirement: Option<f32>,
+    ) -> AutoGazeGenerateOutput {
         let video = self.resize_video(video);
         let (video_embeds, _) = self.embed_video(video, false, None);
         let [batch, frames, vision_tokens, dim] = video_embeds.shape().dims::<4>();
@@ -648,11 +1048,12 @@ impl<B: Backend> AutoGazeGazingModel<B> {
             {
                 let seq_len = sequence_embeds.shape().dims::<3>()[1];
                 let attention_mask =
-                    attention_mask_tensor::<B>(&prefix_attention_mask, seq_len, &device);
-                let position_ids = position_ids_tensor::<B>(&prefix_position_ids, seq_len, &device);
+                    attention_mask_tensor_or_none::<B>(&prefix_attention_mask, seq_len, &device);
+                let position_ids =
+                    position_ids_tensor_optimized::<B>(&prefix_position_ids, seq_len, &device);
                 let outputs = self.gaze_decoder.forward(
                     sequence_embeds.clone(),
-                    Some(attention_mask),
+                    attention_mask,
                     position_ids,
                 );
                 let last_logits = outputs
@@ -752,6 +1153,202 @@ impl<B: Backend> AutoGazeGazingModel<B> {
         max_gaze_tokens_each_frame: usize,
         task_loss_requirement: Option<f32>,
     ) -> Result<AutoGazeGenerateOutput, ExecutionError> {
+        let frames = video.shape().dims::<5>()[1];
+        if frames > 1 {
+            self.generate_cached_async(video, max_gaze_tokens_each_frame, task_loss_requirement)
+                .await
+        } else {
+            self.generate_uncached_async(video, max_gaze_tokens_each_frame, task_loss_requirement)
+                .await
+        }
+    }
+
+    pub async fn generate_cached_async(
+        &self,
+        video: Tensor<B, 5>,
+        max_gaze_tokens_each_frame: usize,
+        task_loss_requirement: Option<f32>,
+    ) -> Result<AutoGazeGenerateOutput, ExecutionError> {
+        let video = self.resize_video(video);
+        let (video_embeds, _) = self.embed_video(video, false, None);
+        let [batch, frames, vision_tokens, dim] = video_embeds.shape().dims::<4>();
+        let device = video_embeds.device();
+
+        let mut gazing_pos = vec![Vec::<i64>::new(); batch];
+        let mut if_padded_gazing = vec![Vec::<bool>::new(); batch];
+        let mut confidences = vec![Vec::<f32>::new(); batch];
+        let mut num_gazing_each_frame = Vec::with_capacity(frames);
+
+        let mut past_key_values: Option<AutoGazePastKeyValues<B>> = None;
+        let mut pending_query_embeds: Option<Tensor<B, 3>> = None;
+        let mut prefix_attention_mask = vec![vec![]; batch];
+        let mut prefix_position_ids = vec![vec![]; batch];
+        let mut pending_position_indices = vec![Vec::<usize>::new(); batch];
+        let max_tokens = max_gaze_tokens_each_frame.max(1);
+        let cache_capacity = frames * (vision_tokens + max_tokens);
+
+        for frame_idx in 0..frames {
+            commit_pending_position_ids(
+                &prefix_attention_mask,
+                &mut prefix_position_ids,
+                &pending_position_indices,
+            );
+            pending_position_indices.iter_mut().for_each(Vec::clear);
+
+            let frame_embed = video_embeds
+                .clone()
+                .slice_dim(1, frame_idx..(frame_idx + 1))
+                .reshape([batch, vision_tokens, dim]);
+            for batch_idx in 0..batch {
+                let valid_start = prefix_attention_mask[batch_idx]
+                    .iter()
+                    .filter(|&&mask| mask != 0)
+                    .count() as i64;
+                for valid_count in (valid_start..).take(vision_tokens) {
+                    prefix_attention_mask[batch_idx].push(1);
+                    prefix_position_ids[batch_idx].push(valid_count);
+                }
+            }
+            let initial_query_embeds = if let Some(pending) = pending_query_embeds.take() {
+                Tensor::cat(vec![pending, frame_embed], 1)
+            } else {
+                frame_embed
+            };
+
+            let mut frame_tokens = vec![Vec::<i64>::new(); batch];
+            let mut frame_padded = vec![Vec::<bool>::new(); batch];
+            let mut frame_confidences = vec![Vec::<f32>::new(); batch];
+            let mut finished = vec![false; batch];
+            let mut is_first_token = true;
+            let generation_prefix_len = prefix_attention_mask.first().map(Vec::len).unwrap_or(0);
+            let generation_tail_positions =
+                generation_tail_positions(&prefix_position_ids, self.num_multi_token_pred);
+            let mut last_generated_indices = vec![Vec::<usize>::new(); batch];
+            let mut next_query_embeds = Some(initial_query_embeds);
+
+            while frame_tokens.iter().map(Vec::len).max().unwrap_or(0) < max_tokens
+                && finished.iter().any(|done| !done)
+            {
+                let Some(query_embeds) = next_query_embeds.take() else {
+                    break;
+                };
+                let query_len = query_embeds.shape().dims::<3>()[1];
+                let query_start = cached_sequence_len(&past_key_values);
+                let key_len = query_start + query_len;
+                let attention_mask =
+                    attention_mask_tensor_or_none::<B>(&prefix_attention_mask, key_len, &device);
+                let position_ids = position_ids_slice_tensor_optimized::<B>(
+                    &prefix_position_ids,
+                    query_start,
+                    query_len,
+                    &device,
+                );
+                let outputs = self.gaze_decoder.forward_cached(
+                    query_embeds,
+                    attention_mask,
+                    position_ids,
+                    past_key_values,
+                    cache_capacity,
+                );
+                past_key_values = Some(outputs.past_key_values);
+                let last_logits = outputs
+                    .logits
+                    .slice_dim(1, query_len.saturating_sub(1)..query_len)
+                    .reshape([
+                        batch,
+                        self.num_multi_token_pred,
+                        self.gaze_decoder.vocab_size,
+                    ]);
+                let last_task = outputs
+                    .task_loss_prediction
+                    .slice_dim(1, query_len.saturating_sub(1)..query_len)
+                    .reshape([batch, self.num_multi_token_pred]);
+                let (next_tokens, next_valid, next_confidences) = greedy_select_multi_tokens_async(
+                    last_logits,
+                    last_task,
+                    &frame_tokens,
+                    &finished,
+                    self.eos_token_id,
+                    max_tokens,
+                    TaskLossStop {
+                        requirement: task_loss_requirement,
+                        is_first_token,
+                    },
+                )
+                .await?;
+
+                let new_tokens = next_tokens.first().map(Vec::len).unwrap_or(0);
+                if new_tokens == 0 {
+                    break;
+                }
+                let flat_tokens: Vec<i64> = next_tokens
+                    .iter()
+                    .flat_map(|tokens| tokens.iter().copied())
+                    .collect();
+                let token_tensor = Tensor::<B, 2, Int>::from_data(
+                    TensorData::new(flat_tokens, [batch, new_tokens]),
+                    &device,
+                );
+                let token_embeds = self.gaze_decoder.model.embed_tokens.forward(token_tensor);
+
+                for batch_idx in 0..batch {
+                    last_generated_indices[batch_idx].clear();
+                    for local_idx in 0..new_tokens {
+                        last_generated_indices[batch_idx]
+                            .push(prefix_attention_mask[batch_idx].len());
+                        let token = next_tokens[batch_idx][local_idx];
+                        let valid = next_valid[batch_idx][local_idx];
+                        let confidence = next_confidences[batch_idx][local_idx];
+                        frame_tokens[batch_idx].push(token);
+                        frame_padded[batch_idx].push(!valid);
+                        frame_confidences[batch_idx].push(confidence);
+                        prefix_attention_mask[batch_idx].push(1);
+                        let tail = &generation_tail_positions[batch_idx];
+                        prefix_position_ids[batch_idx].push(tail[local_idx % tail.len()]);
+                        if !valid {
+                            finished[batch_idx] = true;
+                        }
+                    }
+                }
+                next_query_embeds = Some(token_embeds);
+                is_first_token = false;
+            }
+
+            let frame_count = frame_tokens.first().map(Vec::len).unwrap_or(0);
+            num_gazing_each_frame.push(frame_count);
+            let frame_offset = (frame_idx * self.num_vision_tokens_each_frame) as i64;
+            for batch_idx in 0..batch {
+                for (local_idx, padded) in frame_padded[batch_idx].iter().copied().enumerate() {
+                    if padded {
+                        prefix_attention_mask[batch_idx][generation_prefix_len + local_idx] = 0;
+                    }
+                }
+                gazing_pos[batch_idx].extend(
+                    frame_tokens[batch_idx]
+                        .iter()
+                        .map(|token| token + frame_offset),
+                );
+                if_padded_gazing[batch_idx].extend(frame_padded[batch_idx].iter().copied());
+                confidences[batch_idx].extend(frame_confidences[batch_idx].iter().copied());
+            }
+            pending_position_indices = last_generated_indices;
+            pending_query_embeds = next_query_embeds;
+        }
+
+        Ok(AutoGazeGenerateOutput {
+            gazing_pos,
+            num_gazing_each_frame,
+            if_padded_gazing,
+            confidences,
+        })
+    }
+
+    pub async fn generate_uncached_async(
+        &self,
+        video: Tensor<B, 5>,
+        max_gaze_tokens_each_frame: usize,
+        task_loss_requirement: Option<f32>,
+    ) -> Result<AutoGazeGenerateOutput, ExecutionError> {
         let video = self.resize_video(video);
         let (video_embeds, _) = self.embed_video(video, false, None);
         let [batch, frames, vision_tokens, dim] = video_embeds.shape().dims::<4>();
@@ -812,11 +1409,12 @@ impl<B: Backend> AutoGazeGazingModel<B> {
             {
                 let seq_len = sequence_embeds.shape().dims::<3>()[1];
                 let attention_mask =
-                    attention_mask_tensor::<B>(&prefix_attention_mask, seq_len, &device);
-                let position_ids = position_ids_tensor::<B>(&prefix_position_ids, seq_len, &device);
+                    attention_mask_tensor_or_none::<B>(&prefix_attention_mask, seq_len, &device);
+                let position_ids =
+                    position_ids_tensor_optimized::<B>(&prefix_position_ids, seq_len, &device);
                 let outputs = self.gaze_decoder.forward(
                     sequence_embeds.clone(),
-                    Some(attention_mask),
+                    attention_mask,
                     position_ids,
                 );
                 let last_logits = outputs
@@ -1271,6 +1869,27 @@ fn causal_attention_bias<B: Backend>(
     bias
 }
 
+fn causal_attention_bias_for_query<B: Backend>(
+    batch: usize,
+    query_len: usize,
+    key_len: usize,
+    past_len: usize,
+    attention_mask: Option<Tensor<B, 2, Int>>,
+    device: &B::Device,
+) -> Tensor<B, 4> {
+    let q_pos = Tensor::<B, 1, Int>::arange(past_len as i64..(past_len + query_len) as i64, device)
+        .reshape([1, 1, query_len, 1]);
+    let k_pos = Tensor::<B, 1, Int>::arange(0..key_len as i64, device).reshape([1, 1, 1, key_len]);
+    let causal = k_pos.lower_equal(q_pos).float();
+    let mut bias = causal.sub_scalar(1.0).abs().mul_scalar(-1.0e9);
+    if let Some(mask) = attention_mask {
+        let key_valid = mask.float().reshape([batch.max(1), 1, 1, key_len]);
+        let key_bias = key_valid.sub_scalar(1.0).abs().mul_scalar(-1.0e9);
+        bias = bias + key_bias;
+    }
+    bias
+}
+
 fn llama3_inv_freq<B: Backend>(
     config: &crate::config::GazeDecoderConfig,
     device: &B::Device,
@@ -1347,6 +1966,26 @@ fn attention_mask_tensor<B: Backend>(
     Tensor::<B, 2, Int>::from_data(TensorData::new(values, [batch, seq_len]), device)
 }
 
+fn attention_mask_tensor_or_none<B: Backend>(
+    mask_rows: &[Vec<i64>],
+    seq_len: usize,
+    device: &B::Device,
+) -> Option<Tensor<B, 2, Int>> {
+    if attention_mask_rows_are_all_valid(mask_rows, seq_len) {
+        None
+    } else {
+        Some(attention_mask_tensor(mask_rows, seq_len, device))
+    }
+}
+
+fn attention_mask_rows_are_all_valid(mask_rows: &[Vec<i64>], seq_len: usize) -> bool {
+    !mask_rows.is_empty()
+        && mask_rows
+            .iter()
+            .all(|row| row.len() >= seq_len && row.iter().take(seq_len).all(|mask| *mask != 0))
+}
+
+#[cfg(test)]
 fn position_ids_tensor<B: Backend>(
     position_rows: &[Vec<i64>],
     seq_len: usize,
@@ -1358,6 +1997,90 @@ fn position_ids_tensor<B: Backend>(
         values.extend(row.iter().copied().take(seq_len));
     }
     Tensor::<B, 2, Int>::from_data(TensorData::new(values, [batch, seq_len]), device)
+}
+
+fn position_ids_tensor_optimized<B: Backend>(
+    position_rows: &[Vec<i64>],
+    seq_len: usize,
+    device: &B::Device,
+) -> Tensor<B, 2, Int> {
+    position_ids_slice_tensor_optimized(position_rows, 0, seq_len, device)
+}
+
+fn position_ids_slice_tensor<B: Backend>(
+    position_rows: &[Vec<i64>],
+    start: usize,
+    len: usize,
+    device: &B::Device,
+) -> Tensor<B, 2, Int> {
+    let batch = position_rows.len().max(1);
+    let mut values = Vec::with_capacity(batch * len);
+    for row in position_rows {
+        values.extend(row.iter().copied().skip(start).take(len));
+    }
+    Tensor::<B, 2, Int>::from_data(TensorData::new(values, [batch, len]), device)
+}
+
+fn position_ids_slice_tensor_optimized<B: Backend>(
+    position_rows: &[Vec<i64>],
+    start: usize,
+    len: usize,
+    device: &B::Device,
+) -> Tensor<B, 2, Int> {
+    let batch = position_rows.len().max(1);
+    if let Some(first_value) = contiguous_position_start(position_rows, start, len) {
+        return Tensor::<B, 1, Int>::arange(first_value..(first_value + len as i64), device)
+            .reshape([1, len])
+            .repeat_dim(0, batch);
+    }
+
+    if let Some(row) = identical_position_slice(position_rows, start, len) {
+        return Tensor::<B, 1, Int>::from_data(TensorData::new(row, [len]), device)
+            .reshape([1, len])
+            .repeat_dim(0, batch);
+    }
+
+    position_ids_slice_tensor(position_rows, start, len, device)
+}
+
+fn contiguous_position_start(position_rows: &[Vec<i64>], start: usize, len: usize) -> Option<i64> {
+    let first = position_rows.first()?.get(start).copied().or(Some(0))?;
+    if position_rows.iter().all(|row| {
+        row.len() >= start + len
+            && (0..len).all(|offset| row[start + offset] == first + offset as i64)
+    }) {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+fn identical_position_slice(
+    position_rows: &[Vec<i64>],
+    start: usize,
+    len: usize,
+) -> Option<Vec<i64>> {
+    let first = position_rows.first()?;
+    if first.len() < start + len {
+        return None;
+    }
+    let row = first[start..start + len].to_vec();
+    if position_rows
+        .iter()
+        .all(|candidate| candidate.len() >= start + len && candidate[start..start + len] == row)
+    {
+        Some(row)
+    } else {
+        None
+    }
+}
+
+fn cached_sequence_len<B: Backend>(past_key_values: &Option<AutoGazePastKeyValues<B>>) -> usize {
+    past_key_values
+        .as_ref()
+        .and_then(|past| past.first())
+        .map(|past| past.len)
+        .unwrap_or(0)
 }
 
 fn generation_tail_positions(
@@ -1413,28 +2136,67 @@ fn greedy_select_multi_tokens<B: Backend>(
     task_loss_stop: TaskLossStop,
 ) -> GreedyTokenSelection {
     let [batch, num_multi, vocab] = logits.shape().dims::<3>();
-    let scores = logits
-        .into_data()
-        .to_vec::<f32>()
-        .expect("convert logits to f32 vec");
-    let task_losses = task_loss
-        .into_data()
-        .to_vec::<f32>()
-        .expect("convert task loss predictions to f32 vec");
-    greedy_select_multi_tokens_from_data(
-        scores,
-        task_losses,
-        batch,
-        num_multi,
-        vocab,
-        GreedySelectionContext {
-            prior_tokens,
-            finished,
-            eos_token_id,
-            max_tokens,
-            task_loss_stop,
-        },
-    )
+    let device = logits.device();
+    let context = GreedySelectionContext {
+        prior_tokens,
+        finished,
+        eos_token_id,
+        max_tokens,
+        task_loss_stop,
+    };
+    let mut builder = GreedySelectionBuilder::new(batch);
+
+    for multi_idx in 0..num_multi {
+        if !builder.has_active_rows(context) {
+            break;
+        }
+
+        let mask_values = builder.disallowed_mask(vocab, context);
+        let mask =
+            Tensor::<B, 2, Bool>::from_data(TensorData::new(mask_values, [batch, vocab]), &device);
+        let step_logits = logits
+            .clone()
+            .slice_dim(1, multi_idx..(multi_idx + 1))
+            .squeeze_dim::<2>(1);
+        let masked_logits = step_logits.mask_fill(mask, f32::NEG_INFINITY);
+        let exp_sum = masked_logits.clone().exp().sum_dim(1);
+        let best_indices = masked_logits
+            .clone()
+            .add(greedy_tie_breaker::<B>(batch, vocab, &device))
+            .argmax(1);
+        let best_scores = masked_logits.gather(1, best_indices.clone());
+        let confidences = best_scores.clone().exp().div(exp_sum);
+        let step_task_loss = task_loss.clone().slice_dim(1, multi_idx..(multi_idx + 1));
+
+        let best_scores = best_scores
+            .into_data()
+            .to_vec::<f32>()
+            .expect("convert selected logits to f32 vec");
+        let best_tokens = best_indices
+            .into_data()
+            .convert::<i64>()
+            .to_vec::<i64>()
+            .expect("convert selected token ids to i64 vec");
+        let confidences = confidences
+            .into_data()
+            .to_vec::<f32>()
+            .expect("convert selected confidences to f32 vec");
+        let task_losses = step_task_loss
+            .into_data()
+            .to_vec::<f32>()
+            .expect("convert selected task loss predictions to f32 vec");
+
+        builder.push_step(
+            multi_idx,
+            &best_tokens,
+            &best_scores,
+            &confidences,
+            &task_losses,
+            context,
+        );
+    }
+
+    builder.finish(eos_token_id)
 }
 
 async fn greedy_select_multi_tokens_async<B: Backend>(
@@ -1447,30 +2209,79 @@ async fn greedy_select_multi_tokens_async<B: Backend>(
     task_loss_stop: TaskLossStop,
 ) -> Result<GreedyTokenSelection, ExecutionError> {
     let [batch, num_multi, vocab] = logits.shape().dims::<3>();
-    let scores = logits
-        .into_data_async()
-        .await?
-        .to_vec::<f32>()
-        .expect("convert logits to f32 vec");
-    let task_losses = task_loss
-        .into_data_async()
-        .await?
-        .to_vec::<f32>()
-        .expect("convert task loss predictions to f32 vec");
-    Ok(greedy_select_multi_tokens_from_data(
-        scores,
-        task_losses,
-        batch,
-        num_multi,
-        vocab,
-        GreedySelectionContext {
-            prior_tokens,
-            finished,
-            eos_token_id,
-            max_tokens,
-            task_loss_stop,
-        },
-    ))
+    let device = logits.device();
+    let context = GreedySelectionContext {
+        prior_tokens,
+        finished,
+        eos_token_id,
+        max_tokens,
+        task_loss_stop,
+    };
+    let mut builder = GreedySelectionBuilder::new(batch);
+
+    for multi_idx in 0..num_multi {
+        if !builder.has_active_rows(context) {
+            break;
+        }
+
+        let mask_values = builder.disallowed_mask(vocab, context);
+        let mask =
+            Tensor::<B, 2, Bool>::from_data(TensorData::new(mask_values, [batch, vocab]), &device);
+        let step_logits = logits
+            .clone()
+            .slice_dim(1, multi_idx..(multi_idx + 1))
+            .squeeze_dim::<2>(1);
+        let masked_logits = step_logits.mask_fill(mask, f32::NEG_INFINITY);
+        let exp_sum = masked_logits.clone().exp().sum_dim(1);
+        let best_indices = masked_logits
+            .clone()
+            .add(greedy_tie_breaker::<B>(batch, vocab, &device))
+            .argmax(1);
+        let best_scores = masked_logits.gather(1, best_indices.clone());
+        let confidences = best_scores.clone().exp().div(exp_sum);
+        let step_task_loss = task_loss.clone().slice_dim(1, multi_idx..(multi_idx + 1));
+
+        let best_scores = best_scores
+            .into_data_async()
+            .await?
+            .to_vec::<f32>()
+            .expect("convert selected logits to f32 vec");
+        let best_tokens = best_indices
+            .into_data_async()
+            .await?
+            .convert::<i64>()
+            .to_vec::<i64>()
+            .expect("convert selected token ids to i64 vec");
+        let confidences = confidences
+            .into_data_async()
+            .await?
+            .to_vec::<f32>()
+            .expect("convert selected confidences to f32 vec");
+        let task_losses = step_task_loss
+            .into_data_async()
+            .await?
+            .to_vec::<f32>()
+            .expect("convert selected task loss predictions to f32 vec");
+
+        builder.push_step(
+            multi_idx,
+            &best_tokens,
+            &best_scores,
+            &confidences,
+            &task_losses,
+            context,
+        );
+    }
+
+    Ok(builder.finish(eos_token_id))
+}
+
+fn greedy_tie_breaker<B: Backend>(batch: usize, vocab: usize, device: &B::Device) -> Tensor<B, 2> {
+    Tensor::<B, 1, Int>::arange(0..vocab as i64, device)
+        .float()
+        .mul_scalar(-1.0e-9)
+        .reshape([1, vocab])
+        .repeat_dim(0, batch)
 }
 
 #[derive(Clone, Copy)]
@@ -1482,6 +2293,148 @@ struct GreedySelectionContext<'a> {
     task_loss_stop: TaskLossStop,
 }
 
+#[derive(Debug)]
+struct GreedySelectionBuilder {
+    per_batch_tokens: Vec<Vec<i64>>,
+    per_batch_disallowed: Vec<Vec<i64>>,
+    per_batch_valid: Vec<Vec<bool>>,
+    per_batch_confidences: Vec<Vec<f32>>,
+}
+
+impl GreedySelectionBuilder {
+    fn new(batch: usize) -> Self {
+        Self {
+            per_batch_tokens: vec![Vec::new(); batch],
+            per_batch_disallowed: vec![Vec::new(); batch],
+            per_batch_valid: vec![Vec::new(); batch],
+            per_batch_confidences: vec![Vec::new(); batch],
+        }
+    }
+
+    fn has_active_rows(&self, context: GreedySelectionContext<'_>) -> bool {
+        self.per_batch_tokens
+            .iter()
+            .enumerate()
+            .any(|(batch_idx, selected)| {
+                !context.finished.get(batch_idx).copied().unwrap_or(false)
+                    && context.prior_tokens[batch_idx].len() + selected.len() < context.max_tokens
+            })
+    }
+
+    fn disallowed_mask(&self, vocab: usize, context: GreedySelectionContext<'_>) -> Vec<bool> {
+        let batch = self.per_batch_tokens.len();
+        let mut values = vec![false; batch * vocab];
+        for batch_idx in 0..batch {
+            let base = batch_idx * vocab;
+            if context.finished.get(batch_idx).copied().unwrap_or(false)
+                || context.prior_tokens[batch_idx].len() + self.per_batch_tokens[batch_idx].len()
+                    >= context.max_tokens
+            {
+                values[base..base + vocab].fill(true);
+                continue;
+            }
+            if context.eos_token_id >= 0 {
+                let eos = context.eos_token_id as usize;
+                if eos < vocab {
+                    values[base + eos] = true;
+                }
+            }
+            for token in context.prior_tokens[batch_idx]
+                .iter()
+                .chain(&self.per_batch_disallowed[batch_idx])
+            {
+                if *token >= 0 {
+                    let token = *token as usize;
+                    if token < vocab {
+                        values[base + token] = true;
+                    }
+                }
+            }
+        }
+        values
+    }
+
+    fn push_step(
+        &mut self,
+        multi_idx: usize,
+        best_tokens: &[i64],
+        best_scores: &[f32],
+        confidences: &[f32],
+        task_losses: &[f32],
+        context: GreedySelectionContext<'_>,
+    ) {
+        for batch_idx in 0..self.per_batch_tokens.len() {
+            if context.finished.get(batch_idx).copied().unwrap_or(false)
+                || context.prior_tokens[batch_idx].len() + self.per_batch_tokens[batch_idx].len()
+                    >= context.max_tokens
+            {
+                continue;
+            }
+
+            let Some((&token, &best_score)) =
+                best_tokens.get(batch_idx).zip(best_scores.get(batch_idx))
+            else {
+                continue;
+            };
+            if !best_score.is_finite() {
+                continue;
+            }
+
+            let task_loss = task_losses.get(batch_idx).copied().unwrap_or(f32::INFINITY);
+            let meets_task_loss_requirement =
+                context.task_loss_stop.requirement.is_some_and(|threshold| {
+                    !(context.task_loss_stop.is_first_token && multi_idx == 0)
+                        && task_loss <= threshold
+                });
+            self.per_batch_disallowed[batch_idx].push(token);
+            self.per_batch_tokens[batch_idx].push(if meets_task_loss_requirement {
+                context.eos_token_id
+            } else {
+                token
+            });
+            self.per_batch_valid[batch_idx].push(!meets_task_loss_requirement);
+            self.per_batch_confidences[batch_idx].push(if meets_task_loss_requirement {
+                0.0
+            } else {
+                let confidence = confidences.get(batch_idx).copied().unwrap_or(1.0);
+                if confidence.is_finite() && confidence > 0.0 {
+                    confidence
+                } else {
+                    1.0
+                }
+            });
+        }
+    }
+
+    fn finish(self, eos_token_id: i64) -> GreedyTokenSelection {
+        let padded_len = self
+            .per_batch_tokens
+            .iter()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0);
+        let mut out_tokens = Vec::with_capacity(self.per_batch_tokens.len());
+        let mut out_valid = Vec::with_capacity(self.per_batch_tokens.len());
+        let mut out_confidences = Vec::with_capacity(self.per_batch_tokens.len());
+        for batch_idx in 0..self.per_batch_tokens.len() {
+            let mut tokens = self.per_batch_tokens[batch_idx].clone();
+            let mut valid = self.per_batch_valid[batch_idx].clone();
+            let mut confidences = self.per_batch_confidences[batch_idx].clone();
+            while tokens.len() < padded_len {
+                tokens.push(eos_token_id);
+                valid.push(false);
+                confidences.push(0.0);
+            }
+            out_tokens.push(tokens);
+            out_valid.push(valid);
+            out_confidences.push(confidences);
+        }
+
+        (out_tokens, out_valid, out_confidences)
+    }
+}
+
+#[cfg(test)]
 fn greedy_select_multi_tokens_from_data(
     scores: Vec<f32>,
     task_losses: Vec<f32>,
@@ -1707,6 +2660,9 @@ fn square_grid(token_count: usize) -> usize {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "ndarray")]
+    use burn::module::ModuleMapper;
+
     #[test]
     fn token_to_fixation_point_preserves_multiscale_cells() {
         let mut config = AutoGazeConfig {
@@ -1782,6 +2738,45 @@ mod tests {
         assert_eq!(position_ids, vec![0, 1, 1, 2, 3, 2, 3, 2]);
     }
 
+    #[cfg(feature = "ndarray")]
+    #[test]
+    fn optimized_position_ids_preserve_contiguous_and_shared_rows() {
+        type B = burn::backend::NdArray<f32>;
+        let device = Default::default();
+
+        let contiguous = vec![vec![4, 5, 6], vec![4, 5, 6]];
+        let values = position_ids_slice_tensor_optimized::<B>(&contiguous, 0, 3, &device)
+            .into_data()
+            .to_vec::<i64>()
+            .expect("position ids");
+        assert_eq!(values, vec![4, 5, 6, 4, 5, 6]);
+
+        let shared_non_contiguous = vec![vec![8, 13, 8], vec![8, 13, 8]];
+        let values =
+            position_ids_slice_tensor_optimized::<B>(&shared_non_contiguous, 0, 3, &device)
+                .into_data()
+                .to_vec::<i64>()
+                .expect("position ids");
+        assert_eq!(values, vec![8, 13, 8, 8, 13, 8]);
+
+        let per_batch = vec![vec![8, 13, 8], vec![9, 14, 9]];
+        let values = position_ids_slice_tensor_optimized::<B>(&per_batch, 0, 3, &device)
+            .into_data()
+            .to_vec::<i64>()
+            .expect("position ids");
+        assert_eq!(values, vec![8, 13, 8, 9, 14, 9]);
+    }
+
+    #[cfg(feature = "ndarray")]
+    #[test]
+    fn attention_mask_upload_is_skipped_when_all_keys_are_valid() {
+        type B = burn::backend::NdArray<f32>;
+        let device = Default::default();
+
+        assert!(attention_mask_tensor_or_none::<B>(&[vec![1, 1, 1]], 3, &device).is_none());
+        assert!(attention_mask_tensor_or_none::<B>(&[vec![1, 0, 1]], 3, &device).is_some());
+    }
+
     #[test]
     fn commit_pending_position_ids_uses_attention_cumsum() {
         let masks = vec![vec![1, 1, 0, 1, 1, 0, 1]];
@@ -1795,20 +2790,107 @@ mod tests {
 
     #[cfg(feature = "ndarray")]
     #[test]
+    fn cached_generation_matches_uncached_generation() {
+        type B = burn::backend::NdArray<f32>;
+        let device = Default::default();
+        let config = tiny_cache_test_config();
+        let mut mapper = DeterministicParamMapper { cursor: 0 };
+        let model = NativeAutoGazeModel::<B>::new(&config, &device).map(&mut mapper);
+        let values = (0..(2 * 3 * 16 * 16))
+            .map(|idx| ((idx % 251) as f32 / 125.0) - 1.0)
+            .collect::<Vec<_>>();
+        let video = Tensor::<B, 5>::from_data(TensorData::new(values, [1, 2, 3, 16, 16]), &device);
+
+        let uncached = model.gazing_model.generate_uncached(video.clone(), 4, None);
+        let cached = model.gazing_model.generate_cached(video, 4, None);
+
+        assert_eq!(cached.gazing_pos, uncached.gazing_pos);
+        assert_eq!(cached.num_gazing_each_frame, uncached.num_gazing_each_frame);
+        assert_eq!(cached.if_padded_gazing, uncached.if_padded_gazing);
+        assert_eq!(cached.confidences[0].len(), uncached.confidences[0].len());
+        for (left, right) in cached.confidences[0].iter().zip(&uncached.confidences[0]) {
+            assert!((left - right).abs() < 1.0e-5);
+        }
+    }
+
+    #[cfg(feature = "ndarray")]
+    fn tiny_cache_test_config() -> AutoGazeConfig {
+        let hidden = 8;
+        let heads = 2;
+        AutoGazeConfig {
+            scales: "8+16".to_string(),
+            max_num_frames: 2,
+            num_vision_tokens_each_frame: 5,
+            gaze_model_config: GazeModelConfig {
+                input_img_size: 16,
+                num_vision_tokens_each_frame: 5,
+                attn_mode: "sdpa".to_string(),
+                vision_model_config: VisionModelConfig {
+                    hidden_dim: hidden,
+                    out_dim: hidden,
+                    depth: 1,
+                    kernel_size: 8,
+                    temporal_patch_size: 1,
+                    trunk_temporal_kernel_size: 3,
+                    trunk_spatial_kernel_size: 1,
+                },
+                connector_config: ConnectorConfig {
+                    hidden_dim: hidden,
+                    num_tokens: 4,
+                },
+                gaze_decoder_config: crate::config::GazeDecoderConfig {
+                    vocab_size: 6,
+                    hidden_size: hidden,
+                    intermediate_size: hidden * 2,
+                    num_hidden_layers: 1,
+                    num_attention_heads: heads,
+                    num_key_value_heads: heads,
+                    max_position_embeddings: 512,
+                    bos_token_id: 0,
+                    eos_token_id: 5,
+                    head_dim: hidden / heads,
+                    num_multi_token_pred: 2,
+                    ..crate::config::GazeDecoderConfig::default()
+                },
+            },
+            ..AutoGazeConfig::default()
+        }
+    }
+
+    #[cfg(feature = "ndarray")]
+    struct DeterministicParamMapper {
+        cursor: usize,
+    }
+
+    #[cfg(feature = "ndarray")]
+    impl<B: Backend> ModuleMapper<B> for DeterministicParamMapper {
+        fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
+            let tensor = param.val();
+            let shape = tensor.shape().dims::<D>();
+            let device = tensor.device();
+            let len = shape.iter().product::<usize>();
+            let start = self.cursor;
+            self.cursor += len;
+            let values = (0..len)
+                .map(|idx| (((start + idx) % 97) as f32 - 48.0) * 0.002)
+                .collect::<Vec<_>>();
+            Param::from_tensor(Tensor::from_data(TensorData::new(values, shape), &device))
+        }
+    }
+
+    #[cfg(feature = "ndarray")]
+    #[test]
     fn greedy_selection_applies_task_loss_requirement_after_first_token() {
         type B = burn::backend::NdArray<f32>;
         let device = Default::default();
-        let logits = Tensor::<B, 3>::from_data(
-            TensorData::new(
-                vec![
-                    10.0, 1.0, 0.0, -1.0, //
-                    0.0, 9.0, 1.0, -1.0,
-                ],
-                [1, 2, 4],
-            ),
-            &device,
-        );
-        let task_loss = Tensor::<B, 2>::from_data(TensorData::new(vec![0.1, 0.2], [1, 2]), &device);
+        let scores = vec![
+            10.0, 1.0, 0.0, -1.0, //
+            0.0, 9.0, 1.0, -1.0,
+        ];
+        let task_losses = vec![0.1, 0.2];
+        let logits = Tensor::<B, 3>::from_data(TensorData::new(scores.clone(), [1, 2, 4]), &device);
+        let task_loss =
+            Tensor::<B, 2>::from_data(TensorData::new(task_losses.clone(), [1, 2]), &device);
 
         let (tokens, valid, confidences) = greedy_select_multi_tokens(
             logits,
@@ -1827,6 +2909,78 @@ mod tests {
         assert_eq!(valid, vec![vec![true, false]]);
         assert!(confidences[0][0] > 0.0);
         assert_eq!(confidences[0][1], 0.0);
+
+        let reference = greedy_select_multi_tokens_from_data(
+            scores,
+            task_losses,
+            1,
+            2,
+            4,
+            GreedySelectionContext {
+                prior_tokens: &[Vec::new()],
+                finished: &[false],
+                eos_token_id: 3,
+                max_tokens: 2,
+                task_loss_stop: TaskLossStop {
+                    requirement: Some(0.5),
+                    is_first_token: true,
+                },
+            },
+        );
+        assert_eq!((tokens, valid), (reference.0, reference.1));
+        for (left, right) in confidences[0].iter().zip(&reference.2[0]) {
+            assert!((left - right).abs() < 1.0e-6);
+        }
+    }
+
+    #[cfg(feature = "ndarray")]
+    #[test]
+    fn greedy_selection_disallows_hidden_token_after_task_loss_stop() {
+        type B = burn::backend::NdArray<f32>;
+        let device = Default::default();
+        let scores = vec![
+            8.0, 1.0, 0.0, -1.0, -2.0, //
+            0.0, 9.0, 2.0, 1.0, -2.0, //
+            0.0, 9.0, 8.0, 1.0, -2.0,
+        ];
+        let task_losses = vec![1.0, 0.1, 1.0];
+        let logits = Tensor::<B, 3>::from_data(TensorData::new(scores.clone(), [1, 3, 5]), &device);
+        let task_loss =
+            Tensor::<B, 2>::from_data(TensorData::new(task_losses.clone(), [1, 3]), &device);
+
+        let selected = greedy_select_multi_tokens(
+            logits,
+            task_loss,
+            &[Vec::new()],
+            &[false],
+            4,
+            3,
+            TaskLossStop {
+                requirement: Some(0.5),
+                is_first_token: true,
+            },
+        );
+        let reference = greedy_select_multi_tokens_from_data(
+            scores,
+            task_losses,
+            1,
+            3,
+            5,
+            GreedySelectionContext {
+                prior_tokens: &[Vec::new()],
+                finished: &[false],
+                eos_token_id: 4,
+                max_tokens: 3,
+                task_loss_stop: TaskLossStop {
+                    requirement: Some(0.5),
+                    is_first_token: true,
+                },
+            },
+        );
+
+        assert_eq!(selected.0, vec![vec![0, 4, 2]]);
+        assert_eq!(selected.0, reference.0);
+        assert_eq!(selected.1, reference.1);
     }
 
     #[test]

@@ -44,7 +44,7 @@ jobs:
         run: cargo check --target wasm32-unknown-unknown --no-default-features --features wasm
 
       - name: check bevy wasm
-        run: cargo check -p bevy_burn_autogaze --target wasm32-unknown-unknown --no-default-features --features web
+        run: cargo check -p bevy_burn_autogaze --target wasm32-unknown-unknown
 
       - name: install wasm-bindgen-cli
         shell: bash

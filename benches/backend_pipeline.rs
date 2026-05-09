@@ -17,6 +17,7 @@ use std::{
     env,
     hint::black_box,
     path::{Path, PathBuf},
+    process::Command,
     time::Duration,
 };
 
@@ -53,6 +54,52 @@ struct VisualizationCase {
     force_delta_frame: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CacheCase {
+    name: &'static str,
+    width: usize,
+    height: usize,
+    frames: usize,
+    max_tokens: usize,
+}
+
+impl CacheCase {
+    const fn frames_per_batch(&self) -> u64 {
+        (BATCH * self.frames) as u64
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TileVideoCase {
+    name: &'static str,
+    width: usize,
+    height: usize,
+    frames: usize,
+}
+
+impl TileVideoCase {
+    const fn frames_per_batch(&self) -> u64 {
+        (BATCH * self.frames) as u64
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TaskLossBenchSetting {
+    ModelDefault,
+    Disabled,
+    Threshold(f32),
+}
+
+impl TaskLossBenchSetting {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::ModelDefault => "model-default",
+            Self::Disabled => "disabled",
+            Self::Threshold(_) => "threshold-0.7",
+        }
+    }
+}
+
 const VIDEO_CASES: &[VideoCase] = &[
     VideoCase {
         name: "720p",
@@ -71,10 +118,9 @@ const MODE_CASES: &[ModeCase] = &[
         mode: AutoGazeInferenceMode::ResizeToModelInput,
     },
     ModeCase {
-        name: "tile-224",
-        mode: AutoGazeInferenceMode::TiledFullResolution {
+        name: "anyres-tile-224",
+        mode: AutoGazeInferenceMode::TiledResizeToGrid {
             tile_size: MODEL_INPUT_SIZE,
-            stride: MODEL_INPUT_SIZE,
         },
     },
 ];
@@ -115,9 +161,85 @@ const BATCH: usize = 1;
 const FRAMES: usize = 2;
 const CHANNELS: usize = 3;
 const REAL_TOP_K: usize = 10;
+const REAL_TILE_BATCH_CASES: &[(usize, usize)] = &[(2, 64), (10, 8), (10, 64), (24, 8), (24, 64)];
+const REAL_TILE_VIDEO_CASES: &[TileVideoCase] = &[
+    TileVideoCase {
+        name: "720p-2f",
+        width: 1280,
+        height: 720,
+        frames: 2,
+    },
+    TileVideoCase {
+        name: "1080p-2f",
+        width: 1920,
+        height: 1080,
+        frames: 2,
+    },
+    TileVideoCase {
+        name: "720p-16f",
+        width: 1280,
+        height: 720,
+        frames: 16,
+    },
+    TileVideoCase {
+        name: "1080p-16f",
+        width: 1920,
+        height: 1080,
+        frames: 16,
+    },
+];
+const REAL_CACHE_CASES: &[CacheCase] = &[
+    CacheCase {
+        name: "720p-2f-max10",
+        width: 1280,
+        height: 720,
+        frames: 2,
+        max_tokens: 10,
+    },
+    CacheCase {
+        name: "1080p-2f-max10",
+        width: 1920,
+        height: 1080,
+        frames: 2,
+        max_tokens: 10,
+    },
+    CacheCase {
+        name: "720p-2f-max24",
+        width: 1280,
+        height: 720,
+        frames: 2,
+        max_tokens: 24,
+    },
+    CacheCase {
+        name: "1080p-2f-max24",
+        width: 1920,
+        height: 1080,
+        frames: 2,
+        max_tokens: 24,
+    },
+    CacheCase {
+        name: "720p-16f-max10",
+        width: 1280,
+        height: 720,
+        frames: 16,
+        max_tokens: 10,
+    },
+    CacheCase {
+        name: "1080p-16f-max10",
+        width: 1920,
+        height: 1080,
+        frames: 16,
+        max_tokens: 10,
+    },
+];
+const REAL_TASK_LOSS_CASES: &[TaskLossBenchSetting] = &[
+    TaskLossBenchSetting::ModelDefault,
+    TaskLossBenchSetting::Disabled,
+    TaskLossBenchSetting::Threshold(0.7),
+];
 const BLEND_ALPHA: f32 = 0.55;
 const KEYFRAME_DURATION: usize = 30;
-const TILE_BATCH_CASES: &[usize] = &[1, 2, 4, 8, 16];
+const TILE_BATCH_CASES: &[usize] = &[1, 2, 4, 8, 16, 32, 64];
 
 fn bench_embed_video(c: &mut Criterion) {
     let mut group = c.benchmark_group("autogaze_embed_video");
@@ -165,6 +287,141 @@ fn bench_real_trace_video(c: &mut Criterion) {
 
     #[cfg(feature = "cuda")]
     register_cuda_real_trace(&mut group, &hf_dir);
+
+    group.finish();
+}
+
+fn bench_real_task_loss(c: &mut Criterion) {
+    let Some(hf_dir) = real_model_dir() else {
+        eprintln!(
+            "skipping real AutoGaze task-loss benchmarks: set AUTOGAZE_HF_DIR to a Hugging Face snapshot"
+        );
+        return;
+    };
+
+    let mut group = c.benchmark_group("autogaze_real_task_loss");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(6));
+
+    #[cfg(feature = "webgpu")]
+    if let Some(device) = webgpu_device() {
+        register_real_task_loss::<burn::backend::WebGpu<f32, i32>>(
+            &mut group, "webgpu", &hf_dir, device,
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    register_real_task_loss::<burn::backend::Cuda<f32, i32>>(
+        &mut group,
+        "cuda",
+        &hf_dir,
+        burn::backend::cuda::CudaDevice::default(),
+    );
+
+    group.finish();
+}
+
+fn bench_real_video_file(c: &mut Criterion) {
+    let Some(hf_dir) = real_model_dir() else {
+        eprintln!(
+            "skipping real AutoGaze video-file benchmarks: set AUTOGAZE_HF_DIR to a Hugging Face snapshot"
+        );
+        return;
+    };
+    let Some(video_path) = real_video_path() else {
+        eprintln!(
+            "skipping real AutoGaze video-file benchmarks: set AUTOGAZE_VIDEO or provide /home/mosure/Videos/birds.mp4"
+        );
+        return;
+    };
+
+    let mut group = c.benchmark_group("autogaze_real_video_file");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(6));
+
+    #[cfg(feature = "webgpu")]
+    if let Some(device) = webgpu_device() {
+        register_real_video_file::<burn::backend::WebGpu<f32, i32>>(
+            &mut group,
+            "webgpu",
+            &hf_dir,
+            &video_path,
+            device,
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    register_real_video_file::<burn::backend::Cuda<f32, i32>>(
+        &mut group,
+        "cuda",
+        &hf_dir,
+        &video_path,
+        burn::backend::cuda::CudaDevice::default(),
+    );
+
+    group.finish();
+}
+
+fn bench_real_tile_batch_size(c: &mut Criterion) {
+    let Some(hf_dir) = real_model_dir() else {
+        eprintln!(
+            "skipping real AutoGaze tile-batch benchmarks: set AUTOGAZE_HF_DIR to a Hugging Face snapshot"
+        );
+        return;
+    };
+
+    let mut group = c.benchmark_group("autogaze_real_tile_batch_size");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(5));
+
+    #[cfg(feature = "webgpu")]
+    if let Some(device) = webgpu_device() {
+        register_real_tile_batch_size::<burn::backend::WebGpu<f32, i32>>(
+            &mut group, "webgpu", &hf_dir, device,
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    register_real_tile_batch_size::<burn::backend::Cuda<f32, i32>>(
+        &mut group,
+        "cuda",
+        &hf_dir,
+        burn::backend::cuda::CudaDevice::default(),
+    );
+
+    group.finish();
+}
+
+fn bench_real_kv_cache(c: &mut Criterion) {
+    let Some(hf_dir) = real_model_dir() else {
+        eprintln!(
+            "skipping real AutoGaze KV-cache benchmarks: set AUTOGAZE_HF_DIR to a Hugging Face snapshot"
+        );
+        return;
+    };
+
+    let mut group = c.benchmark_group("autogaze_real_kv_cache");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(5));
+
+    #[cfg(feature = "webgpu")]
+    if let Some(device) = webgpu_device() {
+        register_real_kv_cache::<burn::backend::WebGpu<f32, i32>>(
+            &mut group, "webgpu", &hf_dir, device,
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    register_real_kv_cache::<burn::backend::Cuda<f32, i32>>(
+        &mut group,
+        "cuda",
+        &hf_dir,
+        burn::backend::cuda::CudaDevice::default(),
+    );
 
     group.finish();
 }
@@ -461,6 +718,246 @@ fn register_real_trace<B>(
     }
 }
 
+fn register_real_task_loss<B>(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    backend: &str,
+    hf_dir: &Path,
+    device: B::Device,
+) where
+    B: Backend,
+    B::Device: Clone,
+{
+    let Some(base_pipeline) = run_optional(backend, || {
+        AutoGazePipeline::<B>::from_hf_dir(hf_dir, &device)
+            .expect("load real AutoGaze model")
+            .with_max_gaze_tokens_each_frame(REAL_TOP_K)
+    }) else {
+        return;
+    };
+
+    for &case in VIDEO_CASES {
+        for &mode in MODE_CASES {
+            for &setting in REAL_TASK_LOSS_CASES {
+                let mut pipeline = base_pipeline.clone();
+                match setting {
+                    TaskLossBenchSetting::ModelDefault => {}
+                    TaskLossBenchSetting::Disabled => pipeline.set_task_loss_requirement(None),
+                    TaskLossBenchSetting::Threshold(threshold) => {
+                        pipeline.set_task_loss_requirement(Some(threshold));
+                    }
+                }
+                let video = deterministic_video::<B>(
+                    BATCH,
+                    FRAMES,
+                    CHANNELS,
+                    case.height,
+                    case.width,
+                    &device,
+                );
+                group.throughput(Throughput::Elements(case.frames_per_batch()));
+                group.bench_with_input(
+                    BenchmarkId::new(
+                        format!("{backend}/{}/{}", mode.name, setting.name()),
+                        case.name,
+                    ),
+                    &(case, mode, setting),
+                    |b, _| {
+                        b.iter_batched(
+                            || video.clone(),
+                            |video| {
+                                black_box(
+                                    pipeline.trace_video_with_mode(video, REAL_TOP_K, mode.mode),
+                                );
+                                B::sync(&device).expect("backend sync");
+                            },
+                            BatchSize::SmallInput,
+                        );
+                    },
+                );
+            }
+        }
+    }
+}
+
+fn register_real_video_file<B>(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    backend: &str,
+    hf_dir: &Path,
+    video_path: &Path,
+    device: B::Device,
+) where
+    B: Backend,
+    B::Device: Clone,
+{
+    let Some(base_pipeline) = run_optional(backend, || {
+        AutoGazePipeline::<B>::from_hf_dir(hf_dir, &device)
+            .expect("load real AutoGaze model")
+            .with_max_gaze_tokens_each_frame(REAL_TOP_K)
+    }) else {
+        return;
+    };
+
+    for &case in VIDEO_CASES {
+        let Some(rgba) = decode_video_rgba(video_path, case.width, case.height, FRAMES) else {
+            continue;
+        };
+        for &mode in MODE_CASES {
+            let pipeline = base_pipeline.clone();
+            group.throughput(Throughput::Elements(case.frames_per_batch()));
+            group.bench_with_input(
+                BenchmarkId::new(format!("{backend}/{}", mode.name), case.name),
+                &(case, mode),
+                |b, _| {
+                    b.iter_batched(
+                        || rgba.clone(),
+                        |rgba| {
+                            black_box(
+                                pipeline
+                                    .trace_rgba_clip_with_mode(
+                                        &rgba,
+                                        AutoGazeRgbaClipShape::new(FRAMES, case.height, case.width),
+                                        REAL_TOP_K,
+                                        mode.mode,
+                                        &device,
+                                    )
+                                    .expect("trace real video RGBA clip"),
+                            );
+                            B::sync(&device).expect("backend sync");
+                        },
+                        BatchSize::SmallInput,
+                    );
+                },
+            );
+        }
+    }
+}
+
+fn register_real_tile_batch_size<B>(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    backend: &str,
+    hf_dir: &Path,
+    device: B::Device,
+) where
+    B: Backend,
+    B::Device: Clone,
+{
+    let Some(model) = run_optional(backend, || {
+        AutoGazePipeline::<B>::from_hf_dir(hf_dir, &device).expect("load real AutoGaze model")
+    }) else {
+        return;
+    };
+    let mode = AutoGazeInferenceMode::TiledResizeToGrid {
+        tile_size: MODEL_INPUT_SIZE,
+    };
+
+    for &case in REAL_TILE_VIDEO_CASES {
+        for &(top_k, tile_batch_size) in REAL_TILE_BATCH_CASES {
+            let pipeline = model
+                .clone()
+                .with_max_gaze_tokens_each_frame(top_k)
+                .with_tile_batch_size(tile_batch_size);
+            let video = deterministic_video::<B>(
+                BATCH,
+                case.frames,
+                CHANNELS,
+                case.height,
+                case.width,
+                &device,
+            );
+            group.throughput(Throughput::Elements(case.frames_per_batch()));
+            group.bench_with_input(
+                BenchmarkId::new(
+                    format!("{backend}/top-k-{top_k}/tile-batch-{tile_batch_size}"),
+                    case.name,
+                ),
+                &case,
+                |b, _| {
+                    b.iter_batched(
+                        || video.clone(),
+                        |video| {
+                            black_box(pipeline.trace_video_with_mode(video, top_k, mode));
+                            B::sync(&device).expect("backend sync");
+                        },
+                        BatchSize::SmallInput,
+                    );
+                },
+            );
+        }
+    }
+}
+
+fn register_real_kv_cache<B>(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    backend: &str,
+    hf_dir: &Path,
+    device: B::Device,
+) where
+    B: Backend,
+    B::Device: Clone,
+{
+    let Some(model) = run_optional(backend, || {
+        NativeAutoGazeModel::<B>::from_hf_dir(hf_dir, &device).expect("load real AutoGaze model")
+    }) else {
+        return;
+    };
+
+    for &case in REAL_CACHE_CASES {
+        let video = deterministic_video::<B>(
+            BATCH,
+            case.frames,
+            CHANNELS,
+            case.height,
+            case.width,
+            &device,
+        );
+        group.throughput(Throughput::Elements(case.frames_per_batch()));
+
+        group.bench_with_input(
+            BenchmarkId::new(
+                format!("{backend}/kv-cache/max-{}", case.max_tokens),
+                case.name,
+            ),
+            &case,
+            |b, _| {
+                b.iter_batched(
+                    || video.clone(),
+                    |video| {
+                        black_box(
+                            model
+                                .gazing_model
+                                .generate_cached(video, case.max_tokens, None),
+                        );
+                        B::sync(&device).expect("backend sync");
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new(
+                format!("{backend}/full-seq/max-{}", case.max_tokens),
+                case.name,
+            ),
+            &case,
+            |b, _| {
+                b.iter_batched(
+                    || video.clone(),
+                    |video| {
+                        black_box(model.gazing_model.generate_uncached(
+                            video,
+                            case.max_tokens,
+                            None,
+                        ));
+                        B::sync(&device).expect("backend sync");
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+}
+
 fn bench_embed_case<B>(
     group: &mut BenchmarkGroup<'_, WallTime>,
     backend: &str,
@@ -541,9 +1038,8 @@ fn register_tile_batch_size<B>(
         scales: "32+64+112+224",
         num_vision_tokens_each_frame: 265,
     };
-    let mode = AutoGazeInferenceMode::TiledFullResolution {
+    let mode = AutoGazeInferenceMode::TiledResizeToGrid {
         tile_size: MODEL_INPUT_SIZE,
-        stride: MODEL_INPUT_SIZE,
     };
 
     if run_optional(backend, || {
@@ -1038,13 +1534,82 @@ fn real_model_dir() -> Option<PathBuf> {
     default.exists().then_some(default)
 }
 
+fn real_video_path() -> Option<PathBuf> {
+    if let Ok(path) = env::var("AUTOGAZE_VIDEO") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Some(path);
+        }
+        eprintln!(
+            "AUTOGAZE_VIDEO does not exist, skipping real video benchmarks: {}",
+            path.display()
+        );
+        return None;
+    }
+
+    let default = PathBuf::from("/home/mosure/Videos/birds.mp4");
+    default.exists().then_some(default)
+}
+
+fn decode_video_rgba(path: &Path, width: usize, height: usize, frames: usize) -> Option<Vec<u8>> {
+    let expected = frames
+        .checked_mul(width)?
+        .checked_mul(height)?
+        .checked_mul(4)?;
+    let scale = format!("scale={width}:{height}:flags=bicubic");
+    let frames_arg = frames.to_string();
+    let output = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-i",
+            path.to_str()?,
+            "-vf",
+            &scale,
+            "-frames:v",
+            &frames_arg,
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgba",
+            "-",
+        ])
+        .output();
+    let output = match output {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => {
+            eprintln!(
+                "skipping real video case {width}x{height}: ffmpeg failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return None;
+        }
+        Err(err) => {
+            eprintln!("skipping real video case {width}x{height}: ffmpeg unavailable: {err}");
+            return None;
+        }
+    };
+    if output.stdout.len() < expected {
+        eprintln!(
+            "skipping real video case {width}x{height}: decoded {} bytes, expected {expected}",
+            output.stdout.len()
+        );
+        return None;
+    }
+    Some(output.stdout[..expected].to_vec())
+}
+
 criterion_group!(
     benches,
     bench_embed_video,
     bench_trace_video,
     bench_real_trace_video,
+    bench_real_task_loss,
+    bench_real_video_file,
     bench_rgba_e2e_video,
     bench_visualization,
-    bench_tile_batch_size
+    bench_tile_batch_size,
+    bench_real_tile_batch_size,
+    bench_real_kv_cache
 );
 criterion_main!(benches);

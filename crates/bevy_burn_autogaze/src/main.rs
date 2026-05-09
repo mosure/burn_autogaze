@@ -1,17 +1,19 @@
-#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 use bevy_burn_autogaze::{
-    BevyAutoGazeMode, DEFAULT_REALTIME_INFERENCE_WIDTH, DEFAULT_REALTIME_TOP_K,
+    BevyAutoGazeMode, DEFAULT_TILED_INFERENCE_WIDTH, default_frames_per_clip,
+    default_inference_dimensions, default_max_gaze_tokens_each_frame, default_tile_batch_size,
+    default_top_k,
 };
 use bevy_burn_autogaze::{BevyBurnAutoGazeConfig, run_app};
-#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 use burn_autogaze::AutoGazeVisualizationMode;
 
-#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 use clap::{ArgAction, Parser, ValueEnum};
-#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 use std::{fmt, path::PathBuf, str::FromStr};
 
-#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum NativeInferenceMode {
     #[value(
@@ -35,7 +37,7 @@ enum NativeInferenceMode {
     Tiled,
 }
 
-#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 impl fmt::Display for NativeInferenceMode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
@@ -45,7 +47,7 @@ impl fmt::Display for NativeInferenceMode {
     }
 }
 
-#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 impl From<NativeInferenceMode> for BevyAutoGazeMode {
     fn from(mode: NativeInferenceMode) -> Self {
         match mode {
@@ -55,7 +57,7 @@ impl From<NativeInferenceMode> for BevyAutoGazeMode {
     }
 }
 
-#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum NativeVisualizationMode {
     #[value(
@@ -74,7 +76,7 @@ enum NativeVisualizationMode {
     Interframe,
 }
 
-#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 impl fmt::Display for NativeVisualizationMode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
@@ -84,7 +86,7 @@ impl fmt::Display for NativeVisualizationMode {
     }
 }
 
-#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 impl From<NativeVisualizationMode> for AutoGazeVisualizationMode {
     fn from(mode: NativeVisualizationMode) -> Self {
         match mode {
@@ -94,7 +96,7 @@ impl From<NativeVisualizationMode> for AutoGazeVisualizationMode {
     }
 }
 
-#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum TaskLossRequirementArg {
     ModelDefault,
@@ -102,7 +104,7 @@ enum TaskLossRequirementArg {
     Value(f32),
 }
 
-#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 impl FromStr for TaskLossRequirementArg {
     type Err = String;
 
@@ -115,7 +117,7 @@ impl FromStr for TaskLossRequirementArg {
     }
 }
 
-#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Parser)]
 #[command(
     about = "native Bevy viewer for burn_autogaze",
@@ -197,28 +199,25 @@ struct NativeArgs {
         long,
         value_name = "COUNT",
         value_parser = parse_nonzero_usize,
-        default_value_t = DEFAULT_REALTIME_TOP_K,
-        help = "Number of highest-scoring gaze tokens to visualize per trace."
+        help = "Number of highest-scoring gaze tokens to visualize per trace. Defaults to 24 in realtime and 2 per tile in tiled mode."
     )]
-    top_k: usize,
+    top_k: Option<usize>,
 
     #[arg(
         long,
         value_name = "COUNT",
         value_parser = parse_usize,
-        default_value_t = DEFAULT_REALTIME_TOP_K,
-        help = "Model-side generated-token cap. Use 0 for the model default."
+        help = "Model-side generated-token cap. Defaults to 0, which uses the model's configured inference budget."
     )]
-    max_gaze_tokens_each_frame: usize,
+    max_gaze_tokens_each_frame: Option<usize>,
 
     #[arg(
         long,
         value_name = "COUNT",
         value_parser = parse_nonzero_usize,
-        default_value_t = 8,
-        help = "Number of 224px tiles traced together in tiled mode."
+        help = "Number of 224px tiles traced together in tiled mode. Defaults to 64 so 720p is one tile batch."
     )]
-    tile_batch_size: usize,
+    tile_batch_size: Option<usize>,
 
     #[arg(
         long,
@@ -238,10 +237,9 @@ struct NativeArgs {
         long,
         value_name = "COUNT",
         value_parser = parse_nonzero_usize,
-        default_value_t = 2,
-        help = "Number of input frames buffered per AutoGaze clip."
+        help = "Number of input frames buffered per AutoGaze clip. Defaults to 2; use 16 to match the upstream long-context setting."
     )]
-    frames_per_clip: usize,
+    frames_per_clip: Option<usize>,
 
     #[arg(
         long,
@@ -301,12 +299,20 @@ struct NativeArgs {
         long,
         default_value_t = false,
         action = ArgAction::SetTrue,
-        help = "Log pack, trace, visualization, display, and total timing periodically."
+        help = "Log source capture, resize/prep, pack, input upload/preprocess, model, visualization, display, and total timing periodically."
     )]
     log_pipeline_timing: bool,
+
+    #[arg(
+        long,
+        value_name = "COUNT",
+        value_parser = parse_nonzero_usize,
+        help = "Process COUNT inference outputs, print a JSON perf summary, then exit."
+    )]
+    perf_summary_frames: Option<usize>,
 }
 
-#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 impl From<NativeArgs> for BevyBurnAutoGazeConfig {
     fn from(args: NativeArgs) -> Self {
         let mode = BevyAutoGazeMode::from(args.mode);
@@ -314,6 +320,16 @@ impl From<NativeArgs> for BevyBurnAutoGazeConfig {
         let defaults = BevyBurnAutoGazeConfig::default();
         let (inference_width, inference_height) =
             inference_dimensions_for_args(mode, args.inference_width, args.inference_height);
+        let top_k = args.top_k.unwrap_or_else(|| default_top_k(mode));
+        let max_gaze_tokens_each_frame = args
+            .max_gaze_tokens_each_frame
+            .unwrap_or_else(|| default_max_gaze_tokens_each_frame(mode));
+        let tile_batch_size = args
+            .tile_batch_size
+            .unwrap_or_else(|| default_tile_batch_size(mode));
+        let frames_per_clip = args
+            .frames_per_clip
+            .unwrap_or_else(|| default_frames_per_clip(mode));
         let (task_loss_requirement, disable_task_loss_requirement) = task_loss_config(
             args.task_loss_requirement,
             args.disable_task_loss_requirement,
@@ -327,12 +343,12 @@ impl From<NativeArgs> for BevyBurnAutoGazeConfig {
             image_path: args.image_path,
             load_model: args.load_model && !args.no_load_model,
             mode,
-            top_k: args.top_k,
-            max_gaze_tokens_each_frame: args.max_gaze_tokens_each_frame,
-            tile_batch_size: args.tile_batch_size,
+            top_k,
+            max_gaze_tokens_each_frame,
+            tile_batch_size,
             task_loss_requirement,
             disable_task_loss_requirement,
-            frames_per_clip: args.frames_per_clip,
+            frames_per_clip,
             inference_width,
             inference_height: inference_height.or(defaults.inference_height),
             mask_cell_scale: args.mask_cell_scale,
@@ -340,27 +356,25 @@ impl From<NativeArgs> for BevyBurnAutoGazeConfig {
             visualization_mode,
             keyframe_duration: args.keyframe_duration,
             log_pipeline_timing: args.log_pipeline_timing,
+            perf_summary_frames: args.perf_summary_frames,
             ..defaults
         }
     }
 }
 
-#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 fn inference_dimensions_for_args(
     mode: BevyAutoGazeMode,
     width: Option<u32>,
     height: Option<u32>,
 ) -> (Option<u32>, Option<u32>) {
     match (width, height) {
-        (None, None) => match mode {
-            BevyAutoGazeMode::Resize224 => (Some(DEFAULT_REALTIME_INFERENCE_WIDTH), None),
-            BevyAutoGazeMode::Tile224 => (Some(1280), None),
-        },
+        (None, None) => default_inference_dimensions(mode),
         configured => configured,
     }
 }
 
-#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 fn task_loss_config(arg: Option<TaskLossRequirementArg>, disable: bool) -> (Option<f32>, bool) {
     if disable {
         return (None, true);
@@ -372,14 +386,14 @@ fn task_loss_config(arg: Option<TaskLossRequirementArg>, disable: bool) -> (Opti
     }
 }
 
-#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_usize(value: &str) -> Result<usize, String> {
     value
         .parse()
         .map_err(|_| format!("expected an unsigned integer, got `{value}`"))
 }
 
-#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_nonzero_usize(value: &str) -> Result<usize, String> {
     let parsed = parse_usize(value)?;
     if parsed == 0 {
@@ -388,7 +402,7 @@ fn parse_nonzero_usize(value: &str) -> Result<usize, String> {
     Ok(parsed)
 }
 
-#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_positive_u32(value: &str) -> Result<u32, String> {
     let parsed = value
         .parse::<u32>()
@@ -399,7 +413,7 @@ fn parse_positive_u32(value: &str) -> Result<u32, String> {
     Ok(parsed)
 }
 
-#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_positive_f32(value: &str) -> Result<f32, String> {
     let parsed = value
         .parse::<f32>()
@@ -410,7 +424,7 @@ fn parse_positive_f32(value: &str) -> Result<f32, String> {
     Ok(parsed)
 }
 
-#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_nonnegative_f32(value: &str) -> Result<f32, String> {
     let parsed = value
         .parse::<f32>()
@@ -421,7 +435,7 @@ fn parse_nonnegative_f32(value: &str) -> Result<f32, String> {
     Ok(parsed)
 }
 
-#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_alpha(value: &str) -> Result<f32, String> {
     let parsed = value
         .parse::<f32>()
@@ -435,7 +449,7 @@ fn parse_alpha(value: &str) -> Result<f32, String> {
 fn main() {
     let config = runtime_config();
 
-    #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+    #[cfg(not(target_arch = "wasm32"))]
     {
         if config.image_path.is_none() {
             let request = camera_request_for_config(&config);
@@ -448,22 +462,24 @@ fn main() {
     run_app(config);
 }
 
-#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 fn runtime_config() -> BevyBurnAutoGazeConfig {
     NativeArgs::parse().into()
 }
 
-#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 fn camera_request_for_config(
     config: &BevyBurnAutoGazeConfig,
 ) -> bevy_burn_autogaze::platform::camera::CameraRequest {
     match config.mode {
         BevyAutoGazeMode::Resize224 => camera_request_with_fallback(config, 640, 360),
-        BevyAutoGazeMode::Tile224 => camera_request_with_fallback(config, 1280, 720),
+        BevyAutoGazeMode::Tile224 => {
+            camera_request_with_fallback(config, DEFAULT_TILED_INFERENCE_WIDTH, 720)
+        }
     }
 }
 
-#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 fn camera_request_with_fallback(
     config: &BevyBurnAutoGazeConfig,
     fallback_width: u32,
@@ -495,15 +511,18 @@ fn camera_request_with_fallback(
 
 #[cfg(target_arch = "wasm32")]
 fn runtime_config() -> BevyBurnAutoGazeConfig {
-    #[cfg(feature = "web")]
     console_error_panic_hook::set_once();
 
     BevyBurnAutoGazeConfig::from_browser_query()
 }
 
-#[cfg(all(test, feature = "native", not(target_arch = "wasm32")))]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    use bevy_burn_autogaze::{
+        DEFAULT_MODEL_GENERATION_BUDGET, DEFAULT_REALTIME_INFERENCE_WIDTH,
+        DEFAULT_TILED_INFERENCE_WIDTH, DEFAULT_TILED_TILE_BATCH_SIZE, DEFAULT_TILED_TOP_K,
+    };
 
     #[test]
     fn native_cli_defaults_to_realtime_640_width_without_forcing_height() {
@@ -517,8 +536,52 @@ mod tests {
     fn native_cli_uses_higher_fidelity_default_for_tiled_mode() {
         assert_eq!(
             inference_dimensions_for_args(BevyAutoGazeMode::Tile224, None, None),
-            (Some(1280), None)
+            (Some(DEFAULT_TILED_INFERENCE_WIDTH), None)
         );
+    }
+
+    #[test]
+    fn native_cli_uses_performant_tiled_defaults() {
+        let args = NativeArgs {
+            press_esc_to_close: true,
+            show_fps: true,
+            show_gaze_ratio: true,
+            show_psnr: false,
+            model_dir: bevy_burn_autogaze::DEFAULT_NATIVE_MODEL_DIR.into(),
+            image_path: None,
+            load_model: true,
+            no_load_model: false,
+            mode: NativeInferenceMode::Tiled,
+            top_k: None,
+            max_gaze_tokens_each_frame: None,
+            tile_batch_size: None,
+            task_loss_requirement: None,
+            disable_task_loss_requirement: false,
+            frames_per_clip: None,
+            inference_width: None,
+            inference_height: None,
+            mask_cell_scale: 1.0,
+            blend_alpha: bevy_burn_autogaze::DEFAULT_BLEND_ALPHA,
+            visualization_mode: NativeVisualizationMode::Interframe,
+            keyframe_duration: bevy_burn_autogaze::DEFAULT_KEYFRAME_DURATION,
+            log_pipeline_timing: false,
+            perf_summary_frames: None,
+        };
+        let config = BevyBurnAutoGazeConfig::from(args);
+
+        assert_eq!(config.mode, BevyAutoGazeMode::Tile224);
+        assert_eq!(config.top_k, DEFAULT_TILED_TOP_K);
+        assert_eq!(
+            config.max_gaze_tokens_each_frame,
+            DEFAULT_MODEL_GENERATION_BUDGET
+        );
+        assert_eq!(config.tile_batch_size, DEFAULT_TILED_TILE_BATCH_SIZE);
+        assert_eq!(
+            config.frames_per_clip,
+            bevy_burn_autogaze::DEFAULT_TILED_FRAMES_PER_CLIP
+        );
+        assert_eq!(config.inference_width, Some(DEFAULT_TILED_INFERENCE_WIDTH));
+        assert_eq!(config.inference_height, None);
     }
 
     #[test]

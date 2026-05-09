@@ -1,4 +1,4 @@
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 pub mod camera {
     use std::sync::{
         Arc, Mutex,
@@ -245,7 +245,7 @@ pub mod camera {
     }
 }
 
-#[cfg(feature = "web")]
+#[cfg(target_arch = "wasm32")]
 pub mod camera {
     use std::cell::RefCell;
 

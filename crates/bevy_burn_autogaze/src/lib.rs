@@ -25,15 +25,15 @@ use bevy::{
     ui::widget::ImageNode,
     window::PrimaryWindow,
 };
-use bevy_burn::{BevyBurnBridgePlugin, BevyBurnHandle, BindingDirection, BurnDevice, TransferKind};
-use burn::tensor::{Int, Tensor};
+use bevy_burn::{BevyBurnBridgePlugin, BurnDevice};
+use burn::tensor::Tensor;
 #[cfg(test)]
 use burn_autogaze::fixation_scale_mask_rgba;
 #[cfg(target_arch = "wasm32")]
 use burn_autogaze::{AutoGazeConfig, AutoGazeLoadOptions, NativeAutoGazeModel};
 use burn_autogaze::{
     AutoGazeInferenceMode, AutoGazePipeline, AutoGazeRgbaClipShape, AutoGazeVisualizationMode,
-    AutoGazeVisualizationState, FixationPoint,
+    AutoGazeVisualizationState, FixationPoint, rgba_clip_to_tensor,
 };
 use image::{RgbaImage, imageops::FilterType};
 
@@ -50,6 +50,12 @@ pub const DEFAULT_WEIGHTS_URL: &str =
 const MODEL_INPUT_SIZE: usize = 224;
 pub const DEFAULT_REALTIME_INFERENCE_WIDTH: u32 = 640;
 pub const DEFAULT_REALTIME_TOP_K: usize = 24;
+pub const DEFAULT_MODEL_GENERATION_BUDGET: usize = 0;
+pub const DEFAULT_REALTIME_FRAMES_PER_CLIP: usize = 2;
+pub const DEFAULT_TILED_INFERENCE_WIDTH: u32 = 1280;
+pub const DEFAULT_TILED_TOP_K: usize = 2;
+pub const DEFAULT_TILED_FRAMES_PER_CLIP: usize = 2;
+pub const DEFAULT_TILED_TILE_BATCH_SIZE: usize = 64;
 const MAX_IN_FLIGHT_TASKS: usize = 1;
 const MAX_SPARE_CLIP_BUFFERS: usize = 2;
 pub const DEFAULT_KEYFRAME_DURATION: usize = 30;
@@ -97,9 +103,8 @@ impl BevyAutoGazeMode {
     pub const fn inference_mode(self) -> AutoGazeInferenceMode {
         match self {
             Self::Resize224 => AutoGazeInferenceMode::ResizeToModelInput,
-            Self::Tile224 => AutoGazeInferenceMode::TiledFullResolution {
+            Self::Tile224 => AutoGazeInferenceMode::TiledResizeToGrid {
                 tile_size: MODEL_INPUT_SIZE,
-                stride: MODEL_INPUT_SIZE,
             },
         }
     }
@@ -153,6 +158,7 @@ pub struct BevyBurnAutoGazeConfig {
     pub visualization_mode: AutoGazeVisualizationMode,
     pub keyframe_duration: usize,
     pub log_pipeline_timing: bool,
+    pub perf_summary_frames: Option<usize>,
 }
 
 impl Default for BevyBurnAutoGazeConfig {
@@ -169,11 +175,11 @@ impl Default for BevyBurnAutoGazeConfig {
             image_path: None,
             mode: BevyAutoGazeMode::Resize224,
             top_k: DEFAULT_REALTIME_TOP_K,
-            max_gaze_tokens_each_frame: DEFAULT_REALTIME_TOP_K,
-            tile_batch_size: 8,
+            max_gaze_tokens_each_frame: DEFAULT_MODEL_GENERATION_BUDGET,
+            tile_batch_size: DEFAULT_TILED_TILE_BATCH_SIZE,
             task_loss_requirement: None,
             disable_task_loss_requirement: false,
-            frames_per_clip: 2,
+            frames_per_clip: DEFAULT_REALTIME_FRAMES_PER_CLIP,
             inference_width: Some(DEFAULT_REALTIME_INFERENCE_WIDTH),
             inference_height: None,
             mask_cell_scale: 1.0,
@@ -181,13 +187,14 @@ impl Default for BevyBurnAutoGazeConfig {
             visualization_mode: AutoGazeVisualizationMode::FullBlend,
             keyframe_duration: DEFAULT_KEYFRAME_DURATION,
             log_pipeline_timing: false,
+            perf_summary_frames: None,
         }
     }
 }
 
 impl BevyBurnAutoGazeConfig {
     pub fn apply_option(&mut self, key: &str, value: &str) -> Result<(), String> {
-        let key = key.trim().replace('_', "-").to_ascii_lowercase();
+        let key = normalized_option_key(key);
         match key.as_str() {
             "" => Ok(()),
             "press-esc-to-close" => {
@@ -298,6 +305,10 @@ impl BevyBurnAutoGazeConfig {
                 self.log_pipeline_timing = parse_bool_option(&key, value)?;
                 Ok(())
             }
+            "perf-summary-frames" | "perf-frames" | "benchmark-frames" => {
+                self.perf_summary_frames = parse_optional_usize_option(&key, value)?;
+                Ok(())
+            }
             other => Err(format!("unsupported bevy_burn_autogaze option `{other}`")),
         }
     }
@@ -305,17 +316,71 @@ impl BevyBurnAutoGazeConfig {
     pub fn apply_query_string(&mut self, query: &str) -> Vec<String> {
         let query = query.strip_prefix('?').unwrap_or(query);
         let mut errors = Vec::new();
+        let mut saw_top_k = false;
+        let mut saw_max_gaze_tokens = false;
+        let mut saw_tile_batch_size = false;
+        let mut saw_inference_width = false;
+        let mut saw_inference_height = false;
+        let mut saw_mode = false;
+        let mut saw_frames_per_clip = false;
 
         for pair in query.split('&').filter(|pair| !pair.is_empty()) {
             let (key, value) = pair.split_once('=').unwrap_or((pair, "true"));
             let key = decode_url_component(key);
             let value = decode_url_component(value);
+            match normalized_option_key(&key).as_str() {
+                "mode" => saw_mode = true,
+                "top-k" => saw_top_k = true,
+                "max-gaze-tokens-each-frame" => saw_max_gaze_tokens = true,
+                "tile-batch-size" | "tile-batch" | "tiles-per-batch" => {
+                    saw_tile_batch_size = true;
+                }
+                "frames-per-clip" => saw_frames_per_clip = true,
+                "inference-width" | "input-width" | "source-width" | "frame-width" | "width" => {
+                    saw_inference_width = true;
+                }
+                "inference-height" | "input-height" | "source-height" | "frame-height"
+                | "height" => {
+                    saw_inference_height = true;
+                }
+                _ => {}
+            }
             if let Err(err) = self.apply_option(&key, &value) {
                 errors.push(err);
             }
         }
 
+        if saw_mode {
+            self.apply_implicit_mode_defaults(ImplicitModeDefaults {
+                top_k: !saw_top_k,
+                max_gaze_tokens_each_frame: !saw_max_gaze_tokens,
+                tile_batch_size: !saw_tile_batch_size,
+                frames_per_clip: !saw_frames_per_clip,
+                inference_dimensions: !saw_inference_width && !saw_inference_height,
+            });
+        }
+
         errors
+    }
+
+    pub fn apply_implicit_mode_defaults(&mut self, defaults: ImplicitModeDefaults) {
+        if defaults.top_k {
+            self.top_k = default_top_k(self.mode);
+        }
+        if defaults.max_gaze_tokens_each_frame {
+            self.max_gaze_tokens_each_frame = default_max_gaze_tokens_each_frame(self.mode);
+        }
+        if defaults.tile_batch_size {
+            self.tile_batch_size = default_tile_batch_size(self.mode);
+        }
+        if defaults.frames_per_clip {
+            self.frames_per_clip = default_frames_per_clip(self.mode);
+        }
+        if defaults.inference_dimensions {
+            let (width, height) = default_inference_dimensions(self.mode);
+            self.inference_width = width;
+            self.inference_height = height;
+        }
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -333,6 +398,51 @@ impl BevyBurnAutoGazeConfig {
         }
         config
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ImplicitModeDefaults {
+    pub top_k: bool,
+    pub max_gaze_tokens_each_frame: bool,
+    pub tile_batch_size: bool,
+    pub frames_per_clip: bool,
+    pub inference_dimensions: bool,
+}
+
+pub const fn default_top_k(mode: BevyAutoGazeMode) -> usize {
+    match mode {
+        BevyAutoGazeMode::Resize224 => DEFAULT_REALTIME_TOP_K,
+        BevyAutoGazeMode::Tile224 => DEFAULT_TILED_TOP_K,
+    }
+}
+
+pub const fn default_max_gaze_tokens_each_frame(_mode: BevyAutoGazeMode) -> usize {
+    DEFAULT_MODEL_GENERATION_BUDGET
+}
+
+pub const fn default_tile_batch_size(mode: BevyAutoGazeMode) -> usize {
+    match mode {
+        BevyAutoGazeMode::Resize224 => DEFAULT_TILED_TILE_BATCH_SIZE,
+        BevyAutoGazeMode::Tile224 => DEFAULT_TILED_TILE_BATCH_SIZE,
+    }
+}
+
+pub const fn default_frames_per_clip(mode: BevyAutoGazeMode) -> usize {
+    match mode {
+        BevyAutoGazeMode::Resize224 => DEFAULT_REALTIME_FRAMES_PER_CLIP,
+        BevyAutoGazeMode::Tile224 => DEFAULT_TILED_FRAMES_PER_CLIP,
+    }
+}
+
+pub const fn default_inference_dimensions(mode: BevyAutoGazeMode) -> (Option<u32>, Option<u32>) {
+    match mode {
+        BevyAutoGazeMode::Resize224 => (Some(DEFAULT_REALTIME_INFERENCE_WIDTH), None),
+        BevyAutoGazeMode::Tile224 => (Some(DEFAULT_TILED_INFERENCE_WIDTH), None),
+    }
+}
+
+fn normalized_option_key(key: &str) -> String {
+    key.trim().replace('_', "-").to_ascii_lowercase()
 }
 
 fn parse_bool_option(key: &str, value: &str) -> Result<bool, String> {
@@ -360,6 +470,16 @@ fn parse_optional_u32_option(key: &str, value: &str) -> Result<Option<u32>, Stri
         return Err(format!("invalid zero dimension for `{key}`"));
     }
     Ok(Some(parsed))
+}
+
+fn parse_optional_usize_option(key: &str, value: &str) -> Result<Option<usize>, String> {
+    if value.trim().is_empty()
+        || value.eq_ignore_ascii_case("none")
+        || value.eq_ignore_ascii_case("off")
+    {
+        return Ok(None);
+    }
+    Ok(Some(parse_usize_option(key, value)?.max(1)))
 }
 
 fn parse_f32_option(key: &str, value: &str) -> Result<f32, String> {
@@ -431,12 +551,12 @@ impl Default for AutoGazeTexture {
 struct FrameQueue {
     width: u32,
     height: u32,
-    frames: VecDeque<RgbaImage>,
+    frames: VecDeque<Arc<RgbaImage>>,
     spare_clip_buffers: Vec<Vec<u8>>,
 }
 
 impl FrameQueue {
-    fn push(&mut self, frame: RgbaImage, max_len: usize) {
+    fn push(&mut self, frame: Arc<RgbaImage>, max_len: usize) {
         let max_len = max_len.max(1);
         let (width, height) = frame.dimensions();
         if self.width != width || self.height != height {
@@ -453,7 +573,7 @@ impl FrameQueue {
     }
 
     fn latest(&self) -> Option<&RgbaImage> {
-        self.frames.back()
+        self.frames.back().map(AsRef::as_ref)
     }
 
     fn build_clip(&mut self, max_len: usize) -> Result<Option<FrameClip>, String> {
@@ -495,6 +615,8 @@ impl FrameQueue {
             height,
             clip_len: max_len,
             rgba,
+            source_ms: 0.0,
+            prepare_ms: 0.0,
             pack_ms: elapsed_ms(pack_start),
         }))
     }
@@ -512,6 +634,8 @@ struct FrameClip {
     height: usize,
     clip_len: usize,
     rgba: Vec<u8>,
+    source_ms: f64,
+    prepare_ms: f64,
     pack_ms: f64,
 }
 
@@ -533,6 +657,86 @@ impl FrameClip {
         self.rgba
             .get(start..end)
             .ok_or_else(|| "AutoGaze clip is missing its last frame".to_string())
+    }
+}
+
+struct PreparedFrame<T> {
+    width: usize,
+    height: usize,
+    tensor: T,
+}
+
+struct RollingFrameQueue<T> {
+    width: usize,
+    height: usize,
+    frames: VecDeque<T>,
+}
+
+impl<T> Default for RollingFrameQueue<T> {
+    fn default() -> Self {
+        Self {
+            width: 0,
+            height: 0,
+            frames: VecDeque::new(),
+        }
+    }
+}
+
+impl<T: Clone> RollingFrameQueue<T> {
+    fn previous_frames(&mut self, width: usize, height: usize, count: usize) -> Vec<T> {
+        if count == 0 {
+            return Vec::new();
+        }
+        if self.width != width || self.height != height {
+            self.frames.clear();
+            self.width = width;
+            self.height = height;
+            return Vec::new();
+        }
+        self.frames
+            .iter()
+            .rev()
+            .take(count)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
+    }
+}
+
+impl<T> RollingFrameQueue<T> {
+    fn push(&mut self, frame: PreparedFrame<T>, max_len: usize) {
+        let max_len = max_len.max(1);
+        if self.width != frame.width || self.height != frame.height {
+            self.frames.clear();
+            self.width = frame.width;
+            self.height = frame.height;
+        }
+        self.frames.push_back(frame.tensor);
+        while self.frames.len() > max_len {
+            self.frames.pop_front();
+        }
+    }
+}
+
+type PreparedTensorFrame = PreparedFrame<Tensor<AutoGazeBevyBackend, 5>>;
+
+#[derive(Resource, Default)]
+struct PreparedTensorQueue(RollingFrameQueue<Tensor<AutoGazeBevyBackend, 5>>);
+
+impl PreparedTensorQueue {
+    fn previous_frames(
+        &mut self,
+        width: usize,
+        height: usize,
+        count: usize,
+    ) -> Vec<Tensor<AutoGazeBevyBackend, 5>> {
+        self.0.previous_frames(width, height, count)
+    }
+
+    fn push(&mut self, frame: PreparedTensorFrame, max_len: usize) {
+        self.0.push(frame, max_len);
     }
 }
 
@@ -644,26 +848,45 @@ impl PsnrStats {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct InferenceTiming {
+    sequence: u64,
     clip_frames: usize,
     width: usize,
     height: usize,
+    source_ms: f64,
+    prepare_ms: f64,
     pack_ms: f64,
+    input_ms: f64,
+    model_ms: f64,
     trace_ms: f64,
     sync_ms: f64,
+    visualize_cpu_ms: f64,
+    tensor_ms: f64,
     visualize_ms: f64,
     display_ms: f64,
     total_ms: f64,
+    output_rgba_bytes: usize,
+    output_tensor_bytes: usize,
 }
 
 #[derive(Resource, Clone, Debug, Default)]
 struct InferenceTimingStats {
     latest: Option<InferenceTiming>,
     last_log: Option<Timestamp>,
+    total_ms: f64,
+    model_ms: f64,
+    display_ms: f64,
+    samples: Vec<f64>,
+    emitted_summary: bool,
 }
 
 impl InferenceTimingStats {
     fn record(&mut self, timing: InferenceTiming, should_log: bool) {
+        self.total_ms += timing.total_ms;
+        self.model_ms += timing.model_ms;
+        self.display_ms += timing.display_ms;
+        self.samples.push(timing.total_ms);
         self.latest = Some(timing);
+        publish_wasm_perf_sample(self);
         if !should_log {
             return;
         }
@@ -679,18 +902,53 @@ impl InferenceTimingStats {
 
         self.last_log = Some(now);
         log(&format!(
-            "AutoGaze timing: {:.1} fps e2e ({:.1} ms) clip={} {}x{}, pack={:.1} ms, trace={:.1} ms, sync={:.1} ms, visualize={:.1} ms, display={:.1} ms",
+            "AutoGaze timing: {:.1} fps e2e ({:.1} ms) clip={} {}x{}, source={:.1} ms, prepare={:.1} ms, pack={:.1} ms, input={:.1} ms, model={:.1} ms, trace={:.1} ms, sync={:.1} ms, visualize_cpu={:.1} ms, tensor={:.1} ms, visualize={:.1} ms, display={:.1} ms, output={:.1} MiB rgba/{:.1} MiB f32",
             timing.e2e_fps(),
             timing.total_ms,
             timing.clip_frames,
             timing.width,
             timing.height,
+            timing.source_ms,
+            timing.prepare_ms,
             timing.pack_ms,
+            timing.input_ms,
+            timing.model_ms,
             timing.trace_ms,
             timing.sync_ms,
+            timing.visualize_cpu_ms,
+            timing.tensor_ms,
             timing.visualize_ms,
             timing.display_ms,
+            timing.output_rgba_bytes as f64 / (1024.0 * 1024.0),
+            timing.output_tensor_bytes as f64 / (1024.0 * 1024.0),
         ));
+    }
+
+    fn processed_frames(&self) -> usize {
+        self.samples.len()
+    }
+
+    fn summary_json(&self, target_frames: usize) -> String {
+        let processed_frames = self.processed_frames();
+        let avg_total_ms = mean_or_zero(self.total_ms, processed_frames);
+        let avg_model_ms = mean_or_zero(self.model_ms, processed_frames);
+        let avg_display_ms = mean_or_zero(self.display_ms, processed_frames);
+        let p50_total_ms = percentile_ms(&self.samples, 0.50);
+        let p95_total_ms = percentile_ms(&self.samples, 0.95);
+        serde_json::json!({
+            "target_frames": target_frames,
+            "processed_frames": processed_frames,
+            "avg_fps": fps_from_ms(avg_total_ms),
+            "avg_total_ms": avg_total_ms,
+            "p50_total_ms": p50_total_ms,
+            "p95_total_ms": p95_total_ms,
+            "avg_model_ms": avg_model_ms,
+            "avg_display_ms": avg_display_ms,
+            "latest_sequence": self.latest.map(|timing| timing.sequence).unwrap_or_default(),
+            "latest_width": self.latest.map(|timing| timing.width).unwrap_or_default(),
+            "latest_height": self.latest.map(|timing| timing.height).unwrap_or_default(),
+        })
+        .to_string()
     }
 }
 
@@ -704,6 +962,52 @@ impl InferenceTiming {
     }
 }
 
+fn mean_or_zero(total: f64, count: usize) -> f64 {
+    if count > 0 { total / count as f64 } else { 0.0 }
+}
+
+fn fps_from_ms(ms: f64) -> f64 {
+    if ms > 0.0 { 1000.0 / ms } else { 0.0 }
+}
+
+fn percentile_ms(samples: &[f64], percentile: f64) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(|left, right| left.total_cmp(right));
+    let index =
+        ((sorted.len().saturating_sub(1)) as f64 * percentile.clamp(0.0, 1.0)).round() as usize;
+    sorted[index]
+}
+
+#[cfg(target_arch = "wasm32")]
+fn publish_wasm_perf_sample(stats: &InferenceTimingStats) {
+    use wasm_bindgen::JsValue;
+
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Some(latest) = stats.latest else {
+        return;
+    };
+    let value = serde_json::json!({
+        "processed_frames": stats.processed_frames(),
+        "latest_sequence": latest.sequence,
+        "latest_total_ms": latest.total_ms,
+        "latest_model_ms": latest.model_ms,
+        "latest_display_ms": latest.display_ms,
+        "avg_fps": fps_from_ms(mean_or_zero(stats.total_ms, stats.processed_frames())),
+        "p95_total_ms": percentile_ms(&stats.samples, 0.95),
+    })
+    .to_string();
+    let value = js_sys::JSON::parse(&value).unwrap_or_else(|_| JsValue::from_str(&value));
+    let _ = js_sys::Reflect::set(&window, &JsValue::from_str("__autogazePerf"), &value);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn publish_wasm_perf_sample(_stats: &InferenceTimingStats) {}
+
 #[derive(SystemParam)]
 struct FrameInputParams<'w> {
     config: Res<'w, BevyBurnAutoGazeConfig>,
@@ -711,8 +1015,10 @@ struct FrameInputParams<'w> {
     frame_queue: ResMut<'w, FrameQueue>,
     inference_sequencer: ResMut<'w, InferenceSequencer>,
     visualization_state: ResMut<'w, BevyVisualizationState>,
+    prepared_tensor_queue: ResMut<'w, PreparedTensorQueue>,
     gaze_ratio_stats: ResMut<'w, GazeRatioStats>,
     psnr_stats: ResMut<'w, PsnrStats>,
+    timing_stats: Res<'w, InferenceTimingStats>,
 }
 
 #[derive(Component)]
@@ -746,6 +1052,7 @@ pub fn viewer_app(config: BevyBurnAutoGazeConfig) -> App {
     app.insert_resource(ClearColor(Color::BLACK));
     app.insert_resource(AutoGazeTexture::default());
     app.insert_resource(FrameQueue::default());
+    app.insert_resource(PreparedTensorQueue::default());
     app.insert_resource(BevyVisualizationState::new(
         config.visualization_mode,
         config.keyframe_duration,
@@ -808,6 +1115,7 @@ pub fn viewer_app(config: BevyBurnAutoGazeConfig) -> App {
             handle_tasks,
             preview_frames,
             process_frames,
+            maybe_emit_perf_summary,
             fit_visualization_node,
         )
             .chain(),
@@ -819,7 +1127,7 @@ pub fn viewer_app(config: BevyBurnAutoGazeConfig) -> App {
 pub fn run_app(config: BevyBurnAutoGazeConfig) {
     viewer_app(config).run();
 
-    #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+    #[cfg(not(target_arch = "wasm32"))]
     if let Some(sender) = platform::camera::APP_RUN_SENDER.get() {
         let _ = sender.send(());
     }
@@ -834,18 +1142,18 @@ fn setup_ui(
     if texture.entity.is_some() {
         return;
     }
-    let Some(device) = burn_device.as_ref().and_then(|device| device.device()) else {
+    if burn_device
+        .as_ref()
+        .and_then(|device| device.device())
+        .is_none()
+    {
         return;
-    };
+    }
 
-    let size = Extent3d {
-        width: texture.width.max(1),
-        height: texture.height.max(1),
-        depth_or_array_layers: 1,
-    };
     texture.image = images.add(visualization_image(
         texture.width.max(1),
         texture.height.max(1),
+        vec![0; texture.width.max(1) as usize * texture.height.max(1) as usize * 4],
     ));
 
     let mut image_entity = None;
@@ -868,16 +1176,6 @@ fn setup_ui(
                         width: Val::Px(texture.width.max(1) as f32),
                         height: Val::Px(texture.height.max(1) as f32),
                         ..default()
-                    },
-                    BevyBurnHandle::<AutoGazeBevyBackend> {
-                        bevy_image: texture.image.clone(),
-                        tensor: Tensor::<AutoGazeBevyBackend, 3>::zeros(
-                            [size.height as usize, size.width as usize, 4],
-                            device,
-                        ),
-                        upload: true,
-                        direction: BindingDirection::BurnToBevy,
-                        xfer: TransferKind::Gpu,
                     },
                 ))
                 .id();
@@ -1005,9 +1303,9 @@ fn process_frames(
     let Some(pipeline) = model.pipeline.as_ref() else {
         return;
     };
-    let Some(image_entity) = texture.entity else {
+    if texture.entity.is_none() {
         return;
-    };
+    }
     let Some(device) = burn_device
         .as_ref()
         .and_then(|device| device.device())
@@ -1018,21 +1316,33 @@ fn process_frames(
     if active_tasks.iter().count() >= MAX_IN_FLIGHT_TASKS {
         return;
     }
+    if frame_input
+        .config
+        .perf_summary_frames
+        .is_some_and(|target| frame_input.timing_stats.processed_frames() >= target)
+    {
+        return;
+    }
 
+    let source_start = timestamp_now();
     let frame = if let Some(frame) = frame_input.static_frame.0.as_ref() {
-        Some((**frame).clone())
+        Some((Arc::clone(frame), 0.0))
     } else {
-        receive_frame()
+        receive_frame().map(|frame| {
+            let prepare_start = timestamp_now();
+            let frame = prepare_frame_for_inference(frame, &frame_input.config);
+            (Arc::new(frame), elapsed_ms(prepare_start))
+        })
     };
+    let source_ms = elapsed_ms(source_start);
 
-    let Some(frame) = frame else {
+    let Some((frame, prepare_ms)) = frame else {
         return;
     };
-    let frame = prepare_frame_for_inference(frame, &frame_input.config);
     frame_input
         .frame_queue
         .push(frame, frame_input.config.frames_per_clip);
-    let clip = match frame_input
+    let mut clip = match frame_input
         .frame_queue
         .build_clip(frame_input.config.frames_per_clip)
     {
@@ -1043,6 +1353,8 @@ fn process_frames(
             return;
         }
     };
+    clip.source_ms = source_ms;
+    clip.prepare_ms = prepare_ms;
 
     let task_entity = commands.spawn_empty().id();
     let pipeline = pipeline.clone();
@@ -1064,30 +1376,30 @@ fn process_frames(
         *logged_first_inference = true;
     }
     let sequence = frame_input.inference_sequencer.reserve();
+    let previous_tensors = frame_input.prepared_tensor_queue.previous_frames(
+        clip.width,
+        clip.height,
+        clip.clip_len.saturating_sub(1),
+    );
+    let frame_input_clip_len = frame_input.config.frames_per_clip;
 
     let task = AsyncComputeTaskPool::get().spawn(async move {
-        #[cfg(target_arch = "wasm32")]
-        let result = run_autogaze_visualization(
-            pipeline,
-            &clip,
+        let job = AutoGazeRunContext {
+            clip: &clip,
+            sequence,
+            previous_tensors,
             top_k,
             mode,
             visualization_options,
             visualization_state,
             device,
-        )
-        .await;
+        };
+
+        #[cfg(target_arch = "wasm32")]
+        let result = run_autogaze_visualization(pipeline, job).await;
 
         #[cfg(not(target_arch = "wasm32"))]
-        let result = run_autogaze_visualization(
-            pipeline,
-            &clip,
-            top_k,
-            mode,
-            visualization_options,
-            visualization_state,
-            device,
-        );
+        let result = run_autogaze_visualization(pipeline, job);
         let clip_rgba = clip.rgba;
 
         let mut queue = CommandQueue::default();
@@ -1110,13 +1422,15 @@ fn process_frames(
                     let Visualization {
                         width,
                         height,
-                        tensor,
+                        rgba,
+                        prepared_frame,
                         gaze_update_ratio,
                         psnr_db,
                         mut timing,
+                        ..
                     } = visualization;
                     let display_start = timestamp_now();
-                    apply_visualization_to_world(world, image_entity, width, height, tensor);
+                    apply_visualization_to_world(world, width, height, rgba);
                     if let Some(ref mut timing) = timing {
                         timing.display_ms = elapsed_ms(display_start);
                         timing.total_ms += timing.display_ms;
@@ -1125,6 +1439,13 @@ fn process_frames(
                     if let Some(mut texture) = world.get_resource_mut::<AutoGazeTexture>() {
                         texture.width = width;
                         texture.height = height;
+                    }
+
+                    if let Some(prepared_frame) = prepared_frame
+                        && let Some(mut tensor_queue) =
+                            world.get_resource_mut::<PreparedTensorQueue>()
+                    {
+                        tensor_queue.push(prepared_frame, frame_input_clip_len);
                     }
 
                     if let Some(mut state) = world.get_resource_mut::<BevyVisualizationState>() {
@@ -1167,9 +1488,7 @@ fn process_frames(
 fn preview_frames(
     model: Res<AutoGazeModelState>,
     mut texture: ResMut<AutoGazeTexture>,
-    burn_device: Option<Res<BurnDevice>>,
     mut frame_input: FrameInputParams,
-    mut burn_handles: Query<&mut BevyBurnHandle<AutoGazeBevyBackend>>,
     active_tasks: Query<&ProcessAutoGaze>,
     mut images: ResMut<Assets<Image>>,
 ) {
@@ -1179,23 +1498,20 @@ fn preview_frames(
         return;
     }
 
-    let Some(image_entity) = texture.entity else {
+    if texture.entity.is_none() {
         return;
-    };
-    let Some(device) = burn_device.as_ref().and_then(|device| device.device()) else {
-        return;
-    };
+    }
 
     let frame = if let Some(frame) = frame_input.static_frame.0.as_ref() {
-        Some((**frame).clone())
+        Some(Arc::clone(frame))
     } else {
         receive_frame()
+            .map(|frame| Arc::new(prepare_frame_for_inference(frame, &frame_input.config)))
     };
 
     let Some(frame) = frame else {
         return;
     };
-    let frame = prepare_frame_for_inference(frame, &frame_input.config);
 
     frame_input
         .frame_queue
@@ -1208,27 +1524,20 @@ fn preview_frames(
         return;
     }
 
-    let visualization =
-        match live_preview_visualization(frame, frame_input.config.show_psnr, device) {
-            Ok(visualization) => visualization,
-            Err(err) => {
-                log(&format!("failed to draw AutoGaze preview: {err}"));
-                return;
-            }
-        };
+    let visualization = match live_preview_visualization(frame, frame_input.config.show_psnr) {
+        Ok(visualization) => visualization,
+        Err(err) => {
+            log(&format!("failed to draw AutoGaze preview: {err}"));
+            return;
+        }
+    };
     frame_input
         .gaze_ratio_stats
         .record(visualization.gaze_update_ratio);
     if let Some(psnr_db) = visualization.psnr_db {
         frame_input.psnr_stats.record(psnr_db);
     }
-    apply_visualization_to_texture(
-        image_entity,
-        visualization,
-        &mut texture,
-        &mut burn_handles,
-        &mut images,
-    );
+    apply_visualization_to_texture(visualization, &mut texture, &mut images);
 }
 
 fn handle_tasks(
@@ -1322,32 +1631,82 @@ fn apply_tile_batch_config<B: burn::tensor::backend::Backend>(
     pipeline.set_tile_batch_size(config.tile_batch_size.max(1));
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn run_autogaze_visualization(
-    pipeline: Arc<Mutex<AutoGazePipeline<AutoGazeBevyBackend>>>,
+fn prepare_clip_video_tensor(
     clip: &FrameClip,
+    previous_tensors: Vec<Tensor<AutoGazeBevyBackend, 5>>,
+    device: &AutoGazeBevyDevice,
+) -> Result<(Tensor<AutoGazeBevyBackend, 5>, PreparedTensorFrame, f64), String> {
+    let input_start = timestamp_now();
+    let current_shape = AutoGazeRgbaClipShape::new(1, clip.height, clip.width);
+    let current_tensor =
+        rgba_clip_to_tensor::<AutoGazeBevyBackend>(clip.last_frame_rgba()?, current_shape, device)
+            .map_err(|err| format!("{err:#}"))?;
+    let prepared_frame = PreparedTensorFrame {
+        width: clip.width,
+        height: clip.height,
+        tensor: current_tensor.clone(),
+    };
+
+    let video = if previous_tensors.len() + 1 >= clip.clip_len {
+        let mut frames = previous_tensors;
+        frames.push(current_tensor);
+        if frames.len() == 1 {
+            frames
+                .pop()
+                .ok_or_else(|| "AutoGaze prepared frame queue was empty".to_string())?
+        } else {
+            Tensor::cat(frames, 1)
+        }
+    } else {
+        rgba_clip_to_tensor::<AutoGazeBevyBackend>(&clip.rgba, clip.shape(), device)
+            .map_err(|err| format!("{err:#}"))?
+    };
+
+    Ok((video, prepared_frame, elapsed_ms(input_start)))
+}
+
+struct AutoGazeRunContext<'a> {
+    clip: &'a FrameClip,
+    sequence: u64,
+    previous_tensors: Vec<Tensor<AutoGazeBevyBackend, 5>>,
     top_k: usize,
     mode: AutoGazeInferenceMode,
     visualization_options: VisualizationOptions,
-    mut visualization_state: BevyVisualizationState,
+    visualization_state: BevyVisualizationState,
     device: AutoGazeBevyDevice,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn run_autogaze_visualization(
+    pipeline: Arc<Mutex<AutoGazePipeline<AutoGazeBevyBackend>>>,
+    context: AutoGazeRunContext<'_>,
 ) -> Result<(Visualization, BevyVisualizationState), String> {
+    let AutoGazeRunContext {
+        clip,
+        sequence,
+        previous_tensors,
+        top_k,
+        mode,
+        visualization_options,
+        mut visualization_state,
+        device,
+    } = context;
     let total_start = timestamp_now();
     let width = clip.width;
     let height = clip.height;
-    let traces = {
+    let (video, prepared_frame, input_ms) =
+        prepare_clip_video_tensor(clip, previous_tensors, &device)?;
+    let (traces, model_ms) = {
         let pipeline = pipeline
             .lock()
             .map_err(|_| "AutoGaze model lock was poisoned".to_string())?;
-        let trace_start = timestamp_now();
-        let traces = pipeline
-            .trace_rgba_clip_with_mode(&clip.rgba, clip.shape(), top_k, mode, &device)
-            .map_err(|err| format!("{err:#}"))?;
-        (traces, elapsed_ms(trace_start))
+        let model_start = timestamp_now();
+        let traces = pipeline.trace_video_with_mode(video, top_k, mode);
+        (traces, elapsed_ms(model_start))
     };
+    let trace_ms = input_ms + model_ms;
     let frame_index = clip.clip_len.saturating_sub(1);
     let points = traces
-        .0
         .first()
         .and_then(|trace| trace.frames.get(frame_index))
         .map(|set| set.points.clone())
@@ -1360,18 +1719,27 @@ fn run_autogaze_visualization(
         &points,
         visualization_options,
         &mut visualization_state,
-        &device,
     )?;
+    visualization.prepared_frame = Some(prepared_frame);
     visualization.timing = Some(InferenceTiming {
+        sequence,
         clip_frames: clip.clip_len,
         width,
         height,
+        source_ms: clip.source_ms,
+        prepare_ms: clip.prepare_ms,
         pack_ms: clip.pack_ms,
-        trace_ms: traces.1,
+        input_ms,
+        model_ms,
+        trace_ms,
         sync_ms: 0.0,
+        visualize_cpu_ms: visualization.visualize_cpu_ms,
+        tensor_ms: visualization.tensor_ms,
         visualize_ms: elapsed_ms(visualize_start),
         display_ms: 0.0,
-        total_ms: elapsed_ms(total_start) + clip.pack_ms,
+        total_ms: elapsed_ms(total_start) + clip.source_ms + clip.prepare_ms + clip.pack_ms,
+        output_rgba_bytes: visualization.output_rgba_bytes,
+        output_tensor_bytes: visualization.output_tensor_bytes,
     });
     Ok((visualization, visualization_state))
 }
@@ -1379,32 +1747,41 @@ fn run_autogaze_visualization(
 #[cfg(target_arch = "wasm32")]
 async fn run_autogaze_visualization(
     pipeline: Arc<Mutex<AutoGazePipeline<AutoGazeBevyBackend>>>,
-    clip: &FrameClip,
-    top_k: usize,
-    mode: AutoGazeInferenceMode,
-    visualization_options: VisualizationOptions,
-    mut visualization_state: BevyVisualizationState,
-    device: AutoGazeBevyDevice,
+    context: AutoGazeRunContext<'_>,
 ) -> Result<(Visualization, BevyVisualizationState), String> {
+    let AutoGazeRunContext {
+        clip,
+        sequence,
+        previous_tensors,
+        top_k,
+        mode,
+        visualization_options,
+        mut visualization_state,
+        device,
+    } = context;
     let total_start = timestamp_now();
     let width = clip.width;
     let height = clip.height;
-    let traces = {
+    let (video, prepared_frame, input_ms) =
+        prepare_clip_video_tensor(clip, previous_tensors, &device)?;
+    let (traces, model_ms) = {
         let pipeline = pipeline
             .lock()
             .map_err(|_| "AutoGaze model lock was poisoned".to_string())?
             .clone();
-        let trace_start = timestamp_now();
+        let model_start = timestamp_now();
         let traces = pipeline
-            .trace_rgba_clip_with_mode_async(&clip.rgba, clip.shape(), top_k, mode, &device)
+            .trace_video_with_mode_async(video, top_k, mode)
             .await
-            .map_err(|err| format!("{err:#}"))?;
-        (traces, elapsed_ms(trace_start))
+            .map_err(|err| {
+                format!("failed to read AutoGaze tensor data asynchronously: {err:?}")
+            })?;
+        (traces, elapsed_ms(model_start))
     };
+    let trace_ms = input_ms + model_ms;
 
     let frame_index = clip.clip_len.saturating_sub(1);
     let points = traces
-        .0
         .first()
         .and_then(|trace| trace.frames.get(frame_index))
         .map(|set| set.points.clone())
@@ -1417,18 +1794,27 @@ async fn run_autogaze_visualization(
         &points,
         visualization_options,
         &mut visualization_state,
-        &device,
     )?;
+    visualization.prepared_frame = Some(prepared_frame);
     visualization.timing = Some(InferenceTiming {
+        sequence,
         clip_frames: clip.clip_len,
         width,
         height,
+        source_ms: clip.source_ms,
+        prepare_ms: clip.prepare_ms,
         pack_ms: clip.pack_ms,
-        trace_ms: traces.1,
+        input_ms,
+        model_ms,
+        trace_ms,
         sync_ms: 0.0,
+        visualize_cpu_ms: visualization.visualize_cpu_ms,
+        tensor_ms: visualization.tensor_ms,
         visualize_ms: elapsed_ms(visualize_start),
         display_ms: 0.0,
-        total_ms: elapsed_ms(total_start) + clip.pack_ms,
+        total_ms: elapsed_ms(total_start) + clip.source_ms + clip.prepare_ms + clip.pack_ms,
+        output_rgba_bytes: visualization.output_rgba_bytes,
+        output_tensor_bytes: visualization.output_tensor_bytes,
     });
     Ok((visualization, visualization_state))
 }
@@ -1453,9 +1839,14 @@ impl VisualizationOptions {
 struct Visualization {
     width: u32,
     height: u32,
-    tensor: Tensor<AutoGazeBevyBackend, 3>,
+    rgba: Vec<u8>,
+    prepared_frame: Option<PreparedTensorFrame>,
     gaze_update_ratio: f64,
     psnr_db: Option<f64>,
+    visualize_cpu_ms: f64,
+    tensor_ms: f64,
+    output_rgba_bytes: usize,
+    output_tensor_bytes: usize,
     timing: Option<InferenceTiming>,
 }
 
@@ -1464,7 +1855,6 @@ fn visualize_points(
     points: &[FixationPoint],
     options: VisualizationOptions,
     visualization_state: &mut BevyVisualizationState,
-    device: &AutoGazeBevyDevice,
 ) -> Result<Visualization, String> {
     visualize_rgba_bytes(
         rgba.as_raw(),
@@ -1473,7 +1863,6 @@ fn visualize_points(
         points,
         options,
         visualization_state,
-        device,
     )
 }
 
@@ -1484,10 +1873,10 @@ fn visualize_rgba_bytes(
     points: &[FixationPoint],
     options: VisualizationOptions,
     visualization_state: &mut BevyVisualizationState,
-    device: &AutoGazeBevyDevice,
 ) -> Result<Visualization, String> {
     let width = width.max(1);
     let height = height.max(1);
+    let visualize_cpu_start = timestamp_now();
     let visualization = visualization_state
         .0
         .visualize_rgba(
@@ -1507,18 +1896,20 @@ fn visualize_rgba_bytes(
                 .map_err(|err| format!("{err:#}"))
         })
         .transpose()?;
-    let tensor = rgba_tensor(
-        &visualization.side_by_side_rgba,
-        visualization.side_by_side_width,
-        visualization.height,
-        device,
-    );
+    let visualize_cpu_ms = elapsed_ms(visualize_cpu_start);
+    let gaze_update_ratio = visualization.update_ratio();
+    let output_rgba_bytes = visualization.side_by_side_rgba.len();
     Ok(Visualization {
         width: visualization.side_by_side_width as u32,
         height: visualization.height as u32,
-        tensor,
-        gaze_update_ratio: visualization.update_ratio(),
+        rgba: visualization.side_by_side_rgba,
+        prepared_frame: None,
+        gaze_update_ratio,
         psnr_db,
+        visualize_cpu_ms,
+        tensor_ms: 0.0,
+        output_rgba_bytes,
+        output_tensor_bytes: 0,
         timing: None,
     })
 }
@@ -1526,7 +1917,6 @@ fn visualize_rgba_bytes(
 fn live_preview_visualization(
     rgba: &RgbaImage,
     calculate_psnr: bool,
-    device: &AutoGazeBevyDevice,
 ) -> Result<Visualization, String> {
     let mut state = BevyVisualizationState::new(AutoGazeVisualizationMode::FullBlend, 1);
     let mut visualization = visualize_points(
@@ -1534,7 +1924,6 @@ fn live_preview_visualization(
         &[],
         VisualizationOptions::new(1.0, 0.0, false),
         &mut state,
-        device,
     )?;
     visualization.gaze_update_ratio = 0.0;
     visualization.psnr_db = calculate_psnr.then_some(f64::INFINITY);
@@ -1545,103 +1934,74 @@ fn should_draw_live_preview(model_ready: bool, _inference_busy: bool) -> bool {
     !model_ready
 }
 
-fn rgba_tensor(
-    rgba: &[u8],
-    width: usize,
-    height: usize,
-    device: &AutoGazeBevyDevice,
-) -> Tensor<AutoGazeBevyBackend, 3> {
-    Tensor::<AutoGazeBevyBackend, 1, Int>::from_data(rgba, device)
-        .float()
-        .div_scalar(255.0)
-        .reshape([height, width, 4])
-}
-
 fn apply_visualization_to_texture(
-    image_entity: Entity,
     visualization: Visualization,
     texture: &mut AutoGazeTexture,
-    burn_handles: &mut Query<&mut BevyBurnHandle<AutoGazeBevyBackend>>,
     images: &mut Assets<Image>,
 ) {
-    let Ok(mut handle) = burn_handles.get_mut(image_entity) else {
-        return;
-    };
-
     let width = visualization.width;
     let height = visualization.height;
-    ensure_visualization_image(&handle.bevy_image, width, height, images);
-    handle.tensor = visualization.tensor;
-    handle.upload = true;
-    handle.direction = BindingDirection::BurnToBevy;
-    handle.xfer = TransferKind::Gpu;
+    set_visualization_image(&texture.image, width, height, visualization.rgba, images);
     texture.width = width;
     texture.height = height;
 }
 
-fn apply_visualization_to_world(
-    world: &mut World,
-    image_entity: Entity,
-    width: u32,
-    height: u32,
-    tensor: Tensor<AutoGazeBevyBackend, 3>,
-) {
-    let image_handle = {
-        let Ok(mut entity) = world.get_entity_mut(image_entity) else {
-            return;
-        };
-        let Some(mut handle) = entity.get_mut::<BevyBurnHandle<AutoGazeBevyBackend>>() else {
-            return;
-        };
-        handle.tensor = tensor;
-        handle.upload = true;
-        handle.direction = BindingDirection::BurnToBevy;
-        handle.xfer = TransferKind::Gpu;
-        handle.bevy_image.clone()
+fn apply_visualization_to_world(world: &mut World, width: u32, height: u32, rgba: Vec<u8>) {
+    let Some(image_handle) = world
+        .get_resource::<AutoGazeTexture>()
+        .map(|texture| texture.image.clone())
+    else {
+        return;
     };
 
     if let Some(mut images) = world.get_resource_mut::<Assets<Image>>() {
-        ensure_visualization_image(&image_handle, width, height, &mut images);
+        set_visualization_image(&image_handle, width, height, rgba, &mut images);
     }
 }
 
-fn ensure_visualization_image(
+fn set_visualization_image(
     handle: &Handle<Image>,
     width: u32,
     height: u32,
+    rgba: Vec<u8>,
     images: &mut Assets<Image>,
 ) {
-    if let Some(image) = images.get(handle)
+    if let Some(mut image) = images.get_mut(handle)
         && image.width() == width
         && image.height() == height
-        && image.texture_descriptor.format == TextureFormat::Rgba32Float
+        && image.texture_descriptor.format == TextureFormat::Rgba8UnormSrgb
         && image
             .texture_descriptor
             .usage
-            .contains(TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING)
+            .contains(TextureUsages::COPY_DST | TextureUsages::TEXTURE_BINDING)
     {
+        image.data = Some(rgba);
         return;
     }
 
-    let _ = images.insert(handle.id(), visualization_image(width, height));
+    let _ = images.insert(handle.id(), visualization_image(width, height, rgba));
 }
 
-fn visualization_image(width: u32, height: u32) -> Image {
-    let mut image = Image::new_fill(
+fn visualization_image(width: u32, height: u32, mut rgba: Vec<u8>) -> Image {
+    let width = width.max(1);
+    let height = height.max(1);
+    let expected_len = width as usize * height as usize * 4;
+    if rgba.len() != expected_len {
+        rgba.resize(expected_len, 0);
+    }
+
+    let mut image = Image::new(
         Extent3d {
-            width: width.max(1),
-            height: height.max(1),
+            width,
+            height,
             depth_or_array_layers: 1,
         },
         TextureDimension::D2,
-        &[0; 16],
-        TextureFormat::Rgba32Float,
-        RenderAssetUsages::RENDER_WORLD,
+        rgba,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
     );
-    image.texture_descriptor.usage |= TextureUsages::COPY_SRC
-        | TextureUsages::COPY_DST
-        | TextureUsages::TEXTURE_BINDING
-        | TextureUsages::STORAGE_BINDING;
+    image.texture_descriptor.usage |= TextureUsages::COPY_DST | TextureUsages::TEXTURE_BINDING;
     image.sampler = ImageSampler::nearest();
     image
 }
@@ -1671,23 +2031,7 @@ fn elapsed_ms(start: Timestamp) -> f64 {
 }
 
 fn receive_frame() -> Option<RgbaImage> {
-    #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
-    {
-        platform::camera::receive_image()
-    }
-
-    #[cfg(all(feature = "web", target_arch = "wasm32"))]
-    {
-        platform::camera::receive_image()
-    }
-
-    #[cfg(not(any(
-        all(feature = "native", not(target_arch = "wasm32")),
-        all(feature = "web", target_arch = "wasm32")
-    )))]
-    {
-        None
-    }
+    platform::camera::receive_image()
 }
 
 fn load_static_frame(path: Option<&Path>, config: &BevyBurnAutoGazeConfig) -> StaticFrame {
@@ -1745,6 +2089,43 @@ fn press_esc_close(keys: Res<ButtonInput<KeyCode>>, mut exit: MessageWriter<AppE
         exit.write(AppExit::Success);
     }
 }
+
+fn maybe_emit_perf_summary(
+    config: Res<BevyBurnAutoGazeConfig>,
+    mut timing: ResMut<InferenceTimingStats>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    #[cfg(target_arch = "wasm32")]
+    let _ = &mut exit;
+
+    let Some(target_frames) = config.perf_summary_frames else {
+        return;
+    };
+    if timing.emitted_summary || timing.processed_frames() < target_frames {
+        return;
+    }
+
+    let summary = timing.summary_json(target_frames);
+    log(&format!("AutoGaze perf summary: {summary}"));
+    publish_wasm_perf_summary(&summary);
+    timing.emitted_summary = true;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    exit.write(AppExit::Success);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn publish_wasm_perf_summary(summary: &str) {
+    use wasm_bindgen::JsValue;
+
+    if let Some(window) = web_sys::window() {
+        let value = js_sys::JSON::parse(summary).unwrap_or_else(|_| JsValue::from_str(summary));
+        let _ = js_sys::Reflect::set(&window, &JsValue::from_str("__autogazePerfSummary"), &value);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn publish_wasm_perf_summary(_summary: &str) {}
 
 fn fps_display_setup(mut commands: Commands) {
     commands
@@ -1973,7 +2354,7 @@ mod tests {
     fn applies_url_query_to_viewer_config() {
         let mut config = BevyBurnAutoGazeConfig::default();
         let errors = config.apply_query_string(
-            "?mode=full-res&top_k=2&frames-per-clip=3&inference-width=1920&inference-height=1080&show-fps=false&show-psnr=false&task-loss-requirement=0.65&tile-batch-size=4&config-url=%2Fconfig.json&weights-url=%2Fmodel.safetensors&load-model=false&mask-cell-scale=2.5&blend-alpha=0.5&visualization-mode=interframe&keyframe-duration=7",
+            "?mode=full-res&top_k=2&frames-per-clip=3&inference-width=1920&inference-height=1080&show-fps=false&show-psnr=false&task-loss-requirement=0.65&tile-batch-size=4&config-url=%2Fconfig.json&weights-url=%2Fmodel.safetensors&load-model=false&mask-cell-scale=2.5&blend-alpha=0.5&visualization-mode=interframe&keyframe-duration=7&perf-summary-frames=5",
         );
 
         assert!(errors.is_empty(), "{errors:?}");
@@ -1998,6 +2379,7 @@ mod tests {
             AutoGazeVisualizationMode::Interframe
         );
         assert_eq!(config.keyframe_duration, 7);
+        assert_eq!(config.perf_summary_frames, Some(5));
 
         let errors = config.apply_query_string("?show-gaze-ratio=false");
         assert!(errors.is_empty(), "{errors:?}");
@@ -2038,6 +2420,43 @@ mod tests {
     }
 
     #[test]
+    fn tiled_query_defaults_keep_model_generation_budget() {
+        let mut config = BevyBurnAutoGazeConfig::default();
+        let errors = config.apply_query_string("?mode=tiled&visualization-mode=interframe");
+
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(config.mode, BevyAutoGazeMode::Tile224);
+        assert_eq!(config.top_k, DEFAULT_TILED_TOP_K);
+        assert_eq!(
+            config.max_gaze_tokens_each_frame,
+            DEFAULT_MODEL_GENERATION_BUDGET
+        );
+        assert_eq!(config.tile_batch_size, DEFAULT_TILED_TILE_BATCH_SIZE);
+        assert_eq!(config.frames_per_clip, DEFAULT_TILED_FRAMES_PER_CLIP);
+        assert_eq!(config.inference_width, Some(DEFAULT_TILED_INFERENCE_WIDTH));
+        assert_eq!(config.inference_height, None);
+        assert_eq!(
+            config.visualization_mode,
+            AutoGazeVisualizationMode::Interframe
+        );
+    }
+
+    #[test]
+    fn tiled_query_defaults_preserve_explicit_performance_knobs() {
+        let mut config = BevyBurnAutoGazeConfig::default();
+        let errors = config.apply_query_string(
+            "?mode=tiled&top-k=5&max-gaze-tokens-each-frame=7&tile-batch-size=4&width=1920",
+        );
+
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(config.top_k, 5);
+        assert_eq!(config.max_gaze_tokens_each_frame, 7);
+        assert_eq!(config.tile_batch_size, 4);
+        assert_eq!(config.inference_width, Some(1920));
+        assert_eq!(config.inference_height, None);
+    }
+
+    #[test]
     fn default_blend_alpha_keeps_output_mask_subtle() {
         let config = BevyBurnAutoGazeConfig::default();
 
@@ -2070,13 +2489,14 @@ mod tests {
     #[test]
     fn frame_queue_packs_static_clip_buffer_and_reuses_it() {
         let mut queue = FrameQueue::default();
-        let first = RgbaImage::from_pixel(2, 1, image::Rgba([1, 2, 3, 255]));
-        let second = RgbaImage::from_pixel(2, 1, image::Rgba([4, 5, 6, 255]));
-        let third = RgbaImage::from_pixel(2, 1, image::Rgba([7, 8, 9, 255]));
+        let first = Arc::new(RgbaImage::from_pixel(2, 1, image::Rgba([1, 2, 3, 255])));
+        let second = Arc::new(RgbaImage::from_pixel(2, 1, image::Rgba([4, 5, 6, 255])));
+        let third = Arc::new(RgbaImage::from_pixel(2, 1, image::Rgba([7, 8, 9, 255])));
 
-        queue.push(first.clone(), 2);
+        queue.push(Arc::clone(&first), 2);
+        assert_eq!(Arc::strong_count(&first), 2);
         assert!(queue.build_clip(2).unwrap().is_none());
-        queue.push(second.clone(), 2);
+        queue.push(Arc::clone(&second), 2);
         let clip = queue.build_clip(2).unwrap().unwrap();
 
         assert_eq!(clip.width, 2);
@@ -2090,12 +2510,57 @@ mod tests {
         queue.recycle_clip_buffer(clip.rgba);
         assert_eq!(queue.spare_clip_buffers.len(), 1);
 
-        queue.push(third.clone(), 2);
+        queue.push(Arc::clone(&third), 2);
+        assert_eq!(Arc::strong_count(&first), 1);
         let clip = queue.build_clip(2).unwrap().unwrap();
         assert_eq!(queue.spare_clip_buffers.len(), 0);
         assert_eq!(clip.rgba.capacity(), capacity);
         assert_eq!(&clip.rgba[..second.as_raw().len()], second.as_raw());
         assert_eq!(&clip.rgba[second.as_raw().len()..], third.as_raw());
+    }
+
+    #[test]
+    fn rolling_frame_queue_reuses_recent_frames_and_resets_on_resize() {
+        let mut queue = RollingFrameQueue::<u32>::default();
+
+        queue.push(
+            PreparedFrame {
+                width: 4,
+                height: 2,
+                tensor: 1,
+            },
+            2,
+        );
+        queue.push(
+            PreparedFrame {
+                width: 4,
+                height: 2,
+                tensor: 2,
+            },
+            2,
+        );
+        queue.push(
+            PreparedFrame {
+                width: 4,
+                height: 2,
+                tensor: 3,
+            },
+            2,
+        );
+
+        assert_eq!(queue.previous_frames(4, 2, 2), vec![2, 3]);
+        assert_eq!(queue.previous_frames(4, 2, 1), vec![3]);
+        assert!(queue.previous_frames(8, 2, 1).is_empty());
+
+        queue.push(
+            PreparedFrame {
+                width: 8,
+                height: 2,
+                tensor: 4,
+            },
+            2,
+        );
+        assert_eq!(queue.previous_frames(8, 2, 2), vec![4]);
     }
 
     #[test]

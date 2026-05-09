@@ -90,7 +90,7 @@ impl Default for Args {
             frames: 16,
             clip_len: 16,
             top_k: DEFAULT_DOC_TOP_K,
-            max_gaze_tokens_each_frame: Some(DEFAULT_DOC_TOP_K),
+            max_gaze_tokens_each_frame: None,
             task_loss_requirement: None,
             tile_size: 224,
             stride: 224,
@@ -243,7 +243,7 @@ where
     fs::create_dir_all(&args.output_dir)
         .with_context(|| format!("create {}", args.output_dir.display()))?;
 
-    let mode = AutoGazeInferenceMode::tiled_full_resolution(args.tile_size, args.stride);
+    let mode = AutoGazeInferenceMode::tiled_resize_to_grid(args.tile_size);
     let mut pipeline = AutoGazePipeline::<B>::from_hf_dir(&args.model_dir, &device)
         .with_context(|| format!("load AutoGaze model from {}", args.model_dir.display()))?;
     if let Some(max_gaze_tokens_each_frame) = args.max_gaze_tokens_each_frame {
@@ -362,7 +362,7 @@ where
         source_video: display_path(&args.source_video),
         model_dir: display_path(&args.model_dir),
         backend: backend_name(),
-        inference_mode: format!("tile-{}/{}", args.tile_size, args.stride),
+        inference_mode: format!("anyres-tile-{}", args.tile_size),
         visualization_mode: AutoGazeVisualizationMode::Interframe.as_str(),
         inference_width: args.inference_width,
         inference_height: args.inference_height,
@@ -374,12 +374,11 @@ where
         top_k: args.top_k,
         max_gaze_tokens_each_frame: pipeline.max_gaze_tokens_each_frame(),
         task_loss_requirement: pipeline.task_loss_requirement(),
-        clip_chunking: "non-overlapping",
-        tile_count: AutoGazeTileLayout::tiled(
+        clip_chunking: "anyres-resized-grid",
+        tile_count: AutoGazeTileLayout::resized_grid(
             args.inference_height,
             args.inference_width,
             args.tile_size,
-            args.stride,
         )
         .tile_count(),
         tile_batch_size: pipeline.tile_batch_size(),

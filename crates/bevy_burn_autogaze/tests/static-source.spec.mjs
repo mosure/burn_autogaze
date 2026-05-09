@@ -197,7 +197,7 @@ test("runs optional real wasm inference smoke when model assets are available", 
   });
 
   await page.goto(
-    "/?source=static&show-fps=true&show-gaze-ratio=true&show-psnr=false&mode=resize-224&visualization-mode=interframe&frames-per-clip=1&static-width=224&static-height=224&static-fps=1&top-k=1&max-gaze-tokens-each-frame=1&disable-task-loss-requirement=true&log-pipeline-timing=true&config-url=./config.json&weights-url=./model.safetensors",
+    "/?source=static&show-fps=true&show-gaze-ratio=true&show-psnr=false&mode=resize-224&visualization-mode=interframe&frames-per-clip=1&static-width=224&static-height=224&static-fps=1&top-k=1&max-gaze-tokens-each-frame=1&disable-task-loss-requirement=true&log-pipeline-timing=true&perf-summary-frames=1&config-url=./config.json&weights-url=./model.safetensors",
     { waitUntil: "domcontentloaded" },
   );
 
@@ -238,5 +238,10 @@ test("runs optional real wasm inference smoke when model assets are available", 
   expect(timing.clipFrames).toBe(1);
   expect(timing.width).toBe(224);
   expect(timing.height).toBe(224);
+  const perf = await page.evaluate(() => window.__autogazePerf || null);
+  expect(perf).not.toBeNull();
+  expect(perf.processed_frames).toBeGreaterThanOrEqual(1);
+  expect(perf.latest_sequence).toBeGreaterThanOrEqual(1);
+  expect(perf.p95_total_ms).toBeGreaterThan(0);
   expectNoKnownWasmPanic(consoleLines, pageErrors);
 });

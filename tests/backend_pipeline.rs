@@ -61,6 +61,16 @@ fn accelerator_embeddings_match_ndarray_reference() {
             },
         },
         ParityCase {
+            name: "single-scale-anyres-tile",
+            model_input: 16,
+            scales: "16",
+            connector_tokens: 4,
+            num_vision_tokens_each_frame: 4,
+            height: 31,
+            width: 47,
+            mode: AutoGazeInferenceMode::TiledResizeToGrid { tile_size: 16 },
+        },
+        ParityCase {
             name: "multiscale-resize",
             model_input: 16,
             scales: "8+16",
@@ -112,7 +122,12 @@ fn accelerator_embeddings_match_ndarray_reference() {
 
 #[test]
 fn tiled_embedding_batching_preserves_batch_order() {
-    let case = batched_tiled_case();
+    for case in [batched_tiled_case(), batched_anyres_tiled_case()] {
+        assert_tiled_embedding_batching_preserves_batch_order(case);
+    }
+}
+
+fn assert_tiled_embedding_batching_preserves_batch_order(case: ParityCase) {
     let device = Default::default();
     let single_tile_batches =
         deterministic_pipeline::<CpuBackend>(case, &device).with_tile_batch_size(1);
@@ -147,7 +162,12 @@ fn tiled_embedding_batching_preserves_batch_order() {
 
 #[test]
 fn tiled_trace_batching_preserves_batch_order() {
-    let case = batched_tiled_case();
+    for case in [batched_tiled_case(), batched_anyres_tiled_case()] {
+        assert_tiled_trace_batching_preserves_batch_order(case);
+    }
+}
+
+fn assert_tiled_trace_batching_preserves_batch_order(case: ParityCase) {
     let device = Default::default();
     let single_tile_batches =
         deterministic_pipeline::<CpuBackend>(case, &device).with_tile_batch_size(1);
@@ -227,7 +247,8 @@ fn pipeline_output<B: Backend>(case: ParityCase, device: &B::Device) -> Pipeline
     let output = pipeline.embed_video_with_mode(embeddings_video, case.mode);
     match case.mode {
         AutoGazeInferenceMode::ResizeToModelInput => assert_eq!(output.layout.tile_count(), 1),
-        AutoGazeInferenceMode::TiledFullResolution { .. } => {
+        AutoGazeInferenceMode::TiledResizeToGrid { .. }
+        | AutoGazeInferenceMode::TiledFullResolution { .. } => {
             assert!(
                 output.layout.tile_count() > 1,
                 "tiled case should exercise multiple tiles"
@@ -308,6 +329,19 @@ fn batched_tiled_case() -> ParityCase {
             tile_size: 16,
             stride: 16,
         },
+    }
+}
+
+fn batched_anyres_tiled_case() -> ParityCase {
+    ParityCase {
+        name: "multiscale-anyres-tile-batched",
+        model_input: 16,
+        scales: "8+16",
+        connector_tokens: 4,
+        num_vision_tokens_each_frame: 5,
+        height: 31,
+        width: 47,
+        mode: AutoGazeInferenceMode::TiledResizeToGrid { tile_size: 16 },
     }
 }
 

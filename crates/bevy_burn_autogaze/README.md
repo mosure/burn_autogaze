@@ -6,7 +6,7 @@ and UI layer; platform code only supplies frames and model bytes.
 ## Native
 
 ```sh
-cargo run -p bevy_burn_autogaze --features native -- \
+cargo run -p bevy_burn_autogaze -- \
   --model-dir /home/mosure/.cache/huggingface/hub/models--nvidia--AutoGaze/snapshots/5100fae739ec1bf3f875914fa1b703846a18943a \
   --mode realtime
 ```
@@ -21,22 +21,31 @@ toggles the text overlay for per-frame and EMA output update ratio.
 `--show-psnr=true` toggles PSNR in dB between the current input and rendered
 output; the pixel comparison is skipped when this overlay is disabled.
 `--help` lists the accepted values and aliases for mode-like options.
-`--log-pipeline-timing` prints pack, trace, visualization, and Bevy
-texture-update timing every few seconds. In `tiled` mode, source frames are
-padded to a non-overlapping 224px chunk grid and
-`--max-gaze-tokens-each-frame` controls the per-tile generation cap. The output
-recovery stitches each tile-local scale grid into a full-frame grid for that
-scale before clipping padded edge cells, matching upstream's mask recovery
-semantics. The viewer default is `24` for realtime use, exposing more of the
-multi-scale mask while staying below the NVIDIA model default budget. A value of
-`0` uses the model default, which is `198` for the NVIDIA config and is not a
-realtime setting. The maximum frame budget is
+`--log-pipeline-timing` prints source capture, resize/prep, pack, input
+upload/preprocess, model, visualization, and Bevy texture-update timing every
+few seconds. In `tiled` mode, source frames are resized into a complete AnyRes
+224px chunk grid and `--max-gaze-tokens-each-frame` controls the per-tile
+generation cap. The output recovery stitches each tile-local scale grid into a
+full-frame grid for that scale, matching upstream's mask recovery semantics.
+Use `--perf-summary-frames N` with `--image-path` or another deterministic
+source to process `N` inference outputs, print a JSON FPS/timing summary, and
+exit.
+The viewer display default is `--top-k 24` for realtime use. In `tiled` mode the
+defaults are `--top-k 2`, `--max-gaze-tokens-each-frame 0`,
+`--frames-per-clip 2`, and `--tile-batch-size 64`. Use
+`--frames-per-clip 16` when you want the upstream long-context clip length and
+can absorb the extra latency.
+The viewer keeps prepared frame tensors rolling so multi-frame clips only
+upload/preprocess the newest frame. A max-gaze value of `0` uses the model default,
+which is `198` for the NVIDIA config; pass a lower nonzero cap when you need a
+hard performance bound. The maximum frame budget is
 `max-gaze-tokens-each-frame * tile-count`, before task-loss stopping and
-padded-edge filtering. The native CLI defaults to a 640px-wide aspect-preserving
-source frame in `realtime` mode and 1280px-wide source frames in `tiled` mode.
-The native camera path requests a matching 16:9 stream when height is omitted.
-Pass explicit `--inference-width` and `--inference-height` values for fixed
-full-resolution inspection.
+confidence filtering. The native CLI defaults to a 640px-wide
+aspect-preserving source frame in `realtime` mode and 1280px-wide source frames
+in `tiled` mode. The native camera path requests a matching 16:9 stream when
+height is omitted. Pass explicit `--top-k`, `--tile-batch-size`,
+`--inference-width`, and `--inference-height` values for fixed full-resolution
+inspection.
 Use `--load-model=false` to verify camera/preview rendering without waiting for
 model load or inference.
 
@@ -77,7 +86,7 @@ UI is rendered by Bevy into the `#bevy` canvas, matching the native path. Pass
 the same viewer/inference knobs as query parameters:
 
 ```text
-http://localhost:8080/?mode=tiled&visualization-mode=interframe&keyframe-duration=12&frames-per-clip=16&inference-width=1920&inference-height=1080&task-loss-requirement=0.7&show-fps=true&show-gaze-ratio=true&show-psnr=true
+http://localhost:8080/?mode=tiled&visualization-mode=interframe&keyframe-duration=12&frames-per-clip=2&inference-width=1920&inference-height=1080&task-loss-requirement=0.7&tile-batch-size=4&show-fps=true&show-gaze-ratio=true&show-psnr=true
 ```
 
 Use `?source=static` for a generated static frame, or `?image-url=./frame.png`
@@ -87,6 +96,9 @@ queued for model inference and visualization; for generated static frames, those
 same query values also control the generated source resolution unless
 `static-width` or `static-height` are set. `load-model=false` keeps the viewer in
 preview mode for browser smoke tests.
+`perf-summary-frames=N` exposes live app timing at `window.__autogazePerf` and a
+final summary at `window.__autogazePerfSummary`, which is used by the Playwright
+smoke/perf checks.
 
 Use `config-url` and `weights-url` query parameters to point the wasm build at
 alternate model assets. `mask-radius-scale` remains accepted as a compatibility

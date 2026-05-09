@@ -363,7 +363,7 @@ where
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "ndarray"))]
 mod tests {
     use super::*;
     use burn::backend::NdArray;

@@ -4,7 +4,8 @@ use crate::{
 };
 use anyhow::{Result, anyhow, ensure};
 use burn::tensor::backend::{Backend, ExecutionError};
-use burn::tensor::ops::PadMode;
+use burn::tensor::module::interpolate;
+use burn::tensor::ops::{InterpolateMode, InterpolateOptions, PadMode};
 use burn::tensor::{Tensor, TensorData};
 use std::path::Path;
 
@@ -16,6 +17,9 @@ pub const AUTO_GAZE_RESCALE_FACTOR: f32 = 1.0 / 127.5;
 pub enum AutoGazeInferenceMode {
     #[default]
     ResizeToModelInput,
+    TiledResizeToGrid {
+        tile_size: usize,
+    },
     TiledFullResolution {
         tile_size: usize,
         stride: usize,
@@ -31,17 +35,21 @@ impl AutoGazeInferenceMode {
         Self::TiledFullResolution { tile_size, stride }
     }
 
+    pub const fn tiled_resize_to_grid(tile_size: usize) -> Self {
+        Self::TiledResizeToGrid { tile_size }
+    }
+
     pub fn tiled_model_input(model_input_size: usize) -> Self {
         let tile_size = model_input_size.max(1);
-        Self::TiledFullResolution {
-            tile_size,
-            stride: tile_size,
-        }
+        Self::TiledResizeToGrid { tile_size }
     }
 
     fn normalized(self) -> Self {
         match self {
             Self::ResizeToModelInput => Self::ResizeToModelInput,
+            Self::TiledResizeToGrid { tile_size } => Self::TiledResizeToGrid {
+                tile_size: tile_size.max(1),
+            },
             Self::TiledFullResolution { tile_size, stride } => {
                 let tile_size = tile_size.max(1);
                 let stride = stride.max(1).min(tile_size);
@@ -54,6 +62,13 @@ impl AutoGazeInferenceMode {
         let k = k.max(1);
         match self.normalized() {
             Self::ResizeToModelInput => k,
+            Self::TiledResizeToGrid { tile_size } => {
+                let tile_count =
+                    AutoGazeTileLayout::resized_grid(source_height, source_width, tile_size)
+                        .tile_count()
+                        .max(1);
+                k.saturating_mul(tile_count)
+            }
             Self::TiledFullResolution { tile_size, stride } => {
                 let tile_count =
                     AutoGazeTileLayout::tiled(source_height, source_width, tile_size, stride)
@@ -176,6 +191,34 @@ impl AutoGazeTileLayout {
         }
     }
 
+    pub fn resized_grid(source_height: usize, source_width: usize, tile_size: usize) -> Self {
+        let source_height = source_height.max(1);
+        let source_width = source_width.max(1);
+        let tile_size = tile_size.max(1);
+        let rows = source_height.div_ceil(tile_size).max(1);
+        let cols = source_width.div_ceil(tile_size).max(1);
+        let target_height = rows.saturating_mul(tile_size).max(1);
+        let target_width = cols.saturating_mul(tile_size).max(1);
+        let mut tiles = Vec::with_capacity(rows * cols);
+        for row in 0..rows {
+            for col in 0..cols {
+                tiles.push(AutoGazeTile::new(
+                    col * tile_size,
+                    row * tile_size,
+                    tile_size,
+                    tile_size,
+                ));
+            }
+        }
+        Self {
+            source_width: target_width,
+            source_height: target_height,
+            tile_size,
+            stride: tile_size,
+            tiles,
+        }
+    }
+
     pub fn tile_count(&self) -> usize {
         self.tiles.len()
     }
@@ -245,6 +288,14 @@ pub struct AutoGazePipeline<B: Backend> {
     max_gaze_tokens_each_frame: usize,
     task_loss_requirement: Option<f32>,
     tile_batch_size: usize,
+}
+
+struct TileTraceAccumulator<'a> {
+    batch: usize,
+    time: usize,
+    layout: &'a AutoGazeTileLayout,
+    frame_points: &'a mut [Vec<Vec<FixationPoint>>],
+    stop_probabilities: &'a mut [Vec<f32>],
 }
 
 impl<B: Backend> AutoGazePipeline<B> {
@@ -359,24 +410,19 @@ impl<B: Backend> AutoGazePipeline<B> {
                     layout: AutoGazeTileLayout::full_frame(height, width),
                 }
             }
+            AutoGazeInferenceMode::TiledResizeToGrid { tile_size } => {
+                let layout = AutoGazeTileLayout::resized_grid(height, width, tile_size);
+                let video = resize_video_to_layout_grid(video, &layout);
+                let embeddings = self.embed_tiled_video(video, batch, &layout);
+                AutoGazeEmbedOutput {
+                    embeddings,
+                    past_conv_values: Vec::new(),
+                    layout,
+                }
+            }
             AutoGazeInferenceMode::TiledFullResolution { tile_size, stride } => {
                 let layout = AutoGazeTileLayout::tiled(height, width, tile_size, stride);
-                let mut tile_embedding_chunks =
-                    Vec::with_capacity(layout.tile_count().div_ceil(self.tile_batch_size));
-                for tiles in layout.tiles.chunks(self.tile_batch_size) {
-                    let crops = tiles
-                        .iter()
-                        .copied()
-                        .map(|tile| crop_video_tile(video.clone(), tile))
-                        .collect::<Vec<_>>();
-                    let (embeddings, _) = self.embed_video_resize(Tensor::cat(crops, 0));
-                    tile_embedding_chunks.push(reassemble_tile_embeddings(
-                        embeddings,
-                        tiles.len(),
-                        batch,
-                    ));
-                }
-                let embeddings = Tensor::cat(tile_embedding_chunks, 2);
+                let embeddings = self.embed_tiled_video(video, batch, &layout);
                 AutoGazeEmbedOutput {
                     embeddings,
                     past_conv_values: Vec::new(),
@@ -493,40 +539,14 @@ impl<B: Backend> AutoGazePipeline<B> {
         let [batch, time, _channels, height, width] = video.shape().dims::<5>();
         match mode.normalized() {
             AutoGazeInferenceMode::ResizeToModelInput => self.trace_video_resize(video, k),
+            AutoGazeInferenceMode::TiledResizeToGrid { tile_size } => {
+                let layout = AutoGazeTileLayout::resized_grid(height, width, tile_size);
+                let video = resize_video_to_layout_grid(video, &layout);
+                self.trace_tiled_video(video, k, batch, time, &layout)
+            }
             AutoGazeInferenceMode::TiledFullResolution { tile_size, stride } => {
                 let layout = AutoGazeTileLayout::tiled(height, width, tile_size, stride);
-                let frame_budget = self
-                    .max_gaze_tokens_each_frame
-                    .max(k.max(1))
-                    .saturating_mul(layout.tile_count().max(1));
-                let mut frame_points = (0..batch)
-                    .map(|_| (0..time).map(|_| Vec::<FixationPoint>::new()).collect())
-                    .collect::<Vec<Vec<Vec<FixationPoint>>>>();
-                let mut stop_probabilities = vec![vec![0.0f32; time]; batch];
-                self.collect_tiled_trace_points(
-                    video,
-                    k,
-                    &layout,
-                    &mut frame_points,
-                    &mut stop_probabilities,
-                );
-                frame_points
-                    .into_iter()
-                    .zip(stop_probabilities)
-                    .map(|(batch_frames, batch_stop_probabilities)| {
-                        let frames = batch_frames
-                            .into_iter()
-                            .zip(batch_stop_probabilities)
-                            .map(|(mut points, stop_probability)| {
-                                points.sort_by(|left, right| {
-                                    right.confidence.total_cmp(&left.confidence)
-                                });
-                                FixationSet::new(points, stop_probability, frame_budget)
-                            })
-                            .collect();
-                        FrameFixationTrace::new(frames)
-                    })
-                    .collect()
+                self.trace_tiled_video(video, k, batch, time, &layout)
             }
         }
     }
@@ -542,43 +562,117 @@ impl<B: Backend> AutoGazePipeline<B> {
             AutoGazeInferenceMode::ResizeToModelInput => {
                 self.trace_video_resize_async(video, k).await
             }
+            AutoGazeInferenceMode::TiledResizeToGrid { tile_size } => {
+                let layout = AutoGazeTileLayout::resized_grid(height, width, tile_size);
+                let video = resize_video_to_layout_grid(video, &layout);
+                self.trace_tiled_video_async(video, k, batch, time, &layout)
+                    .await
+            }
             AutoGazeInferenceMode::TiledFullResolution { tile_size, stride } => {
                 let layout = AutoGazeTileLayout::tiled(height, width, tile_size, stride);
-                let frame_budget = self
-                    .max_gaze_tokens_each_frame
-                    .max(k.max(1))
-                    .saturating_mul(layout.tile_count().max(1));
-                let mut frame_points = (0..batch)
-                    .map(|_| (0..time).map(|_| Vec::<FixationPoint>::new()).collect())
-                    .collect::<Vec<Vec<Vec<FixationPoint>>>>();
-                let mut stop_probabilities = vec![vec![0.0f32; time]; batch];
-                self.collect_tiled_trace_points_async(
-                    video,
-                    k,
-                    &layout,
-                    &mut frame_points,
-                    &mut stop_probabilities,
-                )
-                .await?;
-                Ok(frame_points
-                    .into_iter()
-                    .zip(stop_probabilities)
-                    .map(|(batch_frames, batch_stop_probabilities)| {
-                        let frames = batch_frames
-                            .into_iter()
-                            .zip(batch_stop_probabilities)
-                            .map(|(mut points, stop_probability)| {
-                                points.sort_by(|left, right| {
-                                    right.confidence.total_cmp(&left.confidence)
-                                });
-                                FixationSet::new(points, stop_probability, frame_budget)
-                            })
-                            .collect();
-                        FrameFixationTrace::new(frames)
-                    })
-                    .collect())
+                self.trace_tiled_video_async(video, k, batch, time, &layout)
+                    .await
             }
         }
+    }
+
+    fn embed_tiled_video(
+        &self,
+        video: Tensor<B, 5>,
+        batch: usize,
+        layout: &AutoGazeTileLayout,
+    ) -> Tensor<B, 4> {
+        if dense_grid_layout(layout) {
+            let tiled_video = dense_grid_video_tiles(video, layout);
+            return self.embed_batched_tile_video(tiled_video, batch, layout);
+        }
+
+        let mut tile_embedding_chunks =
+            Vec::with_capacity(layout.tile_count().div_ceil(self.tile_batch_size));
+        for tiles in layout.tiles.chunks(self.tile_batch_size) {
+            let crops = tiles
+                .iter()
+                .copied()
+                .map(|tile| crop_video_tile(video.clone(), tile))
+                .collect::<Vec<_>>();
+            let (embeddings, _) = self.embed_video_resize(Tensor::cat(crops, 0));
+            tile_embedding_chunks.push(reassemble_tile_embeddings(embeddings, tiles.len(), batch));
+        }
+        Tensor::cat(tile_embedding_chunks, 2)
+    }
+
+    fn embed_batched_tile_video(
+        &self,
+        tile_video: Tensor<B, 5>,
+        batch: usize,
+        layout: &AutoGazeTileLayout,
+    ) -> Tensor<B, 4> {
+        let mut tile_embedding_chunks =
+            Vec::with_capacity(layout.tile_count().div_ceil(self.tile_batch_size));
+        for (chunk_index, tiles) in layout.tiles.chunks(self.tile_batch_size).enumerate() {
+            let start_tile = chunk_index.saturating_mul(self.tile_batch_size);
+            let tile_video = tile_batch_slice(tile_video.clone(), batch, start_tile, tiles.len());
+            let (embeddings, _) = self.embed_video_resize(tile_video);
+            tile_embedding_chunks.push(reassemble_tile_embeddings(embeddings, tiles.len(), batch));
+        }
+        Tensor::cat(tile_embedding_chunks, 2)
+    }
+
+    fn trace_tiled_video(
+        &self,
+        video: Tensor<B, 5>,
+        k: usize,
+        batch: usize,
+        time: usize,
+        layout: &AutoGazeTileLayout,
+    ) -> Vec<FrameFixationTrace> {
+        let frame_budget = self
+            .max_gaze_tokens_each_frame
+            .max(k.max(1))
+            .saturating_mul(layout.tile_count().max(1));
+        let mut frame_points = (0..batch)
+            .map(|_| (0..time).map(|_| Vec::<FixationPoint>::new()).collect())
+            .collect::<Vec<Vec<Vec<FixationPoint>>>>();
+        let mut stop_probabilities = vec![vec![0.0f32; time]; batch];
+        self.collect_tiled_trace_points(
+            video,
+            k,
+            layout,
+            &mut frame_points,
+            &mut stop_probabilities,
+        );
+        build_tiled_traces(frame_points, stop_probabilities, frame_budget)
+    }
+
+    async fn trace_tiled_video_async(
+        &self,
+        video: Tensor<B, 5>,
+        k: usize,
+        batch: usize,
+        time: usize,
+        layout: &AutoGazeTileLayout,
+    ) -> std::result::Result<Vec<FrameFixationTrace>, ExecutionError> {
+        let frame_budget = self
+            .max_gaze_tokens_each_frame
+            .max(k.max(1))
+            .saturating_mul(layout.tile_count().max(1));
+        let mut frame_points = (0..batch)
+            .map(|_| (0..time).map(|_| Vec::<FixationPoint>::new()).collect())
+            .collect::<Vec<Vec<Vec<FixationPoint>>>>();
+        let mut stop_probabilities = vec![vec![0.0f32; time]; batch];
+        self.collect_tiled_trace_points_async(
+            video,
+            k,
+            layout,
+            &mut frame_points,
+            &mut stop_probabilities,
+        )
+        .await?;
+        Ok(build_tiled_traces(
+            frame_points,
+            stop_probabilities,
+            frame_budget,
+        ))
     }
 
     fn trace_video_resize(&self, video: Tensor<B, 5>, k: usize) -> Vec<FrameFixationTrace> {
@@ -615,13 +709,27 @@ impl<B: Backend> AutoGazePipeline<B> {
     ) {
         let batch = frame_points.len();
         let time = frame_points.first().map_or(0, Vec::len);
+        let tile_trace_k = per_tile_trace_k(self.max_gaze_tokens_each_frame, k);
+        if dense_grid_layout(layout) {
+            let tile_video = dense_grid_video_tiles(video, layout);
+            let accumulator = TileTraceAccumulator {
+                batch,
+                time,
+                layout,
+                frame_points,
+                stop_probabilities,
+            };
+            self.collect_batched_tile_trace_points(tile_video, tile_trace_k, accumulator);
+            return;
+        }
+
         for tiles in layout.tiles.chunks(self.tile_batch_size) {
             let crops = tiles
                 .iter()
                 .copied()
                 .map(|tile| crop_video_tile(video.clone(), tile))
                 .collect::<Vec<_>>();
-            let tile_traces = self.trace_video_resize(Tensor::cat(crops, 0), k);
+            let tile_traces = self.trace_video_resize(Tensor::cat(crops, 0), tile_trace_k);
             collect_tile_trace_points(
                 &tile_traces,
                 tiles,
@@ -644,6 +752,21 @@ impl<B: Backend> AutoGazePipeline<B> {
     ) -> std::result::Result<(), ExecutionError> {
         let batch = frame_points.len();
         let time = frame_points.first().map_or(0, Vec::len);
+        let tile_trace_k = per_tile_trace_k(self.max_gaze_tokens_each_frame, k);
+        if dense_grid_layout(layout) {
+            let tile_video = dense_grid_video_tiles(video, layout);
+            let accumulator = TileTraceAccumulator {
+                batch,
+                time,
+                layout,
+                frame_points,
+                stop_probabilities,
+            };
+            self.collect_batched_tile_trace_points_async(tile_video, tile_trace_k, accumulator)
+                .await?;
+            return Ok(());
+        }
+
         for tiles in layout.tiles.chunks(self.tile_batch_size) {
             let crops = tiles
                 .iter()
@@ -651,7 +774,7 @@ impl<B: Backend> AutoGazePipeline<B> {
                 .map(|tile| crop_video_tile(video.clone(), tile))
                 .collect::<Vec<_>>();
             let tile_traces = self
-                .trace_video_resize_async(Tensor::cat(crops, 0), k)
+                .trace_video_resize_async(Tensor::cat(crops, 0), tile_trace_k)
                 .await?;
             collect_tile_trace_points(
                 &tile_traces,
@@ -661,6 +784,73 @@ impl<B: Backend> AutoGazePipeline<B> {
                 layout,
                 frame_points,
                 stop_probabilities,
+            );
+        }
+        Ok(())
+    }
+
+    fn collect_batched_tile_trace_points(
+        &self,
+        tile_video: Tensor<B, 5>,
+        tile_trace_k: usize,
+        accumulator: TileTraceAccumulator<'_>,
+    ) {
+        for (chunk_index, tiles) in accumulator
+            .layout
+            .tiles
+            .chunks(self.tile_batch_size)
+            .enumerate()
+        {
+            let start_tile = chunk_index.saturating_mul(self.tile_batch_size);
+            let tile_video = tile_batch_slice(
+                tile_video.clone(),
+                accumulator.batch,
+                start_tile,
+                tiles.len(),
+            );
+            let tile_traces = self.trace_video_resize(tile_video, tile_trace_k);
+            collect_tile_trace_points(
+                &tile_traces,
+                tiles,
+                accumulator.batch,
+                accumulator.time,
+                accumulator.layout,
+                &mut *accumulator.frame_points,
+                &mut *accumulator.stop_probabilities,
+            );
+        }
+    }
+
+    async fn collect_batched_tile_trace_points_async(
+        &self,
+        tile_video: Tensor<B, 5>,
+        tile_trace_k: usize,
+        accumulator: TileTraceAccumulator<'_>,
+    ) -> std::result::Result<(), ExecutionError> {
+        for (chunk_index, tiles) in accumulator
+            .layout
+            .tiles
+            .chunks(self.tile_batch_size)
+            .enumerate()
+        {
+            let start_tile = chunk_index.saturating_mul(self.tile_batch_size);
+            let tile_video = tile_batch_slice(
+                tile_video.clone(),
+                accumulator.batch,
+                start_tile,
+                tiles.len(),
+            );
+            let tile_traces = self
+                .trace_video_resize_async(tile_video, tile_trace_k)
+                .await?;
+            collect_tile_trace_points(
+                &tile_traces,
+                tiles,
+                accumulator.batch,
+                accumulator.time,
+                accumulator.layout,
+                &mut *accumulator.frame_points,
+                &mut *accumulator.stop_probabilities,
             );
         }
         Ok(())
@@ -816,6 +1006,83 @@ fn tile_origins(length: usize, stride: usize) -> Vec<usize> {
     origins
 }
 
+fn resize_video_to_layout_grid<B: Backend>(
+    video: Tensor<B, 5>,
+    layout: &AutoGazeTileLayout,
+) -> Tensor<B, 5> {
+    let [batch, time, channels, height, width] = video.shape().dims::<5>();
+    if height == layout.source_height && width == layout.source_width {
+        return video;
+    }
+
+    let video = video.reshape([batch * time, channels, height, width]);
+    let video = interpolate(
+        video,
+        [layout.source_height, layout.source_width],
+        InterpolateOptions::new(InterpolateMode::Bilinear).with_align_corners(false),
+    );
+    video.reshape([
+        batch,
+        time,
+        channels,
+        layout.source_height,
+        layout.source_width,
+    ])
+}
+
+fn dense_grid_layout(layout: &AutoGazeTileLayout) -> bool {
+    let tile_size = layout.tile_size.max(1);
+    if layout.stride != tile_size
+        || !layout.source_height.is_multiple_of(tile_size)
+        || !layout.source_width.is_multiple_of(tile_size)
+    {
+        return false;
+    }
+
+    let rows = layout.source_height / tile_size;
+    let cols = layout.source_width / tile_size;
+    if rows == 0 || cols == 0 || layout.tiles.len() != rows * cols {
+        return false;
+    }
+
+    layout.tiles.iter().enumerate().all(|(idx, tile)| {
+        let row = idx / cols;
+        let col = idx % cols;
+        tile.x == col * tile_size
+            && tile.y == row * tile_size
+            && tile.width == tile_size
+            && tile.height == tile_size
+    })
+}
+
+fn dense_grid_video_tiles<B: Backend>(
+    video: Tensor<B, 5>,
+    layout: &AutoGazeTileLayout,
+) -> Tensor<B, 5> {
+    debug_assert!(dense_grid_layout(layout));
+    let tile_size = layout.tile_size.max(1);
+    let [batch, time, channels, height, width] = video.shape().dims::<5>();
+    debug_assert_eq!(height, layout.source_height);
+    debug_assert_eq!(width, layout.source_width);
+    let rows = height / tile_size;
+    let cols = width / tile_size;
+    video
+        .reshape([batch * time, channels, rows, tile_size, cols, tile_size])
+        .permute([2, 4, 0, 1, 3, 5])
+        .reshape([rows * cols * batch, time, channels, tile_size, tile_size])
+}
+
+fn tile_batch_slice<B: Backend>(
+    tile_video: Tensor<B, 5>,
+    batch: usize,
+    start_tile: usize,
+    tile_count: usize,
+) -> Tensor<B, 5> {
+    let start = start_tile.saturating_mul(batch.max(1));
+    let end = start.saturating_add(tile_count.saturating_mul(batch.max(1)));
+    tile_video.slice_dim(0, start..end)
+}
+
 fn crop_video_tile<B: Backend>(video: Tensor<B, 5>, tile: AutoGazeTile) -> Tensor<B, 5> {
     let [_batch, _time, _channels, source_height, source_width] = video.shape().dims::<5>();
     let y_end = tile.y.saturating_add(tile.height).min(source_height);
@@ -850,6 +1117,32 @@ fn reassemble_tile_embeddings<B: Backend>(
         .reshape([tile_count, batch, time, tokens, dim])
         .permute([1, 2, 0, 3, 4])
         .reshape([batch, time, tile_count * tokens, dim])
+}
+
+fn per_tile_trace_k(max_gaze_tokens_each_frame: usize, display_k: usize) -> usize {
+    max_gaze_tokens_each_frame.max(display_k.max(1))
+}
+
+fn build_tiled_traces(
+    frame_points: Vec<Vec<Vec<FixationPoint>>>,
+    stop_probabilities: Vec<Vec<f32>>,
+    frame_budget: usize,
+) -> Vec<FrameFixationTrace> {
+    frame_points
+        .into_iter()
+        .zip(stop_probabilities)
+        .map(|(batch_frames, batch_stop_probabilities)| {
+            let frames = batch_frames
+                .into_iter()
+                .zip(batch_stop_probabilities)
+                .map(|(mut points, stop_probability)| {
+                    points.sort_by(|left, right| right.confidence.total_cmp(&left.confidence));
+                    FixationSet::new(points, stop_probability, frame_budget)
+                })
+                .collect();
+            FrameFixationTrace::new(frames)
+        })
+        .collect()
 }
 
 fn collect_tile_trace_points(
@@ -1016,6 +1309,45 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "ndarray")]
+    #[test]
+    fn dense_grid_video_tiles_matches_row_major_crop_cat_order() {
+        let device = Default::default();
+        let batch = 2;
+        let time = 3;
+        let channels = 1;
+        let height = 4;
+        let width = 6;
+        let values = (0..batch * time * channels * height * width)
+            .map(|idx| idx as f32)
+            .collect::<Vec<_>>();
+        let video = Tensor::<burn::backend::NdArray<f32>, 5>::from_data(
+            TensorData::new(values, [batch, time, channels, height, width]),
+            &device,
+        );
+        let layout = AutoGazeTileLayout::resized_grid(height, width, 2);
+        assert!(dense_grid_layout(&layout));
+
+        let expected = Tensor::cat(
+            layout
+                .tiles
+                .iter()
+                .copied()
+                .map(|tile| crop_video_tile(video.clone(), tile))
+                .collect::<Vec<_>>(),
+            0,
+        )
+        .into_data()
+        .to_vec::<f32>()
+        .expect("expected dense grid crop values");
+        let actual = dense_grid_video_tiles(video, &layout)
+            .into_data()
+            .to_vec::<f32>()
+            .expect("actual dense grid values");
+
+        assert_eq!(actual, expected);
+    }
+
     #[test]
     fn remap_tile_point_recovers_upstream_scale_grid() {
         let point = FixationPoint::with_grid_extent(0.5, 0.5, 1.0 / 14.0, 1.0 / 14.0, 1.0, 14);
@@ -1118,6 +1450,58 @@ mod tests {
         assert_eq!(layout.tiles[44], AutoGazeTile::new(1792, 896, 224, 224));
     }
 
+    #[test]
+    fn resized_grid_layout_uses_complete_anyres_tiles() {
+        let layout = AutoGazeTileLayout::resized_grid(1080, 1920, 224);
+
+        assert_eq!(layout.tile_count(), 45);
+        assert_eq!(layout.source_width, 2016);
+        assert_eq!(layout.source_height, 1120);
+        assert_eq!(layout.tiles[8], AutoGazeTile::new(1792, 0, 224, 224));
+        assert_eq!(layout.tiles[44], AutoGazeTile::new(1792, 896, 224, 224));
+    }
+
+    #[test]
+    fn resized_grid_remap_preserves_complete_scale_grids() {
+        let layout = AutoGazeTileLayout::resized_grid(1080, 1920, 224);
+
+        for (grid, expected_width, expected_height) in
+            [(2, 18, 10), (4, 36, 20), (7, 63, 35), (14, 126, 70)]
+        {
+            assert_eq!(
+                recovered_scale_grid(layout.source_width, layout.tile_size, grid),
+                expected_width
+            );
+            assert_eq!(
+                recovered_scale_grid(layout.source_height, layout.tile_size, grid),
+                expected_height
+            );
+
+            let point = FixationPoint::with_grid_extent(
+                (grid as f32 - 0.5) / grid as f32,
+                (grid as f32 - 0.5) / grid as f32,
+                1.0 / grid as f32,
+                1.0 / grid as f32,
+                1.0,
+                grid,
+            );
+            let bottom_right = layout.tiles[44];
+            let remapped =
+                remap_tile_point(point, bottom_right, &layout).expect("complete tile point");
+
+            assert_eq!(remapped.cell_grid(), Some(grid));
+            assert!(
+                (remapped.x - (expected_width as f32 - 0.5) / expected_width as f32).abs() < 1.0e-6
+            );
+            assert!(
+                (remapped.y - (expected_height as f32 - 0.5) / expected_height as f32).abs()
+                    < 1.0e-6
+            );
+            assert!((remapped.cell_width() - 1.0 / expected_width as f32).abs() < 1.0e-6);
+            assert!((remapped.cell_height() - 1.0 / expected_height as f32).abs() < 1.0e-6);
+        }
+    }
+
     #[cfg(feature = "ndarray")]
     #[test]
     fn crop_video_tile_pads_edge_chunks_to_model_tile_size() {
@@ -1132,6 +1516,54 @@ mod tests {
         let values = crop.into_data().to_vec::<f32>().expect("f32 tensor");
 
         assert_eq!(values, vec![4.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[cfg(feature = "ndarray")]
+    #[test]
+    fn resized_grid_mode_resizes_video_to_complete_tile_canvas() {
+        type B = burn::backend::NdArray<f32>;
+        let device = Default::default();
+        let video = Tensor::<B, 5>::from_data(
+            TensorData::new((0..6).map(|value| value as f32).collect(), [1, 1, 1, 2, 3]),
+            &device,
+        );
+        let layout = AutoGazeTileLayout::resized_grid(2, 3, 2);
+
+        let resized = resize_video_to_layout_grid(video, &layout);
+
+        assert_eq!(resized.shape().dims::<5>(), [1, 1, 1, 2, 4]);
+    }
+
+    #[cfg(feature = "ndarray")]
+    #[test]
+    fn resized_grid_mode_uses_bilinear_resampling_not_nearest() {
+        type B = burn::backend::NdArray<f32>;
+        let device = Default::default();
+        let video = Tensor::<B, 5>::from_data(
+            TensorData::new(vec![0.0, 10.0, 20.0, 30.0], [1, 1, 1, 2, 2]),
+            &device,
+        );
+        let layout = AutoGazeTileLayout::resized_grid(4, 4, 4);
+
+        let resized = resize_video_to_layout_grid(video, &layout)
+            .into_data()
+            .to_vec::<f32>()
+            .expect("resized values");
+
+        assert_eq!(resized.len(), 16);
+        assert!(
+            resized
+                .iter()
+                .any(|value| *value > 0.0 && *value < 10.0 && value.fract() != 0.0),
+            "resized grid did not contain fractional interpolated values: {resized:?}"
+        );
+    }
+
+    #[test]
+    fn tiled_trace_uses_generation_budget_not_display_top_k_per_tile() {
+        assert_eq!(per_tile_trace_k(198, 2), 198);
+        assert_eq!(per_tile_trace_k(10, 24), 24);
+        assert_eq!(per_tile_trace_k(0, 0), 1);
     }
 
     #[test]
@@ -1170,5 +1602,14 @@ mod tests {
             AutoGazeInferenceMode::resize_to_model_input().fixation_budget(2, 32, 48),
             2
         );
+    }
+
+    #[test]
+    fn resized_grid_fixation_budget_scales_with_anyres_tile_count() {
+        let mode = AutoGazeInferenceMode::tiled_resize_to_grid(16);
+        let layout = AutoGazeTileLayout::resized_grid(31, 47, 16);
+
+        assert_eq!(layout.tile_count(), 6);
+        assert_eq!(mode.fixation_budget(2, 31, 47), 12);
     }
 }

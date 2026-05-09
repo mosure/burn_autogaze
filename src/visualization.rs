@@ -620,6 +620,18 @@ mod tests {
     }
 
     #[test]
+    fn side_by_side_buffer_has_exact_three_column_size_for_tall_frames() {
+        let rgba = vec![
+            10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 1, 2, 3, 255,
+        ];
+        let visualization =
+            visualize_fixations_rgba(&rgba, 2, 2, &[], 1.0, 0.5).expect("visualize tall frame");
+
+        assert_eq!(visualization.side_by_side_width, 6);
+        assert_eq!(visualization.side_by_side_rgba.len(), 2 * 2 * 3 * 4);
+    }
+
+    #[test]
     fn interframe_mode_preserves_unmasked_regions_until_keyframe() {
         let point = FixationPoint::with_extent(0.25, 0.5, 0.5, 1.0, 1.0);
         let mut state = AutoGazeVisualizationState::new(AutoGazeVisualizationMode::Interframe, 3);

@@ -80,6 +80,10 @@ impl WasmAutoGaze {
         self.mode = AutoGazeInferenceMode::TiledFullResolution { tile_size, stride };
     }
 
+    pub fn set_anyres_tiled_mode(&mut self, tile_size: usize) {
+        self.mode = AutoGazeInferenceMode::TiledResizeToGrid { tile_size };
+    }
+
     pub fn set_top_k(&mut self, top_k: usize) {
         self.top_k = top_k.max(1);
     }
@@ -156,6 +160,9 @@ impl WasmAutoGaze {
     pub fn tile_count(&self, width: usize, height: usize) -> usize {
         match self.mode {
             AutoGazeInferenceMode::ResizeToModelInput => 1,
+            AutoGazeInferenceMode::TiledResizeToGrid { tile_size } => {
+                crate::AutoGazeTileLayout::resized_grid(height, width, tile_size).tile_count()
+            }
             AutoGazeInferenceMode::TiledFullResolution { tile_size, stride } => {
                 crate::AutoGazeTileLayout::tiled(height, width, tile_size, stride).tile_count()
             }
@@ -357,6 +364,9 @@ fn last_rgba_frame(rgba: &[u8], width: usize, height: usize, frames: usize) -> &
 fn mode_label(mode: AutoGazeInferenceMode) -> String {
     match mode {
         AutoGazeInferenceMode::ResizeToModelInput => "resize-224".to_string(),
+        AutoGazeInferenceMode::TiledResizeToGrid { tile_size } => {
+            format!("anyres-tile-{tile_size}")
+        }
         AutoGazeInferenceMode::TiledFullResolution { tile_size, stride } => {
             format!("tile-{tile_size}/{stride}")
         }

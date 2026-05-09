@@ -58,7 +58,7 @@ jobs:
           cargo install wasm-bindgen-cli --version "${version}" --locked
 
       - name: check bevy wasm target
-        run: cargo check -p bevy_burn_autogaze --target wasm32-unknown-unknown --no-default-features --features web
+        run: cargo check -p bevy_burn_autogaze --target wasm32-unknown-unknown
 
       - name: build bevy wasm artifacts
         working-directory: crates/bevy_burn_autogaze

@@ -3,9 +3,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check:native": "cargo check --features native",
-    "check:web": "cargo check --target wasm32-unknown-unknown --no-default-features --features web",
-    "build:wasm": "cargo build --target wasm32-unknown-unknown --no-default-features --features web --release && wasm-bindgen --target web --out-dir www/out --out-name bevy_burn_autogaze ../../target/wasm32-unknown-unknown/release/bevy_burn_autogaze.wasm",
+    "check:native": "cargo check",
+    "check:web": "cargo check --target wasm32-unknown-unknown",
+    "build:wasm": "cargo build --target wasm32-unknown-unknown --release && wasm-bindgen --target web --out-dir www/out --out-name bevy_burn_autogaze ../../target/wasm32-unknown-unknown/release/bevy_burn_autogaze.wasm",
     "serve": "python3 -m http.server 8080 -d www",
     "test:browser": "playwright test --config playwright.config.mjs"
   },

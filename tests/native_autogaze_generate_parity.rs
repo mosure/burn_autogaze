@@ -113,8 +113,40 @@ fn native_autogaze_generate_matches_official_fixture() {
         .unwrap_or(1)
         .max(1) as usize;
 
+    let actual_uncached =
+        model
+            .gazing_model
+            .generate_uncached(video.clone(), max_gaze_tokens_each_frame, None);
+    let actual_cached =
+        model
+            .gazing_model
+            .generate_cached(video.clone(), max_gaze_tokens_each_frame, None);
     let actual = model.generate(video, max_gaze_tokens_each_frame);
     assert_eq!(actual.gazing_pos.len(), 1, "expected single batch fixture");
+    assert_eq!(
+        actual.gazing_pos, actual_uncached.gazing_pos,
+        "public and full-sequence gaze token ids diverged"
+    );
+    assert_eq!(
+        actual.num_gazing_each_frame, actual_uncached.num_gazing_each_frame,
+        "public and full-sequence per-frame lengths diverged"
+    );
+    assert_eq!(
+        actual.if_padded_gazing, actual_uncached.if_padded_gazing,
+        "public and full-sequence padding masks diverged"
+    );
+    assert_eq!(
+        actual_cached.gazing_pos, actual_uncached.gazing_pos,
+        "KV-cache and full-sequence gaze token ids diverged"
+    );
+    assert_eq!(
+        actual_cached.num_gazing_each_frame, actual_uncached.num_gazing_each_frame,
+        "KV-cache and full-sequence per-frame lengths diverged"
+    );
+    assert_eq!(
+        actual_cached.if_padded_gazing, actual_uncached.if_padded_gazing,
+        "KV-cache and full-sequence padding masks diverged"
+    );
     assert_eq!(
         actual.gazing_pos[0], expected_gazing_pos,
         "generated gaze token ids diverged"
