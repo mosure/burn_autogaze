@@ -6,10 +6,10 @@ pub mod camera {
     };
     use std::time::Duration;
 
-    use image::{RgbImage, RgbaImage};
+    use image::RgbaImage;
     use nokhwa::{
         Camera, nokhwa_initialize,
-        pixel_format::RgbFormat,
+        pixel_format::RgbAFormat,
         query,
         utils::{
             ApiBackend, CameraFormat, CameraInfo, FrameFormat, RequestedFormat, RequestedFormatType,
@@ -110,11 +110,11 @@ pub mod camera {
             }
 
             match camera.frame() {
-                Ok(buffer) => match buffer.decode_image::<RgbFormat>() {
+                Ok(buffer) => match buffer.decode_image::<RgbAFormat>() {
                     Ok(image) => {
                         error_count = 0;
                         if let Some(sender) = SAMPLE_SENDER.get() {
-                            let _ = sender.try_send(rgb_to_rgba(image));
+                            let _ = sender.try_send(image);
                         }
                     }
                     Err(err) => {
@@ -152,23 +152,11 @@ pub mod camera {
         last_image
     }
 
-    fn rgb_to_rgba(image: RgbImage) -> RgbaImage {
-        let (width, height) = image.dimensions();
-        let rgb = image.into_raw();
-        let mut rgba = vec![255u8; width as usize * height as usize * 4];
-        for (src, dst) in rgb.chunks_exact(3).zip(rgba.chunks_exact_mut(4)) {
-            dst[0] = src[0];
-            dst[1] = src[1];
-            dst[2] = src[2];
-        }
-        RgbaImage::from_raw(width, height, rgba).expect("valid rgba frame")
-    }
-
     fn open_first_camera(devices: &[CameraInfo], request: CameraRequest) -> Option<Camera> {
         let requested_formats = [
             (
                 "closest requested MJPEG",
-                RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(
+                RequestedFormat::new::<RgbAFormat>(RequestedFormatType::Closest(
                     CameraFormat::new_from(
                         request.width.max(1),
                         request.height.max(1),
@@ -179,7 +167,7 @@ pub mod camera {
             ),
             (
                 "closest requested YUYV",
-                RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(
+                RequestedFormat::new::<RgbAFormat>(RequestedFormatType::Closest(
                     CameraFormat::new_from(
                         request.width.max(1),
                         request.height.max(1),
@@ -190,7 +178,7 @@ pub mod camera {
             ),
             (
                 "backend default",
-                RequestedFormat::new::<RgbFormat>(RequestedFormatType::None),
+                RequestedFormat::new::<RgbAFormat>(RequestedFormatType::None),
             ),
         ];
 

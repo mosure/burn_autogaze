@@ -27,11 +27,13 @@ use bevy::{
 };
 use bevy_burn::{BevyBurnBridgePlugin, BevyBurnHandle, BindingDirection, BurnDevice, TransferKind};
 use burn::tensor::{Int, Tensor};
+#[cfg(test)]
+use burn_autogaze::fixation_scale_mask_rgba;
 #[cfg(target_arch = "wasm32")]
 use burn_autogaze::{AutoGazeConfig, AutoGazeLoadOptions, NativeAutoGazeModel};
 use burn_autogaze::{
     AutoGazeInferenceMode, AutoGazePipeline, AutoGazeRgbaClipShape, AutoGazeVisualizationMode,
-    FixationPoint, fixation_alpha_mask, fixation_scale_mask_rgba,
+    AutoGazeVisualizationState, FixationPoint,
 };
 use image::{RgbaImage, imageops::FilterType};
 
@@ -424,40 +426,19 @@ impl FrameQueue {
 struct StaticFrame(Option<Arc<RgbaImage>>);
 
 #[derive(Resource, Clone)]
-struct BevyVisualizationState {
-    mode: AutoGazeVisualizationMode,
-    keyframe_duration: usize,
-    frame_index: usize,
-    interframe_output_rgba: Vec<u8>,
-    interframe_width: usize,
-    interframe_height: usize,
-}
+struct BevyVisualizationState(AutoGazeVisualizationState);
 
 impl BevyVisualizationState {
     fn new(mode: AutoGazeVisualizationMode, keyframe_duration: usize) -> Self {
-        Self {
-            mode,
-            keyframe_duration: keyframe_duration.max(1),
-            frame_index: 0,
-            interframe_output_rgba: Vec::new(),
-            interframe_width: 0,
-            interframe_height: 0,
-        }
+        Self(AutoGazeVisualizationState::new(mode, keyframe_duration))
     }
 
     fn configure(&mut self, mode: AutoGazeVisualizationMode, keyframe_duration: usize) {
-        if self.mode != mode {
-            self.reset();
-        }
-        self.mode = mode;
-        self.keyframe_duration = keyframe_duration.max(1);
+        self.0.configure(mode, keyframe_duration);
     }
 
     fn reset(&mut self) {
-        self.frame_index = 0;
-        self.interframe_output_rgba.clear();
-        self.interframe_width = 0;
-        self.interframe_height = 0;
+        self.0.reset();
     }
 }
 
@@ -1383,75 +1364,37 @@ fn visualize_points_tensor(
 ) -> Result<Visualization, String> {
     let width = rgba.width().max(1) as usize;
     let height = rgba.height().max(1) as usize;
-    let pixels = width
-        .checked_mul(height)
-        .ok_or_else(|| "AutoGaze visualization dimensions overflow".to_string())?;
-    let expected_bytes = pixels
-        .checked_mul(4)
-        .ok_or_else(|| "AutoGaze visualization byte length overflow".to_string())?;
-    if rgba.as_raw().len() != expected_bytes {
-        return Err(format!(
-            "expected {expected_bytes} RGBA bytes for {width}x{height}, got {}",
-            rgba.as_raw().len()
-        ));
-    }
-
     let input = rgba.as_raw();
-    let alpha = fixation_alpha_mask(width, height, points, options.cell_scale);
-    let mask_visual = fixation_scale_mask_rgba(width, height, points, options.cell_scale);
-
-    let dimensions_changed = visualization_state.interframe_width != width
-        || visualization_state.interframe_height != height;
-    let keyframe = dimensions_changed
-        || visualization_state.interframe_output_rgba.len() != expected_bytes
-        || visualization_state.frame_index == 0
-        || visualization_state
-            .frame_index
-            .is_multiple_of(visualization_state.keyframe_duration);
-    let (output_rgba, updated_pixel_count) = match visualization_state.mode {
-        AutoGazeVisualizationMode::FullBlend => {
-            let output = alpha_blend_rgba(input, &alpha, options.blend_alpha)?;
-            (output, pixels)
-        }
-        AutoGazeVisualizationMode::Interframe if keyframe => {
-            visualization_state.interframe_output_rgba.clear();
-            visualization_state
-                .interframe_output_rgba
-                .extend_from_slice(input);
-            visualization_state.interframe_width = width;
-            visualization_state.interframe_height = height;
-            (visualization_state.interframe_output_rgba.clone(), pixels)
-        }
-        AutoGazeVisualizationMode::Interframe => {
-            let mut updated_pixel_count = 0usize;
-            for (pixel, &mask) in alpha.iter().enumerate() {
-                if mask == 0 {
-                    continue;
-                }
-                let offset = pixel * 4;
-                visualization_state.interframe_output_rgba[offset..offset + 4]
-                    .copy_from_slice(&input[offset..offset + 4]);
-                updated_pixel_count += 1;
-            }
-            (
-                visualization_state.interframe_output_rgba.clone(),
-                updated_pixel_count,
-            )
-        }
-    };
-    visualization_state.frame_index = visualization_state.frame_index.saturating_add(1);
-
+    let visualization = visualization_state
+        .0
+        .visualize_rgba(
+            input,
+            width,
+            height,
+            points,
+            options.cell_scale,
+            options.blend_alpha,
+        )
+        .map_err(|err| format!("{err:#}"))?;
     let psnr_db = options
         .calculate_psnr
-        .then(|| psnr_db_rgba(input, &output_rgba))
+        .then(|| {
+            visualization
+                .output_psnr_db(input)
+                .map_err(|err| format!("{err:#}"))
+        })
         .transpose()?;
-    let side_by_side = side_by_side_rgba(input, &mask_visual, &output_rgba, width, height)?;
-    let tensor = rgba_tensor(&side_by_side, width * 3, height, device);
+    let tensor = rgba_tensor(
+        &visualization.side_by_side_rgba,
+        visualization.side_by_side_width,
+        visualization.height,
+        device,
+    );
     Ok(Visualization {
-        width: (width * 3) as u32,
-        height: height as u32,
+        width: visualization.side_by_side_width as u32,
+        height: visualization.height as u32,
         tensor,
-        gaze_update_ratio: ratio(updated_pixel_count, pixels),
+        gaze_update_ratio: visualization.update_ratio(),
         psnr_db,
         timing: None,
     })
@@ -1485,146 +1428,6 @@ fn rgba_tensor(
         .float()
         .div_scalar(255.0)
         .reshape([height, width, 4])
-}
-
-fn alpha_blend_rgba(rgba: &[u8], alpha: &[u8], blend_alpha: f32) -> Result<Vec<u8>, String> {
-    if !rgba.len().is_multiple_of(4) {
-        return Err("RGBA buffer length must be divisible by 4".to_string());
-    }
-    let pixels = rgba.len() / 4;
-    if alpha.len() != pixels {
-        return Err(format!(
-            "expected {pixels} alpha values, got {}",
-            alpha.len()
-        ));
-    }
-    let blend_alpha = blend_alpha.clamp(0.0, 1.0);
-    let mut output = Vec::with_capacity(rgba.len());
-    for (pixel, mask) in alpha.iter().copied().enumerate() {
-        let offset = pixel * 4;
-        let overlay = if mask > 0 { blend_alpha } else { 0.0 };
-        for channel in 0..3 {
-            let base = rgba[offset + channel] as f32;
-            output.push((base * (1.0 - overlay) + 255.0 * overlay).round() as u8);
-        }
-        output.push(rgba[offset + 3]);
-    }
-    Ok(output)
-}
-
-fn side_by_side_rgba(
-    input: &[u8],
-    mask: &[u8],
-    output: &[u8],
-    width: usize,
-    height: usize,
-) -> Result<Vec<u8>, String> {
-    let expected_bytes = width
-        .checked_mul(height)
-        .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or_else(|| "AutoGaze visualization byte length overflow".to_string())?;
-    if input.len() != expected_bytes
-        || mask.len() != expected_bytes
-        || output.len() != expected_bytes
-    {
-        return Err(format!(
-            "expected {expected_bytes} bytes for each side-by-side panel, got input={}, mask={}, output={}",
-            input.len(),
-            mask.len(),
-            output.len()
-        ));
-    }
-
-    let side_width = width
-        .checked_mul(3)
-        .ok_or_else(|| "AutoGaze side-by-side width overflow".to_string())?;
-    let side_bytes = side_width
-        .checked_mul(height)
-        .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or_else(|| "AutoGaze side-by-side byte length overflow".to_string())?;
-    let mut side_by_side = vec![0u8; side_bytes];
-    for y in 0..height {
-        let src_row = y * width * 4;
-        let dst_row = y * side_width * 4;
-        let row_bytes = width * 4;
-        side_by_side[dst_row..dst_row + row_bytes]
-            .copy_from_slice(&input[src_row..src_row + row_bytes]);
-        let mask_dst = dst_row + row_bytes;
-        side_by_side[mask_dst..mask_dst + row_bytes]
-            .copy_from_slice(&mask[src_row..src_row + row_bytes]);
-        let output_dst = dst_row + row_bytes * 2;
-        side_by_side[output_dst..output_dst + row_bytes]
-            .copy_from_slice(&output[src_row..src_row + row_bytes]);
-    }
-    Ok(side_by_side)
-}
-
-fn psnr_db_rgba(reference: &[u8], candidate: &[u8]) -> Result<f64, String> {
-    if reference.len() != candidate.len() {
-        return Err("PSNR inputs must have the same byte length".to_string());
-    }
-    if !reference.len().is_multiple_of(4) {
-        return Err("PSNR inputs must be RGBA buffers".to_string());
-    }
-    if reference.is_empty() {
-        return Err("PSNR inputs must be nonempty".to_string());
-    }
-
-    let mut squared_error = 0.0f64;
-    let mut samples = 0usize;
-    for (reference, candidate) in reference.chunks_exact(4).zip(candidate.chunks_exact(4)) {
-        for channel in 0..3 {
-            let diff = reference[channel] as f64 - candidate[channel] as f64;
-            squared_error += diff * diff;
-            samples += 1;
-        }
-    }
-    if squared_error == 0.0 {
-        return Ok(f64::INFINITY);
-    }
-    let mse_unit_range = squared_error / samples.max(1) as f64 / (255.0 * 255.0);
-    Ok(psnr_db_from_mse(mse_unit_range))
-}
-
-#[cfg(test)]
-fn mask_blend_data(alpha: &[u8]) -> Vec<f32> {
-    let mut data = Vec::with_capacity(alpha.len() * 4);
-    for &mask in alpha {
-        let value = mask_value(mask);
-        data.extend_from_slice(&[value, value, value, 0.0]);
-    }
-    data
-}
-
-#[cfg(test)]
-fn mask_update_data(alpha: &[u8]) -> Vec<f32> {
-    let mut data = Vec::with_capacity(alpha.len() * 4);
-    for &mask in alpha {
-        let value = mask_value(mask);
-        data.extend_from_slice(&[value, value, value, value]);
-    }
-    data
-}
-
-#[cfg(test)]
-fn mask_value(mask: u8) -> f32 {
-    if mask > 0 { 1.0 } else { 0.0 }
-}
-
-fn psnr_db_from_mse(mse: f64) -> f64 {
-    if mse == 0.0 {
-        f64::INFINITY
-    } else {
-        10.0 * (1.0 / mse).log10()
-    }
-}
-
-fn ratio(count: usize, total: usize) -> f64 {
-    if total == 0 {
-        0.0
-    } else {
-        count as f64 / total as f64
-    }
 }
 
 fn apply_visualization_to_texture(
@@ -2110,15 +1913,6 @@ mod tests {
     }
 
     #[test]
-    fn tensor_mask_data_uses_crisp_blend_and_update_channels() {
-        let blend = mask_blend_data(&[255, 0]);
-        let update = mask_update_data(&[255, 0]);
-
-        assert_eq!(blend, vec![1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
-        assert_eq!(update, vec![1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
-    }
-
-    #[test]
     fn bevy_visualization_mask_data_uses_crisp_multiscale_cell_bounds() {
         let point = FixationPoint::with_extent(0.25, 0.25, 0.5, 0.5, 1.0);
         let mask = fixation_scale_mask_rgba(4, 4, &[point], 1.0);
@@ -2134,11 +1928,5 @@ mod tests {
                 assert_eq!(&mask[src..src + 4], &expected, "mask {x},{y}");
             }
         }
-    }
-
-    #[test]
-    fn psnr_uses_unit_range_mse() {
-        assert!(psnr_db_from_mse(0.0).is_infinite());
-        assert!((psnr_db_from_mse(0.25) - 6.020_599_913).abs() < 1.0e-9);
     }
 }

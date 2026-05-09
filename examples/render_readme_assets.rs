@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail, ensure};
 use burn::tensor::backend::Backend;
 use burn_autogaze::{
     AutoGazeInferenceMode, AutoGazePipeline, AutoGazeRgbaClipShape, AutoGazeTileLayout,
-    AutoGazeVisualizationMode, AutoGazeVisualizationState, FixationPoint, fixation_scale_mask_rgba,
+    AutoGazeVisualizationMode, AutoGazeVisualizationState, FixationPoint,
 };
 use serde::Serialize;
 use std::{
@@ -301,15 +301,9 @@ where
                 args.blend_alpha,
             )?;
             let psnr_db = visualization.output_psnr_db(current)?;
-            let scale_mask = fixation_scale_mask_rgba(
-                args.inference_width,
-                args.inference_height,
-                &points,
-                args.mask_cell_scale,
-            );
             stats.record_ratios(visualization.mask_ratio(), visualization.update_ratio());
             stats.record_psnr(psnr_db);
-            mask_rgba.extend_from_slice(&scale_mask);
+            mask_rgba.extend_from_slice(&visualization.mask_rgba);
             output_rgba.extend_from_slice(visualization.output_rgba());
             println!(
                 "frame {:02}/{:02}: points={} mask={:.2}% update={:.2}% psnr={}",

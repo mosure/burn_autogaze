@@ -214,15 +214,16 @@ pub fn rgba_clip_to_tensor<B: Backend>(
     );
 
     let mut values = Vec::with_capacity(shape.clip_len * 3 * pixels_per_frame);
+    // The upstream processor emits RGB video as [batch, time, channel, height, width].
+    // Alpha is intentionally ignored.
     for frame in 0..shape.clip_len {
         let frame_offset = frame * pixels_per_frame * 4;
         for channel in 0..3 {
             for pixel in 0..pixels_per_frame {
-                let value = rgba[frame_offset + pixel * 4 + channel] as f32;
-                let rescaled = value * AUTO_GAZE_RESCALE_FACTOR - 1.0;
-                values.push(
-                    (rescaled - AUTO_GAZE_IMAGE_MEAN[channel]) / AUTO_GAZE_IMAGE_STD[channel],
-                );
+                values.push(autogaze_processor_value(
+                    rgba[frame_offset + pixel * 4 + channel],
+                    channel,
+                ));
             }
         }
     }
@@ -231,6 +232,11 @@ pub fn rgba_clip_to_tensor<B: Backend>(
         TensorData::new(values, [1, shape.clip_len, 3, shape.height, shape.width]),
         device,
     ))
+}
+
+fn autogaze_processor_value(value: u8, channel: usize) -> f32 {
+    let rescaled = value as f32 * AUTO_GAZE_RESCALE_FACTOR - 1.0;
+    (rescaled - AUTO_GAZE_IMAGE_MEAN[channel]) / AUTO_GAZE_IMAGE_STD[channel]
 }
 
 #[derive(Clone, Debug)]
@@ -950,12 +956,12 @@ mod tests {
         let values = tensor.into_data().to_vec::<f32>().expect("f32 tensor");
 
         let expected = [
-            channel_processor_value(10, 0),
-            channel_processor_value(40, 0),
-            channel_processor_value(20, 1),
-            channel_processor_value(50, 1),
-            channel_processor_value(30, 2),
-            channel_processor_value(60, 2),
+            autogaze_processor_value(10, 0),
+            autogaze_processor_value(40, 0),
+            autogaze_processor_value(20, 1),
+            autogaze_processor_value(50, 1),
+            autogaze_processor_value(30, 2),
+            autogaze_processor_value(60, 2),
         ];
         for (actual, expected) in values.iter().zip(expected) {
             assert!((actual - expected).abs() < 1.0e-6);
@@ -963,9 +969,27 @@ mod tests {
     }
 
     #[cfg(feature = "ndarray")]
-    fn channel_processor_value(value: u8, channel: usize) -> f32 {
-        let rescaled = value as f32 * AUTO_GAZE_RESCALE_FACTOR - 1.0;
-        (rescaled - AUTO_GAZE_IMAGE_MEAN[channel]) / AUTO_GAZE_IMAGE_STD[channel]
+    #[test]
+    fn rgba_clip_to_tensor_preserves_clip_channel_order_and_ignores_alpha() {
+        let device = Default::default();
+        let rgba = [1, 2, 3, 4, 10, 20, 30, 250];
+        let shape = AutoGazeRgbaClipShape::new(2, 1, 1);
+        let tensor = rgba_clip_to_tensor::<burn::backend::NdArray<f32>>(&rgba, shape, &device)
+            .expect("rgba tensor");
+        let values = tensor.into_data().to_vec::<f32>().expect("f32 tensor");
+
+        let expected = [
+            autogaze_processor_value(1, 0),
+            autogaze_processor_value(2, 1),
+            autogaze_processor_value(3, 2),
+            autogaze_processor_value(10, 0),
+            autogaze_processor_value(20, 1),
+            autogaze_processor_value(30, 2),
+        ];
+        assert_eq!(values.len(), expected.len());
+        for (actual, expected) in values.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1.0e-6);
+        }
     }
 
     #[test]
