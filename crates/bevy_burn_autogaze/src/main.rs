@@ -16,7 +16,7 @@ struct NativeArgs {
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     show_gaze_ratio: bool,
 
-    #[arg(long, default_value_t = true, action = ArgAction::Set)]
+    #[arg(long, default_value_t = false, action = ArgAction::Set)]
     show_psnr: bool,
 
     #[arg(long, default_value = bevy_burn_autogaze::DEFAULT_NATIVE_MODEL_DIR)]
@@ -49,8 +49,12 @@ struct NativeArgs {
     #[arg(long, default_value_t = 2)]
     frames_per_clip: usize,
 
-    #[arg(long, alias = "width")]
-    inference_width: Option<u32>,
+    #[arg(
+        long,
+        alias = "width",
+        default_value_t = bevy_burn_autogaze::DEFAULT_REALTIME_INFERENCE_WIDTH
+    )]
+    inference_width: u32,
 
     #[arg(long, alias = "height")]
     inference_height: Option<u32>,
@@ -83,6 +87,9 @@ impl From<NativeArgs> for BevyBurnAutoGazeConfig {
             .visualization_mode
             .parse()
             .unwrap_or_else(|err| panic!("{err}"));
+        let defaults = BevyBurnAutoGazeConfig::default();
+        let inference_width = Some(args.inference_width);
+        let inference_height = args.inference_height.or(defaults.inference_height);
         Self {
             press_esc_to_close: args.press_esc_to_close,
             show_fps: args.show_fps,
@@ -98,14 +105,14 @@ impl From<NativeArgs> for BevyBurnAutoGazeConfig {
             task_loss_requirement: args.task_loss_requirement,
             disable_task_loss_requirement: args.disable_task_loss_requirement,
             frames_per_clip: args.frames_per_clip,
-            inference_width: args.inference_width,
-            inference_height: args.inference_height,
+            inference_width,
+            inference_height,
             mask_cell_scale: args.mask_cell_scale,
             blend_alpha: args.blend_alpha,
             visualization_mode,
             keyframe_duration: args.keyframe_duration.max(1),
             log_pipeline_timing: args.log_pipeline_timing,
-            ..Default::default()
+            ..defaults
         }
     }
 }

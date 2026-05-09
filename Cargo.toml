@@ -25,7 +25,7 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = ["ndarray", "webgpu"]
 ndarray = ["burn/ndarray"]
-webgpu = ["burn/webgpu", "burn-store/wgpu"]
+webgpu = ["burn/webgpu"]
 wgpu = ["burn/wgpu", "burn-store/wgpu"]
 cuda = ["burn/cuda", "burn-store/cuda"]
 wasm = [
@@ -68,3 +68,8 @@ tempfile = "3"
 [[bench]]
 name = "backend_pipeline"
 harness = false
+
+[profile.dev]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false

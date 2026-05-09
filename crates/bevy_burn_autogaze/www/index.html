@@ -57,6 +57,13 @@
       const loading = document.querySelector(".loading");
       const status = document.getElementById("status");
       const video = document.getElementById("webcam");
+      window.__autogazeFrameStats = {
+        count: 0,
+        firstFrameMs: null,
+        lastFrameMs: null,
+        lastWidth: 0,
+        lastHeight: 0,
+      };
 
       boot();
 
@@ -140,7 +147,7 @@
 
         function pump(now) {
           if (now - lastFrame >= frameInterval) {
-            frame_input(frame.data, frame.width, frame.height);
+            submitFrame(frame.data, frame.width, frame.height);
             lastFrame = now;
           }
           requestAnimationFrame(pump);
@@ -205,7 +212,7 @@
         const pixelBuffer = new Uint8Array(frame.allocationSize({ format }));
         try {
           await frame.copyTo(pixelBuffer, { format });
-          frame_input(pixelBuffer, frame.displayWidth, frame.displayHeight);
+          submitFrame(pixelBuffer, frame.displayWidth, frame.displayHeight);
         } finally {
           frame.close();
         }
@@ -220,9 +227,20 @@
           }
           context.drawImage(video, 0, 0, canvas.width, canvas.height);
           const image = context.getImageData(0, 0, canvas.width, canvas.height);
-          frame_input(new Uint8Array(image.data), canvas.width, canvas.height);
+          submitFrame(new Uint8Array(image.data), canvas.width, canvas.height);
         }
         requestAnimationFrame(() => captureWithCanvas(canvas, context));
+      }
+
+      function submitFrame(data, width, height) {
+        frame_input(data, width, height);
+        const stats = window.__autogazeFrameStats;
+        const now = performance.now();
+        stats.count += 1;
+        stats.firstFrameMs ??= now;
+        stats.lastFrameMs = now;
+        stats.lastWidth = width;
+        stats.lastHeight = height;
       }
 
       function clampNumber(value, min, max, fallback) {

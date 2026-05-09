@@ -18,8 +18,8 @@ viewer/inference knobs include `--top-k`, `--frames-per-clip`,
 `--task-loss-requirement`, `--disable-task-loss-requirement`,
 `--mask-cell-scale`, `--blend-alpha`, and `--show-fps`. `--show-gaze-ratio`
 toggles the text overlay for per-frame and EMA output update ratio.
-`--show-psnr` toggles PSNR in dB between the current input and rendered output;
-the pixel comparison is skipped when this overlay is disabled.
+`--show-psnr=true` toggles PSNR in dB between the current input and rendered
+output; the pixel comparison is skipped when this overlay is disabled.
 `--log-pipeline-timing=true` prints pack, trace, sync, visualization, and Bevy
 texture-update timing every few seconds. In `tile-224` mode, source frames are
 padded to a non-overlapping 224px chunk grid and
@@ -27,17 +27,23 @@ padded to a non-overlapping 224px chunk grid and
 default is `4` for realtime use. A value of `0` uses the model default, which is
 `198` for the NVIDIA config and is not a realtime setting. The maximum frame
 budget is `max-gaze-tokens-each-frame * tile-count`, before task-loss stopping
-and padded-edge filtering.
+and padded-edge filtering. The viewer also defaults source frames to 224px wide
+while preserving aspect ratio so the native camera path tracks the realtime
+resize-224 benchmark without an extra high-resolution visualization/upload cost.
+Pass explicit `--inference-width` and `--inference-height` values for
+full-resolution inspection.
 Use `--load-model=false` to verify camera/preview rendering without waiting for
 model load or inference.
 
 `--visualization-mode full-blend` renders the current frame's alpha-blended
-mask. `--visualization-mode interframe --keyframe-duration 30` preserves the
-previous output outside masked cells, updates masked cells to the current input,
-and redraws a full keyframe every 30 processed frames. The gaze-ratio overlay
-reports the percentage of output pixels updated on the current frame plus an EMA
-across processed frames. The PSNR overlay reports current-frame and EMA dB for
-the output column compared to the current input frame.
+mask. The center mask panel colors the decoded multi-scale AutoGaze cells by
+scale and draws crisp cell bounds. `--visualization-mode interframe
+--keyframe-duration 30` preserves the previous output outside masked cells,
+updates masked cells to the current input, and redraws a full keyframe every 30
+processed frames. The gaze-ratio overlay reports the percentage of output pixels
+updated on the current frame plus an EMA across processed frames. The PSNR
+overlay reports current-frame and EMA dB for the output column compared to the
+current input frame.
 
 In `full-blend` mode every processed frame is a full redraw, so the update ratio
 is `100%`. In `interframe` mode keyframes are also `100%`; intermediate frames

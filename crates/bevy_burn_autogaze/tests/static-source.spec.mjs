@@ -1,5 +1,51 @@
 import { test, expect } from "@playwright/test";
 
+const wasmPanicNeedles = [
+  "Creating a wgpu setup synchronously is unsupported on wasm",
+  "Failed to read tensor data synchronously",
+  "time not implemented on this platform",
+  "std::time::Instant",
+];
+
+function combinedOutput(consoleLines, pageErrors) {
+  return `${consoleLines.join("\n")}\n${pageErrors.join("\n")}`;
+}
+
+function expectNoKnownWasmPanic(consoleLines, pageErrors) {
+  const output = combinedOutput(consoleLines, pageErrors);
+  for (const needle of wasmPanicNeedles) {
+    expect(output).not.toContain(needle);
+  }
+}
+
+function latestTimingMetrics(consoleLines) {
+  const timingPattern =
+    /AutoGaze timing: ([0-9.]+) fps e2e \(([0-9.]+) ms\) clip=([0-9]+) ([0-9]+)x([0-9]+)/;
+  for (let index = consoleLines.length - 1; index >= 0; index -= 1) {
+    const line = consoleLines[index];
+    const match = line.match(timingPattern);
+    if (!match) {
+      continue;
+    }
+    return {
+      fps: Number.parseFloat(match[1]),
+      totalMs: Number.parseFloat(match[2]),
+      clipFrames: Number.parseInt(match[3], 10),
+      width: Number.parseInt(match[4], 10),
+      height: Number.parseInt(match[5], 10),
+    };
+  }
+  return null;
+}
+
+function isDeviceLost(output) {
+  return (
+    output.includes("DeviceLost") ||
+    output.includes("Destroyed Device was destroyed") ||
+    output.includes("Quitting the application due to DeviceLost")
+  );
+}
+
 test("boots bevy wasm with static frames and no webcam", async ({ page }) => {
   const consoleLines = [];
   const pageErrors = [];
@@ -51,11 +97,7 @@ test("boots bevy wasm with static frames and no webcam", async ({ page }) => {
     .not.toBe("pending");
 
   if (state === "no-webgpu") {
-    const output = `${consoleLines.join("\n")}\n${pageErrors.join("\n")}`;
-    expect(output).not.toContain(
-      "Creating a wgpu setup synchronously is unsupported on wasm",
-    );
-    expect(output).not.toContain("Failed to read tensor data synchronously");
+    expectNoKnownWasmPanic(consoleLines, pageErrors);
     return;
   }
 
@@ -71,14 +113,16 @@ test("boots bevy wasm with static frames and no webcam", async ({ page }) => {
   getUserMediaCalls = await page.evaluate(
     () => window.__autogazeGetUserMediaCalls || 0,
   );
+  const frameStats = await page.evaluate(() => window.__autogazeFrameStats);
+  expect(frameStats.count).toBeGreaterThanOrEqual(2);
+  expect(frameStats.lastWidth).toBe(320);
+  expect(frameStats.lastHeight).toBe(180);
+  expect(frameStats.lastFrameMs).toBeGreaterThanOrEqual(
+    frameStats.firstFrameMs,
+  );
   expect(getUserMediaCalls).toBe(0);
   expect(pageErrors).toEqual([]);
-  expect(consoleLines.join("\n")).not.toContain(
-    "Creating a wgpu setup synchronously is unsupported on wasm",
-  );
-  expect(`${consoleLines.join("\n")}\n${pageErrors.join("\n")}`).not.toContain(
-    "Failed to read tensor data synchronously",
-  );
+  expectNoKnownWasmPanic(consoleLines, pageErrors);
 });
 
 test("starts wasm model load through async wgpu setup", async ({ page }) => {
@@ -107,12 +151,7 @@ test("starts wasm model load through async wgpu setup", async ({ page }) => {
     .poll(
       async () => {
         const output = `${consoleLines.join("\n")}\n${pageErrors.join("\n")}`;
-        if (
-          output.includes(
-            "Creating a wgpu setup synchronously is unsupported on wasm",
-          ) ||
-          output.includes("Failed to read tensor data synchronously")
-        ) {
+        if (wasmPanicNeedles.some((needle) => output.includes(needle))) {
           state = "sync-panic";
         } else if (output.includes("failed to load AutoGaze model")) {
           state = "handled-model-error";
@@ -131,4 +170,73 @@ test("starts wasm model load through async wgpu setup", async ({ page }) => {
     .not.toBe("pending");
 
   expect(state).not.toBe("sync-panic");
+});
+
+test("runs optional real wasm inference smoke when model assets are available", async ({
+  page,
+}) => {
+  test.skip(
+    process.env.AUTOGAZE_WASM_MODEL_E2E !== "1",
+    "set AUTOGAZE_WASM_MODEL_E2E=1 and provide www/config.json + www/model.safetensors",
+  );
+
+  const configResponse = await page.request.get("/config.json");
+  const weightsResponse = await page.request.get("/model.safetensors");
+  test.skip(
+    !configResponse.ok() || !weightsResponse.ok(),
+    "missing local wasm model assets",
+  );
+
+  const consoleLines = [];
+  const pageErrors = [];
+  page.on("console", (message) => {
+    consoleLines.push(`${message.type()}: ${message.text()}`);
+  });
+  page.on("pageerror", (error) => {
+    pageErrors.push(error.message);
+  });
+
+  await page.goto(
+    "/?source=static&show-fps=true&show-gaze-ratio=true&show-psnr=false&mode=resize-224&visualization-mode=interframe&frames-per-clip=1&static-width=224&static-height=224&static-fps=1&top-k=1&max-gaze-tokens-each-frame=1&disable-task-loss-requirement=true&log-pipeline-timing=true&config-url=./config.json&weights-url=./model.safetensors",
+    { waitUntil: "domcontentloaded" },
+  );
+
+  let state = "pending";
+  await expect
+    .poll(
+      async () => {
+        const output = combinedOutput(consoleLines, pageErrors);
+        if (wasmPanicNeedles.some((needle) => output.includes(needle))) {
+          state = "known-panic";
+        } else if (latestTimingMetrics(consoleLines)) {
+          state = "timing";
+        } else if (isDeviceLost(output)) {
+          state = "device-lost";
+        } else if (output.includes("failed to load AutoGaze model")) {
+          state = "model-error";
+        } else {
+          state = "pending";
+        }
+        return state;
+      },
+      { timeout: 180_000 },
+    )
+    .not.toBe("pending");
+
+  expect(state).not.toBe("known-panic");
+  if (state === "device-lost") {
+    expectNoKnownWasmPanic(consoleLines, pageErrors);
+    return;
+  }
+
+  expect(state).toBe("timing");
+
+  const timing = latestTimingMetrics(consoleLines);
+  expect(timing).not.toBeNull();
+  expect(timing.fps).toBeGreaterThan(0);
+  expect(timing.totalMs).toBeGreaterThan(0);
+  expect(timing.clipFrames).toBe(1);
+  expect(timing.width).toBe(224);
+  expect(timing.height).toBe(224);
+  expectNoKnownWasmPanic(consoleLines, pageErrors);
 });

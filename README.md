@@ -192,11 +192,14 @@ I/O (`nokhwa` or `--image-path` natively, browser camera plus `frame_input` on
 wasm). both modes show the same bevy-rendered `input | mask | output`
 visualization plus toggleable FPS, gaze/update-ratio, and output-PSNR overlays.
 
-Set `--show-fps=false`, `--show-gaze-ratio=false`, or `--show-psnr=false` to
-hide individual text overlays. Set `--log-pipeline-timing=true` to print Bevy
-viewer stage timing. The viewer defaults to
-`--max-gaze-tokens-each-frame 4` for realtime use; pass
-`--max-gaze-tokens-each-frame 0` to use the NVIDIA model default budget.
+Set `--show-fps=false` or `--show-gaze-ratio=false` to hide the default text
+overlays, or `--show-psnr=true` to enable output PSNR. Set
+`--log-pipeline-timing=true` to print Bevy viewer stage timing. The viewer
+defaults to
+`--max-gaze-tokens-each-frame 4` and a 224px-wide aspect-preserving source
+resize for realtime use; pass `--max-gaze-tokens-each-frame 0` to use the NVIDIA
+model default budget, or pass explicit `--inference-width` and
+`--inference-height` values for full-resolution inspection.
 
 The native app accepts CLI flags; the wasm app accepts the same viewer/inference
 knobs through query parameters:
