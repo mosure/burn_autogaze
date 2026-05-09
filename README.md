@@ -21,8 +21,8 @@ bevy/webgpu demos.
 - loads hugging face `config.json` + `model.safetensors`
 - default fast path downsamples frames to the model's `224` input
 - optional tiled full-resolution mode batches source frames into 224px chunks,
-  then remaps local tile predictions and token-cell extents back into
-  source-frame coordinates
+  stitches each scale's tile-local feature grid, and clips padded edge cells
+  before mapping cells back into source-frame coordinates
 - tiled inference processes chunks in bounded tile batches by default so CUDA
   and WebGPU do not build one very large autoregressive graph for 1080p clips
 - tiled mode decodes every non-padded generated token up to
@@ -113,9 +113,14 @@ budget for each frame is `max_gaze_tokens_each_frame * tile_count`; task-loss
 stopping and padded-edge filtering usually reduce the visible mask below that
 budget. The `top_k` argument is retained as a compatibility lower bound for
 trace slots and does not discard generated non-padded mask tokens.
-`AutoGazePipeline::set_tile_batch_size` controls how many tiles are generated
-in one backend batch; the default is `8`, which keeps the 45-tile 1080p path
-away from large CUDA/WebGPU fusion graphs while preserving the same tile layout.
+The tile output recovery follows upstream's per-scale mask stitching: each
+`2x2`, `4x4`, `7x7`, or `14x14` tile-local feature map is stitched into a
+full-frame grid for that scale before padded cells are clipped. This keeps the
+lower-resolution masks aligned with the finer grids at padded 720p/1080p
+edges. `AutoGazePipeline::set_tile_batch_size` controls how many tiles are
+generated in one backend batch; the default is `8`, which keeps the 45-tile
+1080p path away from large CUDA/WebGPU fusion graphs while preserving the same
+tile layout.
 
 ## visualization
 
@@ -126,8 +131,9 @@ away from large CUDA/WebGPU fusion graphs while preserving the same tile layout.
 
 AutoGaze emits multi-scale token positions. For the NVIDIA config, the Rust
 trace decoder maps those tokens back to `2x2`, `4x4`, `7x7`, and `14x14`
-source-frame cells, then renders the mask with nearest sampling so the
-quad-tree-like cell structure stays crisp.
+cells. In tiled full-resolution mode those are recovered as per-scale
+full-frame grids before rendering with nearest sampling so the cell structure
+stays crisp and scale-aligned.
 
 The gaze ratio metric reports how much of the output frame changed compared to
 a full-frame redraw. The Bevy overlay shows the current frame ratio plus an EMA

@@ -23,21 +23,21 @@
   "mask_cell_scale": 1.0,
   "blend_alpha": 0.55,
   "keyframe_duration": 12,
-  "average_mask_ratio": 0.38405834056712956,
-  "average_update_ratio": 0.4278150016878857,
-  "final_update_ratio_ema": 0.4560344917200397,
-  "min_update_ratio": 0.29169511959876543,
+  "average_mask_ratio": 0.39742088035300915,
+  "average_update_ratio": 0.43975899402006163,
+  "final_update_ratio_ema": 0.466527267230547,
+  "min_update_ratio": 0.2961159336419753,
   "max_update_ratio": 1.0,
-  "average_output_psnr_db": 31.499518333565085,
-  "final_output_psnr_ema_db": 31.955234427775117,
-  "min_output_psnr_db": 29.45303040041408,
-  "max_output_psnr_db": 34.9106234124982,
-  "positive_fixations": 3934,
+  "average_output_psnr_db": 31.652635036147018,
+  "final_output_psnr_ema_db": 32.23255525975674,
+  "min_output_psnr_db": 29.434282262552557,
+  "max_output_psnr_db": 35.32903283899159,
+  "positive_fixations": 3842,
   "cell_grid_histogram": {
     "14x14": 54,
-    "2x2": 819,
+    "2x2": 772,
     "4x4": 1441,
-    "7x7": 1620
+    "7x7": 1575
   },
   "mask_palette": {
     "14x14": [

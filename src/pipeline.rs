@@ -858,6 +858,10 @@ fn remap_tile_point(
     tile: AutoGazeTile,
     layout: &AutoGazeTileLayout,
 ) -> Option<FixationPoint> {
+    if layout.stride == layout.tile_size {
+        return remap_non_overlapping_tile_point(point, tile, layout);
+    }
+
     let source_width = layout.source_width.max(1) as f32;
     let source_height = layout.source_height.max(1) as f32;
     let center_x = tile.x as f32 + point.x * tile.width as f32;
@@ -873,6 +877,62 @@ fn remap_tile_point(
         point.confidence,
         point.cell_grid().unwrap_or(0),
     ))
+}
+
+fn remap_non_overlapping_tile_point(
+    point: FixationPoint,
+    tile: AutoGazeTile,
+    layout: &AutoGazeTileLayout,
+) -> Option<FixationPoint> {
+    let grid = point_scale_grid(point)?;
+    let tile_size = layout.tile_size.max(1);
+    let grid_width = recovered_scale_grid(layout.source_width, tile_size, grid);
+    let grid_height = recovered_scale_grid(layout.source_height, tile_size, grid);
+    let tile_col = tile.x / tile_size;
+    let tile_row = tile.y / tile_size;
+    let local_col = local_cell_index(point.x, grid);
+    let local_row = local_cell_index(point.y, grid);
+    let global_col = tile_col.saturating_mul(grid).saturating_add(local_col);
+    let global_row = tile_row.saturating_mul(grid).saturating_add(local_row);
+    if global_col >= grid_width || global_row >= grid_height {
+        return None;
+    }
+
+    Some(FixationPoint::with_grid_extent(
+        (global_col as f32 + 0.5) / grid_width as f32,
+        (global_row as f32 + 0.5) / grid_height as f32,
+        1.0 / grid_width as f32,
+        1.0 / grid_height as f32,
+        point.confidence,
+        grid,
+    ))
+}
+
+fn point_scale_grid(point: FixationPoint) -> Option<usize> {
+    point.cell_grid().or_else(|| {
+        let width_grid = (1.0 / point.cell_width()).round();
+        let height_grid = (1.0 / point.cell_height()).round();
+        if width_grid.is_finite()
+            && height_grid.is_finite()
+            && (width_grid - height_grid).abs() < 0.5
+        {
+            Some(width_grid.max(1.0) as usize)
+        } else {
+            None
+        }
+    })
+}
+
+fn recovered_scale_grid(source_extent: usize, tile_size: usize, tile_grid: usize) -> usize {
+    source_extent
+        .saturating_mul(tile_grid.max(1))
+        .checked_div(tile_size.max(1))
+        .unwrap_or(0)
+        .max(1)
+}
+
+fn local_cell_index(position: f32, grid: usize) -> usize {
+    ((position.clamp(0.0, 1.0) * grid.max(1) as f32).floor() as usize).min(grid.max(1) - 1)
 }
 
 #[cfg(test)]
@@ -909,17 +969,17 @@ mod tests {
     }
 
     #[test]
-    fn remap_tile_point_preserves_source_space_cell_extent() {
+    fn remap_tile_point_recovers_upstream_scale_grid() {
         let point = FixationPoint::with_grid_extent(0.5, 0.5, 1.0 / 14.0, 1.0 / 14.0, 1.0, 14);
-        let tile = AutoGazeTile::new(224, 112, 224, 224);
+        let tile = AutoGazeTile::new(224, 224, 224, 224);
         let layout = AutoGazeTileLayout::tiled(1080, 1920, 224, 224);
 
         let remapped = remap_tile_point(point, tile, &layout).expect("valid tile point");
 
-        assert!((remapped.x - 336.0 / 1920.0).abs() < 1.0e-6);
-        assert!((remapped.y - 224.0 / 1080.0).abs() < 1.0e-6);
-        assert!((remapped.cell_width() - (224.0 / 14.0) / 1920.0).abs() < 1.0e-6);
-        assert!((remapped.cell_height() - (224.0 / 14.0) / 1080.0).abs() < 1.0e-6);
+        assert!((remapped.x - 21.5 / 120.0).abs() < 1.0e-6);
+        assert!((remapped.y - 21.5 / 67.0).abs() < 1.0e-6);
+        assert!((remapped.cell_width() - 1.0 / 120.0).abs() < 1.0e-6);
+        assert!((remapped.cell_height() - 1.0 / 67.0).abs() < 1.0e-6);
         assert_eq!(remapped.cell_grid(), Some(14));
     }
 
@@ -955,6 +1015,22 @@ mod tests {
         let padded = FixationPoint::with_grid_extent(0.75, 0.75, 0.5, 0.5, 1.0, 2);
 
         assert!(remap_tile_point(padded, tile, &layout).is_none());
+    }
+
+    #[test]
+    fn remap_tile_point_discards_scale_grid_rows_beyond_source_extent() {
+        let layout = AutoGazeTileLayout::tiled(1080, 1920, 224, 224);
+        let bottom_tile = AutoGazeTile::new(0, 896, 224, 224);
+        let padded_row =
+            FixationPoint::with_grid_extent(0.5, 5.5 / 7.0, 1.0 / 7.0, 1.0 / 7.0, 1.0, 7);
+        let last_valid_row =
+            FixationPoint::with_grid_extent(0.5, 4.5 / 7.0, 1.0 / 7.0, 1.0 / 7.0, 1.0, 7);
+
+        assert!(remap_tile_point(padded_row, bottom_tile, &layout).is_none());
+        let remapped =
+            remap_tile_point(last_valid_row, bottom_tile, &layout).expect("last valid row");
+        assert!((remapped.y - 32.5 / 33.0).abs() < 1.0e-6);
+        assert!((remapped.cell_height() - 1.0 / 33.0).abs() < 1.0e-6);
     }
 
     #[test]

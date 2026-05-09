@@ -23,11 +23,13 @@ output; the pixel comparison is skipped when this overlay is disabled.
 `--log-pipeline-timing` prints pack, trace, visualization, and Bevy
 texture-update timing every few seconds. In `tile-224` mode, source frames are
 padded to a non-overlapping 224px chunk grid and
-`--max-gaze-tokens-each-frame` controls the per-tile generation cap. The viewer
-default is `10` for realtime use, matching one NVIDIA multi-token decoder step
-while exposing more of the multi-scale mask than the previous 4-token cap. A
-value of `0` uses the model default, which is `198` for the NVIDIA config and is
-not a realtime setting. The maximum frame budget is
+`--max-gaze-tokens-each-frame` controls the per-tile generation cap. The output
+recovery stitches each tile-local scale grid into a full-frame grid for that
+scale before clipping padded edge cells, matching upstream's mask recovery
+semantics. The viewer default is `10` for realtime use, matching one NVIDIA
+multi-token decoder step while exposing more of the multi-scale mask than the
+previous 4-token cap. A value of `0` uses the model default, which is `198` for
+the NVIDIA config and is not a realtime setting. The maximum frame budget is
 `max-gaze-tokens-each-frame * tile-count`, before task-loss stopping and
 padded-edge filtering. The viewer also defaults source frames to 224px wide
 while preserving aspect ratio, and the native camera path requests a 640x360
