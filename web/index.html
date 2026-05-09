@@ -44,8 +44,12 @@
           <input id="clip-frames" type="number" min="1" max="16" step="1" value="2" />
         </div>
         <div class="field short">
-          <label for="top-k">top k</label>
-          <input id="top-k" type="number" min="1" max="16" step="1" value="4" />
+          <label for="top-k">trace</label>
+          <input id="top-k" type="number" min="1" max="265" step="1" value="4" />
+        </div>
+        <div class="field short">
+          <label for="max-gaze-tokens">tokens</label>
+          <input id="max-gaze-tokens" type="number" min="0" max="265" step="1" value="0" />
         </div>
         <div class="field short">
           <label for="keyframe-duration">keyframe</label>

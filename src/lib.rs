@@ -16,8 +16,9 @@ pub use model::{
     Connector, Conv3dBlockForStreaming, NativeAutoGazeModel, ShallowVideoConvNet,
 };
 pub use pipeline::{
-    AutoGazeClipShape, AutoGazeEmbedOutput, AutoGazeInferenceMode, AutoGazePipeline,
-    AutoGazeRgbaClipShape, AutoGazeTile, AutoGazeTileLayout, rgba_clip_to_tensor,
+    AUTO_GAZE_IMAGE_MEAN, AUTO_GAZE_IMAGE_STD, AUTO_GAZE_RESCALE_FACTOR, AutoGazeClipShape,
+    AutoGazeEmbedOutput, AutoGazeInferenceMode, AutoGazePipeline, AutoGazeRgbaClipShape,
+    AutoGazeTile, AutoGazeTileLayout, rgba_clip_to_tensor,
 };
 pub use safetensors_io::AutoGazeTraceStore;
 pub use teacher::AutoGazeTeacher;

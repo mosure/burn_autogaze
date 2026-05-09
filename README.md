@@ -20,11 +20,14 @@ bevy/webgpu demos.
 - practical burn-native gaze inference for video clips and RGBA frame buffers
 - loads hugging face `config.json` + `model.safetensors`
 - default fast path downsamples frames to the model's `224` input
-- optional tiled full-resolution mode pads source frames to a 224px chunk grid,
+- optional tiled full-resolution mode batches source frames into 224px chunks,
   then remaps local tile predictions and token-cell extents back into
   source-frame coordinates
-- tiled mode treats `top_k` as a per-tile budget, matching the recovered
-  multi-tile mask instead of truncating the whole frame to a sparse global list
+- tiled inference processes chunks in bounded tile batches by default so CUDA
+  and WebGPU do not build one very large autoregressive graph for 1080p clips
+- tiled mode decodes every non-padded generated token up to
+  `max_gaze_tokens_each_frame`, matching upstream mask recovery instead of
+  truncating the frame to a sparse global top-k list
 - the NVIDIA fixed inference defaults are applied by default:
   `gazing_ratio=0.75` and `task_loss_requirement=0.7`
 - mask visualizations preserve the model's multi-scale `2x2`/`4x4`/`7x7`/`14x14`
@@ -65,11 +68,10 @@ use burn_autogaze::{
 let device = wgpu::WgpuDevice::default();
 wgpu::init_setup::<wgpu::graphics::AutoGraphicsApi>(&device, Default::default());
 
-let pipeline = AutoGazePipeline::<WebGpu>::from_hf_dir("/path/to/AutoGaze", &device)?
-    .with_max_gaze_tokens_each_frame(8);
+let pipeline = AutoGazePipeline::<WebGpu>::from_hf_dir("/path/to/AutoGaze", &device)?;
 
-// frames are [time, channels, height, width], normalized as f32
-let shape = AutoGazeClipShape::new(2, 3, 720, 1280);
+// frames are [time, channels, height, width] and already AutoGaze-preprocessed
+let shape = AutoGazeClipShape::new(16, 3, 720, 1280);
 let frames = vec![0.0; shape.num_values()];
 
 let trace = pipeline.trace_clip_from_frames_with_mode(
@@ -106,8 +108,14 @@ chopping them into fixed-size chunks, or by using `target_scales` when adapting
 to a different downstream vision encoder shape. `TiledFullResolution` mirrors
 the chunked path by padding edge chunks instead of overlapping and resizing
 partial crops. It keeps local full-res evidence, but it is much slower because
-every covered tile runs through the model. In tiled mode, `top_k` is applied per
-tile; the returned fixation budget for each frame is `top_k * tile_count`.
+every covered tile runs through the model. In tiled mode, the maximum fixation
+budget for each frame is `max_gaze_tokens_each_frame * tile_count`; task-loss
+stopping and padded-edge filtering usually reduce the visible mask below that
+budget. The `top_k` argument is retained as a compatibility lower bound for
+trace slots and does not discard generated non-padded mask tokens.
+`AutoGazePipeline::set_tile_batch_size` controls how many tiles are generated
+in one backend batch; the default is `8`, which keeps the 45-tile 1080p path
+away from large CUDA/WebGPU fusion graphs while preserving the same tile layout.
 
 ## visualization
 
@@ -130,13 +138,16 @@ comparison is skipped when the PSNR overlay is disabled.
 The README GIFs are generated from `/home/mosure/Videos/birds.mp4` at
 `1920x1080` inference resolution with the NVIDIA AutoGaze weights and the same
 Rust pipeline exposed by the crate. `trace_rgba_clip_with_mode(..., tile-224)`
-pads the clip into 45 non-overlapping chunks before the resulting stream is
-downsampled for README display, using `top_k=4` per tile and
-`task_loss_requirement=0.7`. The maximum fixation budget is 180 tokens per
-frame before task-loss stopping and padded-edge filtering. The mask GIF uses
-scale colors from the decoded model grid metadata, drawing larger cells first
-and smaller cells on top. The per-run ratios and detected cell scale histogram
-are checked in at
+pads each 16-frame clip into 45 non-overlapping chunks before the resulting
+stream is downsampled for README display, using the NVIDIA default
+`max_gaze_tokens_each_frame=198` and `task_loss_requirement=0.7`. The maximum
+fixation budget is 8910 tokens per high-res frame before task-loss stopping and
+padded-edge filtering; tiles are generated in batches of 8. The RGBA
+convenience path applies the upstream
+AutoGazeImageProcessor affine preprocessing (`image / 127.5 - 1`, then
+ImageNet mean/std normalization). The mask GIF uses scale colors from the
+decoded model grid metadata, drawing larger cells first and smaller cells on
+top. The per-run ratios, PSNR, and detected cell scale histogram are checked in at
 [`docs/autogaze_birds_metrics.json`](./docs/autogaze_birds_metrics.json).
 
 ```sh
@@ -168,7 +179,7 @@ this is the low-level wasm-bindgen api demo.
 
 ```sh
 cargo run -p bevy_burn_autogaze --features native -- --mode resize-224 --visualization-mode full-blend
-cargo run -p bevy_burn_autogaze --features native -- --mode tile-224 --visualization-mode interframe --keyframe-duration 30 --inference-width 1920 --inference-height 1080 --task-loss-requirement 0.7
+cargo run -p bevy_burn_autogaze --features native -- --mode tile-224 --visualization-mode interframe --keyframe-duration 12 --frames-per-clip 16 --inference-width 1920 --inference-height 1080 --task-loss-requirement 0.7 --tile-batch-size 8
 
 cd crates/bevy_burn_autogaze
 npm run build:wasm
@@ -188,7 +199,7 @@ The native app accepts CLI flags; the wasm app accepts the same viewer/inference
 knobs through query parameters:
 
 ```text
-http://localhost:8080/?mode=tile-224&visualization-mode=interframe&keyframe-duration=30&top-k=2&frames-per-clip=2&inference-width=1920&inference-height=1080&task-loss-requirement=0.7&show-fps=true&show-gaze-ratio=true&show-psnr=true
+http://localhost:8080/?mode=tile-224&visualization-mode=interframe&keyframe-duration=12&frames-per-clip=16&inference-width=1920&inference-height=1080&task-loss-requirement=0.7&tile-batch-size=8&show-fps=true&show-gaze-ratio=true&show-psnr=true
 ```
 
 For headless browsers or machines without a webcam, run the same Bevy UI from a

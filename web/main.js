@@ -12,6 +12,7 @@ const visualizationMode = document.getElementById("visualization-mode");
 const resolution = document.getElementById("resolution");
 const clipFrames = document.getElementById("clip-frames");
 const topK = document.getElementById("top-k");
+const maxGazeTokens = document.getElementById("max-gaze-tokens");
 const keyframeDuration = document.getElementById("keyframe-duration");
 const loadModel = document.getElementById("load-model");
 const startCamera = document.getElementById("start-camera");
@@ -42,6 +43,7 @@ startCamera.addEventListener("click", () => toggleCamera());
 mode.addEventListener("change", applyModelOptions);
 visualizationMode.addEventListener("change", applyModelOptions);
 topK.addEventListener("change", applyModelOptions);
+maxGazeTokens.addEventListener("change", applyModelOptions);
 keyframeDuration.addEventListener("change", applyModelOptions);
 
 function setStatus(message) {
@@ -217,8 +219,13 @@ function applyModelOptions() {
   if (!model) {
     return;
   }
-  model.set_top_k(clampInteger(topK.value, 1, 16));
-  model.set_max_gaze_tokens_each_frame(clampInteger(topK.value, 1, 16));
+  model.set_top_k(clampInteger(topK.value, 1, 265));
+  const maxTokens = clampInteger(maxGazeTokens.value, 0, 265);
+  if (maxTokens > 0) {
+    model.set_max_gaze_tokens_each_frame(maxTokens);
+  } else {
+    model.reset_max_gaze_tokens_each_frame();
+  }
   model.set_keyframe_duration(clampInteger(keyframeDuration.value, 1, 300));
   model.set_visualization_mode(visualizationMode.value);
   if (mode.value === "tile") {

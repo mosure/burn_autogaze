@@ -599,8 +599,19 @@ impl<B: Backend> AutoGazeGazingModel<B> {
 
         let mut prefix_embeds: Option<Tensor<B, 3>> = None;
         let mut prefix_attention_mask = vec![vec![]; batch];
+        // Mirror upstream Transformers cached generation while using full-sequence Burn forwards.
+        // Completed chunks keep cached RoPE positions; the final chunk is committed on the next frame.
+        let mut prefix_position_ids = vec![vec![]; batch];
+        let mut pending_position_indices = vec![Vec::<usize>::new(); batch];
 
         for frame_idx in 0..frames {
+            commit_pending_position_ids(
+                &prefix_attention_mask,
+                &mut prefix_position_ids,
+                &pending_position_indices,
+            );
+            pending_position_indices.iter_mut().for_each(Vec::clear);
+
             let frame_embed = video_embeds
                 .clone()
                 .slice_dim(1, frame_idx..(frame_idx + 1))
@@ -610,8 +621,15 @@ impl<B: Backend> AutoGazeGazingModel<B> {
             } else {
                 frame_embed.clone()
             };
-            for row in prefix_attention_mask.iter_mut() {
-                row.extend(std::iter::repeat_n(1, vision_tokens));
+            for batch_idx in 0..batch {
+                let valid_start = prefix_attention_mask[batch_idx]
+                    .iter()
+                    .filter(|&&mask| mask != 0)
+                    .count() as i64;
+                for valid_count in (valid_start..).take(vision_tokens) {
+                    prefix_attention_mask[batch_idx].push(1);
+                    prefix_position_ids[batch_idx].push(valid_count);
+                }
             }
 
             let mut frame_tokens = vec![Vec::<i64>::new(); batch];
@@ -620,6 +638,10 @@ impl<B: Backend> AutoGazeGazingModel<B> {
             let mut finished = vec![false; batch];
             let mut is_first_token = true;
             let max_tokens = max_gaze_tokens_each_frame.max(1);
+            let generation_prefix_len = sequence_embeds.shape().dims::<3>()[1];
+            let generation_tail_positions =
+                generation_tail_positions(&prefix_position_ids, self.num_multi_token_pred);
+            let mut last_generated_indices = vec![Vec::<usize>::new(); batch];
 
             while frame_tokens.iter().map(Vec::len).max().unwrap_or(0) < max_tokens
                 && finished.iter().any(|done| !done)
@@ -627,8 +649,7 @@ impl<B: Backend> AutoGazeGazingModel<B> {
                 let seq_len = sequence_embeds.shape().dims::<3>()[1];
                 let attention_mask =
                     attention_mask_tensor::<B>(&prefix_attention_mask, seq_len, &device);
-                let position_ids =
-                    position_ids_from_attention_mask::<B>(&prefix_attention_mask, seq_len, &device);
+                let position_ids = position_ids_tensor::<B>(&prefix_position_ids, seq_len, &device);
                 let outputs = self.gaze_decoder.forward(
                     sequence_embeds.clone(),
                     Some(attention_mask),
@@ -675,14 +696,19 @@ impl<B: Backend> AutoGazeGazingModel<B> {
                 sequence_embeds = Tensor::cat(vec![sequence_embeds, token_embeds], 1);
 
                 for batch_idx in 0..batch {
+                    last_generated_indices[batch_idx].clear();
                     for local_idx in 0..new_tokens {
+                        last_generated_indices[batch_idx]
+                            .push(prefix_attention_mask[batch_idx].len());
                         let token = next_tokens[batch_idx][local_idx];
                         let valid = next_valid[batch_idx][local_idx];
                         let confidence = next_confidences[batch_idx][local_idx];
                         frame_tokens[batch_idx].push(token);
                         frame_padded[batch_idx].push(!valid);
                         frame_confidences[batch_idx].push(confidence);
-                        prefix_attention_mask[batch_idx].push(if valid { 1 } else { 0 });
+                        prefix_attention_mask[batch_idx].push(1);
+                        let tail = &generation_tail_positions[batch_idx];
+                        prefix_position_ids[batch_idx].push(tail[local_idx % tail.len()]);
                         if !valid {
                             finished[batch_idx] = true;
                         }
@@ -695,6 +721,11 @@ impl<B: Backend> AutoGazeGazingModel<B> {
             num_gazing_each_frame.push(frame_count);
             let frame_offset = (frame_idx * self.num_vision_tokens_each_frame) as i64;
             for batch_idx in 0..batch {
+                for (local_idx, padded) in frame_padded[batch_idx].iter().copied().enumerate() {
+                    if padded {
+                        prefix_attention_mask[batch_idx][generation_prefix_len + local_idx] = 0;
+                    }
+                }
                 gazing_pos[batch_idx].extend(
                     frame_tokens[batch_idx]
                         .iter()
@@ -703,6 +734,7 @@ impl<B: Backend> AutoGazeGazingModel<B> {
                 if_padded_gazing[batch_idx].extend(frame_padded[batch_idx].iter().copied());
                 confidences[batch_idx].extend(frame_confidences[batch_idx].iter().copied());
             }
+            pending_position_indices = last_generated_indices;
             prefix_embeds = Some(sequence_embeds);
         }
 
@@ -732,8 +764,18 @@ impl<B: Backend> AutoGazeGazingModel<B> {
 
         let mut prefix_embeds: Option<Tensor<B, 3>> = None;
         let mut prefix_attention_mask = vec![vec![]; batch];
+        // Keep the async path position-compatible with the sync upstream-generation emulation.
+        let mut prefix_position_ids = vec![vec![]; batch];
+        let mut pending_position_indices = vec![Vec::<usize>::new(); batch];
 
         for frame_idx in 0..frames {
+            commit_pending_position_ids(
+                &prefix_attention_mask,
+                &mut prefix_position_ids,
+                &pending_position_indices,
+            );
+            pending_position_indices.iter_mut().for_each(Vec::clear);
+
             let frame_embed = video_embeds
                 .clone()
                 .slice_dim(1, frame_idx..(frame_idx + 1))
@@ -743,8 +785,15 @@ impl<B: Backend> AutoGazeGazingModel<B> {
             } else {
                 frame_embed.clone()
             };
-            for row in prefix_attention_mask.iter_mut() {
-                row.extend(std::iter::repeat_n(1, vision_tokens));
+            for batch_idx in 0..batch {
+                let valid_start = prefix_attention_mask[batch_idx]
+                    .iter()
+                    .filter(|&&mask| mask != 0)
+                    .count() as i64;
+                for valid_count in (valid_start..).take(vision_tokens) {
+                    prefix_attention_mask[batch_idx].push(1);
+                    prefix_position_ids[batch_idx].push(valid_count);
+                }
             }
 
             let mut frame_tokens = vec![Vec::<i64>::new(); batch];
@@ -753,6 +802,10 @@ impl<B: Backend> AutoGazeGazingModel<B> {
             let mut finished = vec![false; batch];
             let mut is_first_token = true;
             let max_tokens = max_gaze_tokens_each_frame.max(1);
+            let generation_prefix_len = sequence_embeds.shape().dims::<3>()[1];
+            let generation_tail_positions =
+                generation_tail_positions(&prefix_position_ids, self.num_multi_token_pred);
+            let mut last_generated_indices = vec![Vec::<usize>::new(); batch];
 
             while frame_tokens.iter().map(Vec::len).max().unwrap_or(0) < max_tokens
                 && finished.iter().any(|done| !done)
@@ -760,8 +813,7 @@ impl<B: Backend> AutoGazeGazingModel<B> {
                 let seq_len = sequence_embeds.shape().dims::<3>()[1];
                 let attention_mask =
                     attention_mask_tensor::<B>(&prefix_attention_mask, seq_len, &device);
-                let position_ids =
-                    position_ids_from_attention_mask::<B>(&prefix_attention_mask, seq_len, &device);
+                let position_ids = position_ids_tensor::<B>(&prefix_position_ids, seq_len, &device);
                 let outputs = self.gaze_decoder.forward(
                     sequence_embeds.clone(),
                     Some(attention_mask),
@@ -809,14 +861,19 @@ impl<B: Backend> AutoGazeGazingModel<B> {
                 sequence_embeds = Tensor::cat(vec![sequence_embeds, token_embeds], 1);
 
                 for batch_idx in 0..batch {
+                    last_generated_indices[batch_idx].clear();
                     for local_idx in 0..new_tokens {
+                        last_generated_indices[batch_idx]
+                            .push(prefix_attention_mask[batch_idx].len());
                         let token = next_tokens[batch_idx][local_idx];
                         let valid = next_valid[batch_idx][local_idx];
                         let confidence = next_confidences[batch_idx][local_idx];
                         frame_tokens[batch_idx].push(token);
                         frame_padded[batch_idx].push(!valid);
                         frame_confidences[batch_idx].push(confidence);
-                        prefix_attention_mask[batch_idx].push(if valid { 1 } else { 0 });
+                        prefix_attention_mask[batch_idx].push(1);
+                        let tail = &generation_tail_positions[batch_idx];
+                        prefix_position_ids[batch_idx].push(tail[local_idx % tail.len()]);
                         if !valid {
                             finished[batch_idx] = true;
                         }
@@ -829,6 +886,11 @@ impl<B: Backend> AutoGazeGazingModel<B> {
             num_gazing_each_frame.push(frame_count);
             let frame_offset = (frame_idx * self.num_vision_tokens_each_frame) as i64;
             for batch_idx in 0..batch {
+                for (local_idx, padded) in frame_padded[batch_idx].iter().copied().enumerate() {
+                    if padded {
+                        prefix_attention_mask[batch_idx][generation_prefix_len + local_idx] = 0;
+                    }
+                }
                 gazing_pos[batch_idx].extend(
                     frame_tokens[batch_idx]
                         .iter()
@@ -837,6 +899,7 @@ impl<B: Backend> AutoGazeGazingModel<B> {
                 if_padded_gazing[batch_idx].extend(frame_padded[batch_idx].iter().copied());
                 confidences[batch_idx].extend(frame_confidences[batch_idx].iter().copied());
             }
+            pending_position_indices = last_generated_indices;
             prefix_embeds = Some(sequence_embeds);
         }
 
@@ -1075,12 +1138,10 @@ impl<B: Backend> NativeAutoGazeModel<B> {
         max_gaze_tokens_each_frame: usize,
         task_loss_requirement: Option<f32>,
     ) -> Vec<FrameFixationTrace> {
-        let generated = self.generate_with_task_loss_requirement(
-            video,
-            max_gaze_tokens_each_frame.max(k.max(1)),
-            task_loss_requirement,
-        );
-        generated_to_traces(&generated, &self.config, k)
+        let trace_budget = max_gaze_tokens_each_frame.max(k.max(1));
+        let generated =
+            self.generate_with_task_loss_requirement(video, trace_budget, task_loss_requirement);
+        generated_to_traces(&generated, &self.config, trace_budget)
     }
 
     pub async fn trace_video_with_task_loss_requirement_async(
@@ -1090,14 +1151,11 @@ impl<B: Backend> NativeAutoGazeModel<B> {
         max_gaze_tokens_each_frame: usize,
         task_loss_requirement: Option<f32>,
     ) -> Result<Vec<FrameFixationTrace>, ExecutionError> {
+        let trace_budget = max_gaze_tokens_each_frame.max(k.max(1));
         let generated = self
-            .generate_with_task_loss_requirement_async(
-                video,
-                max_gaze_tokens_each_frame.max(k.max(1)),
-                task_loss_requirement,
-            )
+            .generate_with_task_loss_requirement_async(video, trace_budget, task_loss_requirement)
             .await?;
-        Ok(generated_to_traces(&generated, &self.config, k))
+        Ok(generated_to_traces(&generated, &self.config, trace_budget))
     }
 
     pub fn trace_clip_from_frames(
@@ -1289,23 +1347,60 @@ fn attention_mask_tensor<B: Backend>(
     Tensor::<B, 2, Int>::from_data(TensorData::new(values, [batch, seq_len]), device)
 }
 
-fn position_ids_from_attention_mask<B: Backend>(
-    mask_rows: &[Vec<i64>],
+fn position_ids_tensor<B: Backend>(
+    position_rows: &[Vec<i64>],
     seq_len: usize,
     device: &B::Device,
 ) -> Tensor<B, 2, Int> {
-    let batch = mask_rows.len().max(1);
+    let batch = position_rows.len().max(1);
     let mut values = Vec::with_capacity(batch * seq_len);
-    for row in mask_rows {
-        let mut position = 0i64;
-        for mask in row.iter().copied().take(seq_len) {
-            values.push(position);
+    for row in position_rows {
+        values.extend(row.iter().copied().take(seq_len));
+    }
+    Tensor::<B, 2, Int>::from_data(TensorData::new(values, [batch, seq_len]), device)
+}
+
+fn generation_tail_positions(
+    position_rows: &[Vec<i64>],
+    num_multi_token_pred: usize,
+) -> Vec<Vec<i64>> {
+    let chunk = num_multi_token_pred.max(1);
+    position_rows
+        .iter()
+        .map(|row| {
+            if row.is_empty() {
+                vec![0]
+            } else {
+                row[row.len().saturating_sub(chunk)..].to_vec()
+            }
+        })
+        .collect()
+}
+
+fn commit_pending_position_ids(
+    mask_rows: &[Vec<i64>],
+    position_rows: &mut [Vec<i64>],
+    pending_rows: &[Vec<usize>],
+) {
+    for ((mask_row, position_row), pending) in mask_rows
+        .iter()
+        .zip(position_rows.iter_mut())
+        .zip(pending_rows)
+    {
+        if pending.is_empty() {
+            continue;
+        }
+
+        let mut valid_count = 0i64;
+        for (idx, mask) in mask_row.iter().copied().enumerate() {
             if mask != 0 {
-                position += 1;
+                valid_count += 1;
+            }
+            if pending.contains(&idx) && idx < position_row.len() {
+                position_row[idx] = valid_count.saturating_sub(1);
             }
         }
     }
-    Tensor::<B, 2, Int>::from_data(TensorData::new(values, [batch, seq_len]), device)
 }
 
 fn greedy_select_multi_tokens<B: Backend>(
@@ -1673,6 +1768,33 @@ mod tests {
 
     #[cfg(feature = "ndarray")]
     #[test]
+    fn generation_tail_positions_repeat_prefix_tail_for_generated_chunks() {
+        type B = burn::backend::NdArray<f32>;
+        let device = Default::default();
+        let mut position_rows = vec![vec![0, 1, 1, 2, 3]];
+        let tail = generation_tail_positions(&position_rows, 2);
+        position_rows[0].extend([tail[0][0], tail[0][1], tail[0][0]]);
+        let position_ids = position_ids_tensor::<B>(&position_rows, 8, &device)
+            .into_data()
+            .to_vec::<i64>()
+            .expect("position ids");
+
+        assert_eq!(position_ids, vec![0, 1, 1, 2, 3, 2, 3, 2]);
+    }
+
+    #[test]
+    fn commit_pending_position_ids_uses_attention_cumsum() {
+        let masks = vec![vec![1, 1, 0, 1, 1, 0, 1]];
+        let mut positions = vec![vec![0, 1, 1, 2, 2, 2, 2]];
+        let pending = vec![vec![4, 5, 6]];
+
+        commit_pending_position_ids(&masks, &mut positions, &pending);
+
+        assert_eq!(positions[0], vec![0, 1, 1, 2, 3, 3, 4]);
+    }
+
+    #[cfg(feature = "ndarray")]
+    #[test]
     fn greedy_selection_applies_task_loss_requirement_after_first_token() {
         type B = burn::backend::NdArray<f32>;
         let device = Default::default();
@@ -1728,5 +1850,31 @@ mod tests {
             layouts.iter().map(|layout| layout.grid).collect::<Vec<_>>(),
             vec![1, 1, 3]
         );
+    }
+
+    #[test]
+    fn generated_to_traces_preserves_all_non_padded_multiscale_tokens() {
+        let mut config = AutoGazeConfig {
+            scales: "32+64+112+224".to_string(),
+            num_vision_tokens_each_frame: 265,
+            ..Default::default()
+        };
+        config.gaze_model_config.num_vision_tokens_each_frame = 265;
+        let generated = AutoGazeGenerateOutput {
+            gazing_pos: vec![vec![0, 4, 20, 69]],
+            num_gazing_each_frame: vec![4],
+            if_padded_gazing: vec![vec![false, false, false, false]],
+            confidences: vec![vec![0.9, 0.8, 0.7, 0.6]],
+        };
+
+        let traces = generated_to_traces(&generated, &config, 4);
+
+        let grids = traces[0].frames[0]
+            .points
+            .iter()
+            .filter(|point| point.confidence > 0.0)
+            .map(|point| point.cell_grid())
+            .collect::<Vec<_>>();
+        assert_eq!(grids, vec![Some(2), Some(4), Some(7), Some(14)]);
     }
 }

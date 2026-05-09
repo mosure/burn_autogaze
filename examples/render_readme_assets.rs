@@ -86,7 +86,7 @@ impl Default for Args {
             gif_height: 216,
             fps: 8,
             frames: 16,
-            clip_len: 2,
+            clip_len: 16,
             top_k: 4,
             max_gaze_tokens_each_frame: None,
             task_loss_requirement: None,
@@ -184,7 +184,9 @@ struct RenderMetrics {
     top_k: usize,
     max_gaze_tokens_each_frame: usize,
     task_loss_requirement: Option<f32>,
+    clip_chunking: &'static str,
     tile_count: usize,
+    tile_batch_size: usize,
     fixation_budget_each_frame: usize,
     scales: String,
     num_vision_tokens_each_frame: usize,
@@ -196,6 +198,10 @@ struct RenderMetrics {
     final_update_ratio_ema: f64,
     min_update_ratio: f64,
     max_update_ratio: f64,
+    average_output_psnr_db: Option<f64>,
+    final_output_psnr_ema_db: Option<f64>,
+    min_output_psnr_db: Option<f64>,
+    max_output_psnr_db: Option<f64>,
     positive_fixations: usize,
     cell_grid_histogram: BTreeMap<String, usize>,
     mask_palette: BTreeMap<String, [u8; 3]>,
@@ -207,6 +213,8 @@ struct RatioStats {
     mask_ratios: Vec<f64>,
     update_ratios: Vec<f64>,
     update_ratio_ema: Option<f64>,
+    output_psnr_db: Vec<f64>,
+    output_psnr_ema_db: Option<f64>,
     positive_fixations: usize,
     cell_grid_histogram: BTreeMap<String, usize>,
 }
@@ -256,9 +264,14 @@ where
     );
     let mut stats = RatioStats::default();
 
-    for frame_idx in 0..args.frames {
-        let current = frame_slice(&input_rgba, frame_idx, frame_bytes);
-        let clip = clip_for_frame(&input_rgba, frame_idx, args.clip_len, frame_bytes);
+    for chunk_start in (0..args.frames).step_by(args.clip_len) {
+        let clip = clip_for_chunk(
+            &input_rgba,
+            chunk_start,
+            args.clip_len,
+            args.frames,
+            frame_bytes,
+        );
         let traces = pipeline.trace_rgba_clip_with_mode(
             &clip,
             AutoGazeRgbaClipShape::new(args.clip_len, args.inference_height, args.inference_width),
@@ -268,37 +281,45 @@ where
         )?;
         B::sync(&device).context("sync backend after AutoGaze trace")?;
 
-        let points = traces
-            .first()
-            .and_then(|trace| trace.frames.last())
-            .map(|set| set.points.clone())
-            .unwrap_or_default();
-        record_points(&points, &mut stats, &args);
-        let visualization = state.visualize_rgba(
-            current,
-            args.inference_width,
-            args.inference_height,
-            &points,
-            args.mask_cell_scale,
-            args.blend_alpha,
-        )?;
-        let scale_mask = fixation_scale_mask_rgba(
-            args.inference_width,
-            args.inference_height,
-            &points,
-            args.mask_cell_scale,
-        );
-        stats.record_ratios(visualization.mask_ratio(), visualization.update_ratio());
-        mask_rgba.extend_from_slice(&scale_mask);
-        output_rgba.extend_from_slice(visualization.output_rgba());
-        println!(
-            "frame {:02}/{:02}: points={} mask={:.2}% update={:.2}%",
-            frame_idx + 1,
-            args.frames,
-            points.iter().filter(|point| point.confidence > 0.0).count(),
-            visualization.mask_ratio() * 100.0,
-            visualization.update_ratio() * 100.0
-        );
+        let chunk_frames = args.frames.saturating_sub(chunk_start).min(args.clip_len);
+        for local_frame_idx in 0..chunk_frames {
+            let frame_idx = chunk_start + local_frame_idx;
+            let current = frame_slice(&input_rgba, frame_idx, frame_bytes);
+            let points = traces
+                .first()
+                .and_then(|trace| trace.frames.get(local_frame_idx))
+                .map(|set| set.points.clone())
+                .unwrap_or_default();
+            record_points(&points, &mut stats, &args);
+            let visualization = state.visualize_rgba(
+                current,
+                args.inference_width,
+                args.inference_height,
+                &points,
+                args.mask_cell_scale,
+                args.blend_alpha,
+            )?;
+            let psnr_db = visualization.output_psnr_db(current)?;
+            let scale_mask = fixation_scale_mask_rgba(
+                args.inference_width,
+                args.inference_height,
+                &points,
+                args.mask_cell_scale,
+            );
+            stats.record_ratios(visualization.mask_ratio(), visualization.update_ratio());
+            stats.record_psnr(psnr_db);
+            mask_rgba.extend_from_slice(&scale_mask);
+            output_rgba.extend_from_slice(visualization.output_rgba());
+            println!(
+                "frame {:02}/{:02}: points={} mask={:.2}% update={:.2}% psnr={}",
+                frame_idx + 1,
+                args.frames,
+                points.iter().filter(|point| point.confidence > 0.0).count(),
+                visualization.mask_ratio() * 100.0,
+                visualization.update_ratio() * 100.0,
+                format_psnr_db(psnr_db)
+            );
+        }
     }
 
     let target_dir = PathBuf::from("target/readme_birds");
@@ -351,6 +372,7 @@ where
         top_k: args.top_k,
         max_gaze_tokens_each_frame: pipeline.max_gaze_tokens_each_frame(),
         task_loss_requirement: pipeline.task_loss_requirement(),
+        clip_chunking: "non-overlapping",
         tile_count: AutoGazeTileLayout::tiled(
             args.inference_height,
             args.inference_width,
@@ -358,8 +380,9 @@ where
             args.stride,
         )
         .tile_count(),
+        tile_batch_size: pipeline.tile_batch_size(),
         fixation_budget_each_frame: mode.fixation_budget(
-            args.top_k,
+            pipeline.max_gaze_tokens_each_frame(),
             args.inference_height,
             args.inference_width,
         ),
@@ -383,6 +406,10 @@ where
             .copied()
             .reduce(f64::max)
             .unwrap_or(0.0),
+        average_output_psnr_db: average_finite(&stats.output_psnr_db),
+        final_output_psnr_ema_db: finite_number(stats.output_psnr_ema_db),
+        min_output_psnr_db: finite_reduce(&stats.output_psnr_db, f64::min),
+        max_output_psnr_db: finite_reduce(&stats.output_psnr_db, f64::max),
         positive_fixations: stats.positive_fixations,
         cell_grid_histogram: stats.cell_grid_histogram,
         mask_palette: mask_palette(),
@@ -407,6 +434,17 @@ impl RatioStats {
         self.update_ratio_ema = Some(match self.update_ratio_ema {
             Some(previous) => previous * 0.85 + update_ratio * 0.15,
             None => update_ratio,
+        });
+    }
+
+    fn record_psnr(&mut self, psnr_db: f64) {
+        self.output_psnr_db.push(psnr_db);
+        self.output_psnr_ema_db = Some(match self.output_psnr_ema_db {
+            Some(previous) if previous.is_finite() && psnr_db.is_finite() => {
+                previous * 0.85 + psnr_db * 0.15
+            }
+            Some(previous) if previous.is_finite() => previous,
+            _ => psnr_db,
         });
     }
 }
@@ -608,16 +646,18 @@ fn nearest_mask_palette_index(rgb: [u8; 3]) -> u8 {
         .unwrap_or(0)
 }
 
-fn clip_for_frame(frames: &[u8], frame_idx: usize, clip_len: usize, frame_bytes: usize) -> Vec<u8> {
+fn clip_for_chunk(
+    frames: &[u8],
+    chunk_start: usize,
+    clip_len: usize,
+    total_frames: usize,
+    frame_bytes: usize,
+) -> Vec<u8> {
     let mut clip = Vec::with_capacity(clip_len * frame_bytes);
-    let missing = clip_len.saturating_sub(frame_idx + 1);
-    let start = (frame_idx + 1).saturating_sub(clip_len);
     for clip_idx in 0..clip_len {
-        let source = if clip_idx < missing {
-            0
-        } else {
-            start + clip_idx - missing
-        };
+        let source = chunk_start
+            .saturating_add(clip_idx)
+            .min(total_frames.saturating_sub(1));
         clip.extend_from_slice(frame_slice(frames, source, frame_bytes));
     }
     clip
@@ -686,6 +726,42 @@ fn average(values: &[f64]) -> f64 {
         0.0
     } else {
         values.iter().sum::<f64>() / values.len() as f64
+    }
+}
+
+fn average_finite(values: &[f64]) -> Option<f64> {
+    let mut total = 0.0;
+    let mut count = 0usize;
+    for value in values.iter().copied().filter(|value| value.is_finite()) {
+        total += value;
+        count += 1;
+    }
+    if count == 0 {
+        None
+    } else {
+        Some(total / count as f64)
+    }
+}
+
+fn finite_reduce(values: &[f64], reduce: impl Fn(f64, f64) -> f64) -> Option<f64> {
+    values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .reduce(reduce)
+}
+
+fn finite_number(value: Option<f64>) -> Option<f64> {
+    value.filter(|value| value.is_finite())
+}
+
+fn format_psnr_db(value: f64) -> String {
+    if value.is_infinite() && value.is_sign_positive() {
+        "inf dB".to_string()
+    } else if value.is_finite() {
+        format!("{value:.2} dB")
+    } else {
+        "nan dB".to_string()
     }
 }
 

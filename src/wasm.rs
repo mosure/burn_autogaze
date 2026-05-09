@@ -47,7 +47,7 @@ impl WasmAutoGaze {
             AutoGazeLoadOptions::strict(),
         )
         .map_err(|err| js_error(format!("failed to load AutoGaze weights: {err:#}")))?;
-        let pipeline = AutoGazePipeline::new(model).with_max_gaze_tokens_each_frame(4);
+        let pipeline = AutoGazePipeline::new(model);
         Ok(Self {
             pipeline,
             device,
@@ -86,6 +86,14 @@ impl WasmAutoGaze {
 
     pub fn set_max_gaze_tokens_each_frame(&mut self, max_tokens: usize) {
         self.pipeline.set_max_gaze_tokens_each_frame(max_tokens);
+    }
+
+    pub fn reset_max_gaze_tokens_each_frame(&mut self) {
+        self.pipeline.reset_max_gaze_tokens_each_frame();
+    }
+
+    pub fn set_tile_batch_size(&mut self, tile_batch_size: usize) {
+        self.pipeline.set_tile_batch_size(tile_batch_size);
     }
 
     pub fn set_task_loss_requirement(&mut self, task_loss_requirement: f32) {

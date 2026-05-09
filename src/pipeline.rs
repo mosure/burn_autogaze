@@ -8,6 +8,10 @@ use burn::tensor::ops::PadMode;
 use burn::tensor::{Tensor, TensorData};
 use std::path::Path;
 
+pub const AUTO_GAZE_IMAGE_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
+pub const AUTO_GAZE_IMAGE_STD: [f32; 3] = [0.229, 0.224, 0.225];
+pub const AUTO_GAZE_RESCALE_FACTOR: f32 = 1.0 / 127.5;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum AutoGazeInferenceMode {
     #[default]
@@ -214,7 +218,11 @@ pub fn rgba_clip_to_tensor<B: Backend>(
         let frame_offset = frame * pixels_per_frame * 4;
         for channel in 0..3 {
             for pixel in 0..pixels_per_frame {
-                values.push(rgba[frame_offset + pixel * 4 + channel] as f32 / 255.0);
+                let value = rgba[frame_offset + pixel * 4 + channel] as f32;
+                let rescaled = value * AUTO_GAZE_RESCALE_FACTOR - 1.0;
+                values.push(
+                    (rescaled - AUTO_GAZE_IMAGE_MEAN[channel]) / AUTO_GAZE_IMAGE_STD[channel],
+                );
             }
         }
     }
@@ -230,6 +238,7 @@ pub struct AutoGazePipeline<B: Backend> {
     model: NativeAutoGazeModel<B>,
     max_gaze_tokens_each_frame: usize,
     task_loss_requirement: Option<f32>,
+    tile_batch_size: usize,
 }
 
 impl<B: Backend> AutoGazePipeline<B> {
@@ -240,6 +249,7 @@ impl<B: Backend> AutoGazePipeline<B> {
             model,
             max_gaze_tokens_each_frame,
             task_loss_requirement,
+            tile_batch_size: 8,
         }
     }
 
@@ -273,6 +283,10 @@ impl<B: Backend> AutoGazePipeline<B> {
         self.task_loss_requirement
     }
 
+    pub const fn tile_batch_size(&self) -> usize {
+        self.tile_batch_size
+    }
+
     pub fn with_max_gaze_tokens_each_frame(mut self, max_gaze_tokens_each_frame: usize) -> Self {
         self.max_gaze_tokens_each_frame = max_gaze_tokens_each_frame.max(1);
         self
@@ -283,12 +297,25 @@ impl<B: Backend> AutoGazePipeline<B> {
         self
     }
 
+    pub fn with_tile_batch_size(mut self, tile_batch_size: usize) -> Self {
+        self.tile_batch_size = tile_batch_size.max(1);
+        self
+    }
+
     pub fn set_max_gaze_tokens_each_frame(&mut self, max_gaze_tokens_each_frame: usize) {
         self.max_gaze_tokens_each_frame = max_gaze_tokens_each_frame.max(1);
     }
 
+    pub fn reset_max_gaze_tokens_each_frame(&mut self) {
+        self.max_gaze_tokens_each_frame = self.model.default_max_gaze_tokens_each_frame();
+    }
+
     pub fn set_task_loss_requirement(&mut self, task_loss_requirement: Option<f32>) {
         self.task_loss_requirement = task_loss_requirement.map(|value| value.max(0.0));
+    }
+
+    pub fn set_tile_batch_size(&mut self, tile_batch_size: usize) {
+        self.tile_batch_size = tile_batch_size.max(1);
     }
 
     pub const fn model(&self) -> &NativeAutoGazeModel<B> {
@@ -453,32 +480,21 @@ impl<B: Backend> AutoGazePipeline<B> {
             AutoGazeInferenceMode::ResizeToModelInput => self.trace_video_resize(video, k),
             AutoGazeInferenceMode::TiledFullResolution { tile_size, stride } => {
                 let layout = AutoGazeTileLayout::tiled(height, width, tile_size, stride);
-                let frame_budget = k.max(1).saturating_mul(layout.tile_count().max(1));
+                let frame_budget = self
+                    .max_gaze_tokens_each_frame
+                    .max(k.max(1))
+                    .saturating_mul(layout.tile_count().max(1));
                 let mut frame_points = (0..batch)
                     .map(|_| (0..time).map(|_| Vec::<FixationPoint>::new()).collect())
                     .collect::<Vec<Vec<Vec<FixationPoint>>>>();
                 let mut stop_probabilities = vec![vec![0.0f32; time]; batch];
-                for tile in layout.tiles.iter().copied() {
-                    let crop = crop_video_tile(video.clone(), tile);
-                    let tile_traces = self.trace_video_resize(crop, k);
-                    for batch_idx in 0..batch.min(tile_traces.len()) {
-                        for (frame_idx, fixation_set) in
-                            tile_traces[batch_idx].frames.iter().enumerate().take(time)
-                        {
-                            stop_probabilities[batch_idx][frame_idx] = stop_probabilities
-                                [batch_idx][frame_idx]
-                                .max(fixation_set.stop_probability);
-                            frame_points[batch_idx][frame_idx].extend(
-                                fixation_set
-                                    .points
-                                    .iter()
-                                    .copied()
-                                    .filter(|point| point.confidence > 0.0)
-                                    .filter_map(|point| remap_tile_point(point, tile, &layout)),
-                            );
-                        }
-                    }
-                }
+                self.collect_tiled_trace_points(
+                    video,
+                    k,
+                    &layout,
+                    &mut frame_points,
+                    &mut stop_probabilities,
+                );
                 frame_points
                     .into_iter()
                     .zip(stop_probabilities)
@@ -513,32 +529,22 @@ impl<B: Backend> AutoGazePipeline<B> {
             }
             AutoGazeInferenceMode::TiledFullResolution { tile_size, stride } => {
                 let layout = AutoGazeTileLayout::tiled(height, width, tile_size, stride);
-                let frame_budget = k.max(1).saturating_mul(layout.tile_count().max(1));
+                let frame_budget = self
+                    .max_gaze_tokens_each_frame
+                    .max(k.max(1))
+                    .saturating_mul(layout.tile_count().max(1));
                 let mut frame_points = (0..batch)
                     .map(|_| (0..time).map(|_| Vec::<FixationPoint>::new()).collect())
                     .collect::<Vec<Vec<Vec<FixationPoint>>>>();
                 let mut stop_probabilities = vec![vec![0.0f32; time]; batch];
-                for tile in layout.tiles.iter().copied() {
-                    let crop = crop_video_tile(video.clone(), tile);
-                    let tile_traces = self.trace_video_resize_async(crop, k).await?;
-                    for batch_idx in 0..batch.min(tile_traces.len()) {
-                        for (frame_idx, fixation_set) in
-                            tile_traces[batch_idx].frames.iter().enumerate().take(time)
-                        {
-                            stop_probabilities[batch_idx][frame_idx] = stop_probabilities
-                                [batch_idx][frame_idx]
-                                .max(fixation_set.stop_probability);
-                            frame_points[batch_idx][frame_idx].extend(
-                                fixation_set
-                                    .points
-                                    .iter()
-                                    .copied()
-                                    .filter(|point| point.confidence > 0.0)
-                                    .filter_map(|point| remap_tile_point(point, tile, &layout)),
-                            );
-                        }
-                    }
-                }
+                self.collect_tiled_trace_points_async(
+                    video,
+                    k,
+                    &layout,
+                    &mut frame_points,
+                    &mut stop_probabilities,
+                )
+                .await?;
                 Ok(frame_points
                     .into_iter()
                     .zip(stop_probabilities)
@@ -582,6 +588,67 @@ impl<B: Backend> AutoGazePipeline<B> {
                 self.task_loss_requirement,
             )
             .await
+    }
+
+    fn collect_tiled_trace_points(
+        &self,
+        video: Tensor<B, 5>,
+        k: usize,
+        layout: &AutoGazeTileLayout,
+        frame_points: &mut [Vec<Vec<FixationPoint>>],
+        stop_probabilities: &mut [Vec<f32>],
+    ) {
+        let batch = frame_points.len();
+        let time = frame_points.first().map_or(0, Vec::len);
+        for tiles in layout.tiles.chunks(self.tile_batch_size) {
+            let crops = tiles
+                .iter()
+                .copied()
+                .map(|tile| crop_video_tile(video.clone(), tile))
+                .collect::<Vec<_>>();
+            let tile_traces = self.trace_video_resize(Tensor::cat(crops, 0), k);
+            collect_tile_trace_points(
+                &tile_traces,
+                tiles,
+                batch,
+                time,
+                layout,
+                frame_points,
+                stop_probabilities,
+            );
+        }
+    }
+
+    async fn collect_tiled_trace_points_async(
+        &self,
+        video: Tensor<B, 5>,
+        k: usize,
+        layout: &AutoGazeTileLayout,
+        frame_points: &mut [Vec<Vec<FixationPoint>>],
+        stop_probabilities: &mut [Vec<f32>],
+    ) -> std::result::Result<(), ExecutionError> {
+        let batch = frame_points.len();
+        let time = frame_points.first().map_or(0, Vec::len);
+        for tiles in layout.tiles.chunks(self.tile_batch_size) {
+            let crops = tiles
+                .iter()
+                .copied()
+                .map(|tile| crop_video_tile(video.clone(), tile))
+                .collect::<Vec<_>>();
+            let tile_traces = self
+                .trace_video_resize_async(Tensor::cat(crops, 0), k)
+                .await?;
+            collect_tile_trace_points(
+                &tile_traces,
+                tiles,
+                batch,
+                time,
+                layout,
+                frame_points,
+                stop_probabilities,
+            );
+        }
+        Ok(())
     }
 
     pub fn trace_clip_from_frames(
@@ -755,6 +822,37 @@ fn crop_video_tile<B: Backend>(video: Tensor<B, 5>, tile: AutoGazeTile) -> Tenso
     }
 }
 
+fn collect_tile_trace_points(
+    tile_traces: &[FrameFixationTrace],
+    tiles: &[AutoGazeTile],
+    batch: usize,
+    time: usize,
+    layout: &AutoGazeTileLayout,
+    frame_points: &mut [Vec<Vec<FixationPoint>>],
+    stop_probabilities: &mut [Vec<f32>],
+) {
+    for (local_tile_idx, tile) in tiles.iter().copied().enumerate() {
+        for batch_idx in 0..batch {
+            let trace_idx = local_tile_idx * batch + batch_idx;
+            let Some(tile_trace) = tile_traces.get(trace_idx) else {
+                continue;
+            };
+            for (frame_idx, fixation_set) in tile_trace.frames.iter().enumerate().take(time) {
+                stop_probabilities[batch_idx][frame_idx] =
+                    stop_probabilities[batch_idx][frame_idx].max(fixation_set.stop_probability);
+                frame_points[batch_idx][frame_idx].extend(
+                    fixation_set
+                        .points
+                        .iter()
+                        .copied()
+                        .filter(|point| point.confidence > 0.0)
+                        .filter_map(|point| remap_tile_point(point, tile, layout)),
+                );
+            }
+        }
+    }
+}
+
 fn remap_tile_point(
     point: FixationPoint,
     tile: AutoGazeTile,
@@ -783,7 +881,7 @@ mod tests {
 
     #[cfg(feature = "ndarray")]
     #[test]
-    fn rgba_clip_to_tensor_converts_rgba_to_channel_first_rgb() {
+    fn rgba_clip_to_tensor_applies_autogaze_processor_affine() {
         let device = Default::default();
         let rgba = [10, 20, 30, 255, 40, 50, 60, 255];
         let shape = AutoGazeRgbaClipShape::new(1, 1, 2);
@@ -791,17 +889,22 @@ mod tests {
             .expect("rgba tensor");
         let values = tensor.into_data().to_vec::<f32>().expect("f32 tensor");
 
-        assert_eq!(
-            values,
-            vec![
-                10.0 / 255.0,
-                40.0 / 255.0,
-                20.0 / 255.0,
-                50.0 / 255.0,
-                30.0 / 255.0,
-                60.0 / 255.0,
-            ]
-        );
+        let expected = [
+            channel_processor_value(10, 0),
+            channel_processor_value(40, 0),
+            channel_processor_value(20, 1),
+            channel_processor_value(50, 1),
+            channel_processor_value(30, 2),
+            channel_processor_value(60, 2),
+        ];
+        for (actual, expected) in values.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1.0e-6);
+        }
+    }
+
+    fn channel_processor_value(value: u8, channel: usize) -> f32 {
+        let rescaled = value as f32 * AUTO_GAZE_RESCALE_FACTOR - 1.0;
+        (rescaled - AUTO_GAZE_IMAGE_MEAN[channel]) / AUTO_GAZE_IMAGE_STD[channel]
     }
 
     #[test]

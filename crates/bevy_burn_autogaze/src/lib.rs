@@ -106,6 +106,7 @@ pub struct BevyBurnAutoGazeConfig {
     pub mode: BevyAutoGazeMode,
     pub top_k: usize,
     pub max_gaze_tokens_each_frame: usize,
+    pub tile_batch_size: usize,
     pub task_loss_requirement: Option<f32>,
     pub disable_task_loss_requirement: bool,
     pub frames_per_clip: usize,
@@ -131,7 +132,8 @@ impl Default for BevyBurnAutoGazeConfig {
             image_path: None,
             mode: BevyAutoGazeMode::Resize224,
             top_k: 4,
-            max_gaze_tokens_each_frame: 4,
+            max_gaze_tokens_each_frame: 0,
+            tile_batch_size: 8,
             task_loss_requirement: None,
             disable_task_loss_requirement: false,
             frames_per_clip: 2,
@@ -196,6 +198,10 @@ impl BevyBurnAutoGazeConfig {
             }
             "max-gaze-tokens-each-frame" => {
                 self.max_gaze_tokens_each_frame = parse_usize_option(&key, value)?;
+                Ok(())
+            }
+            "tile-batch-size" | "tile-batch" | "tiles-per-batch" => {
+                self.tile_batch_size = parse_usize_option(&key, value)?.max(1);
                 Ok(())
             }
             "task-loss-requirement" | "task-loss" => {
@@ -1011,8 +1017,9 @@ async fn load_model(
 ) -> Result<AutoGazePipeline<AutoGazeBevyBackend>, String> {
     let mut pipeline = AutoGazePipeline::from_hf_dir(&config.model_dir, device)
         .map_err(|err| format!("{err:#}"))?;
-    pipeline.set_max_gaze_tokens_each_frame(config.max_gaze_tokens_each_frame);
+    apply_max_gaze_tokens_config(&mut pipeline, &config);
     apply_task_loss_requirement_config(&mut pipeline, &config);
+    apply_tile_batch_config(&mut pipeline, &config);
     Ok(pipeline)
 }
 
@@ -1033,9 +1040,19 @@ async fn load_model(
     )
     .map_err(|err| format!("{err:#}"))?;
     let mut pipeline = AutoGazePipeline::new(model);
-    pipeline.set_max_gaze_tokens_each_frame(config.max_gaze_tokens_each_frame);
+    apply_max_gaze_tokens_config(&mut pipeline, &config);
     apply_task_loss_requirement_config(&mut pipeline, &config);
+    apply_tile_batch_config(&mut pipeline, &config);
     Ok(pipeline)
+}
+
+fn apply_max_gaze_tokens_config<B: burn::tensor::backend::Backend>(
+    pipeline: &mut AutoGazePipeline<B>,
+    config: &BevyBurnAutoGazeConfig,
+) {
+    if config.max_gaze_tokens_each_frame > 0 {
+        pipeline.set_max_gaze_tokens_each_frame(config.max_gaze_tokens_each_frame);
+    }
 }
 
 fn apply_task_loss_requirement_config<B: burn::tensor::backend::Backend>(
@@ -1047,6 +1064,13 @@ fn apply_task_loss_requirement_config<B: burn::tensor::backend::Backend>(
     } else if let Some(task_loss_requirement) = config.task_loss_requirement {
         pipeline.set_task_loss_requirement(Some(task_loss_requirement));
     }
+}
+
+fn apply_tile_batch_config<B: burn::tensor::backend::Backend>(
+    pipeline: &mut AutoGazePipeline<B>,
+    config: &BevyBurnAutoGazeConfig,
+) {
+    pipeline.set_tile_batch_size(config.tile_batch_size.max(1));
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1614,7 +1638,7 @@ mod tests {
     fn applies_url_query_to_viewer_config() {
         let mut config = BevyBurnAutoGazeConfig::default();
         let errors = config.apply_query_string(
-            "?mode=full-res&top_k=2&frames-per-clip=3&inference-width=1920&inference-height=1080&show-fps=false&show-psnr=false&task-loss-requirement=0.65&config-url=%2Fconfig.json&weights-url=%2Fmodel.safetensors&load-model=false&mask-cell-scale=2.5&blend-alpha=0.5&visualization-mode=interframe&keyframe-duration=7",
+            "?mode=full-res&top_k=2&frames-per-clip=3&inference-width=1920&inference-height=1080&show-fps=false&show-psnr=false&task-loss-requirement=0.65&tile-batch-size=4&config-url=%2Fconfig.json&weights-url=%2Fmodel.safetensors&load-model=false&mask-cell-scale=2.5&blend-alpha=0.5&visualization-mode=interframe&keyframe-duration=7",
         );
 
         assert!(errors.is_empty(), "{errors:?}");
@@ -1628,6 +1652,7 @@ mod tests {
         assert!(!config.show_psnr);
         assert_eq!(config.task_loss_requirement, Some(0.65));
         assert!(!config.disable_task_loss_requirement);
+        assert_eq!(config.tile_batch_size, 4);
         assert_eq!(config.config_url, "/config.json");
         assert_eq!(config.weights_url, "/model.safetensors");
         assert!(!config.load_model);

@@ -21,7 +21,10 @@ toggles the text overlay for per-frame and EMA output update ratio.
 `--show-psnr` toggles PSNR in dB between the current input and rendered output;
 the pixel comparison is skipped when this overlay is disabled. In `tile-224`
 mode, source frames are padded to a non-overlapping 224px chunk grid and
-`--top-k` is a per-tile budget, so the frame budget is `top-k * tile-count`.
+`--max-gaze-tokens-each-frame` controls the per-tile generation cap. A value of
+`0` uses the model default, which is `198` for the NVIDIA config. The maximum
+frame budget is `max-gaze-tokens-each-frame * tile-count`, before task-loss
+stopping and padded-edge filtering.
 Use `--load-model=false` to verify camera/preview rendering without waiting for
 model load or inference.
 
@@ -54,7 +57,7 @@ UI is rendered by Bevy into the `#bevy` canvas, matching the native path. Pass
 the same viewer/inference knobs as query parameters:
 
 ```text
-http://localhost:8080/?mode=tile-224&visualization-mode=interframe&keyframe-duration=30&top-k=2&frames-per-clip=2&inference-width=1920&inference-height=1080&task-loss-requirement=0.7&show-fps=true&show-gaze-ratio=true&show-psnr=true
+http://localhost:8080/?mode=tile-224&visualization-mode=interframe&keyframe-duration=12&frames-per-clip=16&inference-width=1920&inference-height=1080&task-loss-requirement=0.7&show-fps=true&show-gaze-ratio=true&show-psnr=true
 ```
 
 Use `?source=static` for a generated static frame, or `?image-url=./frame.png`
