@@ -1016,7 +1016,9 @@ fn run_bevy_perf_case(
     args.extend(profile.cargo_run_args().iter().copied().map(OsString::from));
     args.push(OsString::from("--"));
     args.extend(app_args);
-    let command = runner.command(&runner.cargo, args);
+    let command = runner
+        .command(&runner.cargo, args)
+        .env("XDG_CACHE_HOME", out_dir.join("cache"));
     println!("\n[{name}]");
     println!("  {}", command.display());
     if runner.dry_run {
