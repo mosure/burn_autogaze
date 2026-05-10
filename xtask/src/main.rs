@@ -11,7 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -88,6 +88,8 @@ struct CompletionAuditArgs {
     frames: u32,
     #[arg(long, default_value_t = BEVY_PERF_CASE_TIMEOUT_SECS)]
     case_timeout_seconds: u64,
+    #[arg(long, value_enum, default_value_t = BevyPerfBuildProfile::Release)]
+    perf_profile: BevyPerfBuildProfile,
     #[arg(long, default_value = "target/autogaze-bevy-perf-audit")]
     out: PathBuf,
 }
@@ -109,6 +111,23 @@ struct BevyPerfMatrixArgs {
     camera: bool,
     #[arg(long, default_value_t = BEVY_PERF_CASE_TIMEOUT_SECS)]
     case_timeout_seconds: u64,
+    #[arg(long, value_enum, default_value_t = BevyPerfBuildProfile::Release)]
+    profile: BevyPerfBuildProfile,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum BevyPerfBuildProfile {
+    Release,
+    Dev,
+}
+
+impl BevyPerfBuildProfile {
+    const fn cargo_run_args(self) -> &'static [&'static str] {
+        match self {
+            Self::Release => &["--release"],
+            Self::Dev => &[],
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -442,6 +461,7 @@ fn release_readiness(root: PathBuf, args: ReleaseReadinessArgs) -> Result<()> {
             strict: false,
             frames: 120,
             case_timeout_seconds: BEVY_PERF_CASE_TIMEOUT_SECS,
+            perf_profile: BevyPerfBuildProfile::Release,
             out: PathBuf::from("target/autogaze-bevy-perf-audit"),
         },
     )?;
@@ -473,6 +493,7 @@ fn release_readiness(root: PathBuf, args: ReleaseReadinessArgs) -> Result<()> {
             out: PathBuf::from("target/autogaze-bevy-perf"),
             camera: true,
             case_timeout_seconds: BEVY_PERF_CASE_TIMEOUT_SECS,
+            profile: BevyPerfBuildProfile::Release,
         },
     )?;
 
@@ -640,6 +661,7 @@ fn completion_audit(root: PathBuf, args: CompletionAuditArgs) -> Result<()> {
                 out: args.out.clone(),
                 camera: true,
                 case_timeout_seconds: args.case_timeout_seconds,
+                profile: args.perf_profile,
             },
         );
         if let Err(error) = perf_result {
@@ -963,6 +985,7 @@ fn bevy_perf_matrix(root: PathBuf, args: BevyPerfMatrixArgs) -> Result<()> {
             name,
             app_args,
             Duration::from_secs(args.case_timeout_seconds),
+            args.profile,
         )?;
     }
     if !runner.dry_run {
@@ -981,6 +1004,7 @@ fn run_bevy_perf_case(
     name: &str,
     app_args: Vec<OsString>,
     timeout: Duration,
+    profile: BevyPerfBuildProfile,
 ) -> Result<()> {
     let log_path = out_dir.join(format!("{name}.log"));
     let json_path = out_dir.join(format!("{name}.json"));
@@ -988,8 +1012,9 @@ fn run_bevy_perf_case(
         OsString::from("run"),
         OsString::from("-p"),
         OsString::from("bevy_burn_autogaze"),
-        OsString::from("--"),
     ];
+    args.extend(profile.cargo_run_args().iter().copied().map(OsString::from));
+    args.push(OsString::from("--"));
     args.extend(app_args);
     let command = runner.command(&runner.cargo, args);
     println!("\n[{name}]");
@@ -2017,6 +2042,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bevy_perf_profile_defaults_to_release_for_throughput_evidence() {
+        let args = completion_audit_args(false, None, true);
+        assert!(matches!(args.perf_profile, BevyPerfBuildProfile::Release));
+        assert_eq!(
+            BevyPerfBuildProfile::Release.cargo_run_args(),
+            &["--release"]
+        );
+        assert!(BevyPerfBuildProfile::Dev.cargo_run_args().is_empty());
+    }
+
     fn completion_audit_args(
         strict: bool,
         burn_jepa: Option<PathBuf>,
@@ -2032,6 +2068,7 @@ mod tests {
             strict,
             frames: 120,
             case_timeout_seconds: BEVY_PERF_CASE_TIMEOUT_SECS,
+            perf_profile: BevyPerfBuildProfile::Release,
             out: PathBuf::from("target/autogaze-bevy-perf-audit"),
         }
     }
