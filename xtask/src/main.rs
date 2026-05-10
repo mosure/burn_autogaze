@@ -1054,14 +1054,14 @@ fn validate_summary(data: &Value, require_hardware_adapter: bool) -> Result<()> 
         require_int(data, field, 0, true)?;
     }
     if let Some(target_frames) = require_int(data, "target_frames", 1, false)? {
-        let processed = require_int(data, "processed_frames", 1, true)?.unwrap();
+        let processed = require_required_int(data, "processed_frames", 1)?;
         ensure!(
             processed <= target_frames,
             "`processed_frames` must not exceed `target_frames`: {processed} > {target_frames}"
         );
     }
     let p50 = require_number(data, "p50_total_ms", 0.0, None, false)?;
-    let p95 = require_number(data, "p95_total_ms", 0.0, None, true)?.unwrap();
+    let p95 = require_required_number(data, "p95_total_ms", 0.0, None)?;
     if let Some(p50) = p50 {
         ensure!(
             p95 >= p50,
@@ -1085,9 +1085,9 @@ fn validate_summary(data: &Value, require_hardware_adapter: bool) -> Result<()> 
         require_bool(data, field, false)?;
     }
     let latest_psnr = require_nullable_number(data, "latest_psnr_db", 0.0)?;
-    let latest_inf = require_bool(data, "latest_psnr_db_infinite", true)?.unwrap();
+    let latest_inf = require_required_bool(data, "latest_psnr_db_infinite")?;
     let ema_psnr = require_nullable_number(data, "ema_psnr_db", 0.0)?;
-    let ema_inf = require_bool(data, "ema_psnr_db_infinite", true)?.unwrap();
+    let ema_inf = require_required_bool(data, "ema_psnr_db_infinite")?;
     let show_psnr = require_bool(data, "show_psnr", false)?.unwrap_or(false);
     ensure!(
         !(latest_inf && latest_psnr.is_some()),
@@ -1146,10 +1146,10 @@ fn validate_summary(data: &Value, require_hardware_adapter: bool) -> Result<()> 
 }
 
 fn validate_aggregate_summary(data: &Value, require_hardware_adapter: bool) -> Result<()> {
-    let case_count = usize::try_from(require_int(data, "case_count", 1, true)?.unwrap())
+    let case_count = usize::try_from(require_required_int(data, "case_count", 1)?)
         .context("case_count exceeds usize")?;
-    let min_output_fps = require_number(data, "min_output_fps", 0.0, None, true)?.unwrap();
-    let max_output_fps = require_number(data, "max_output_fps", 0.0, None, true)?.unwrap();
+    let min_output_fps = require_required_number(data, "min_output_fps", 0.0, None)?;
+    let max_output_fps = require_required_number(data, "max_output_fps", 0.0, None)?;
     ensure!(
         min_output_fps <= max_output_fps,
         "`min_output_fps` must be <= `max_output_fps`"
@@ -1170,7 +1170,7 @@ fn validate_aggregate_summary(data: &Value, require_hardware_adapter: bool) -> R
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("aggregate case is missing `case` name"))?;
         ensure!(!name.is_empty(), "aggregate case name must not be empty");
-        fps_values.push(require_number(case, "avg_output_fps", 0.0, None, true)?.unwrap());
+        fps_values.push(require_required_number(case, "avg_output_fps", 0.0, None)?);
     }
     let observed_min = fps_values.iter().copied().reduce(f64::min).unwrap_or(0.0);
     let observed_max = fps_values.iter().copied().reduce(f64::max).unwrap_or(0.0);
@@ -1275,6 +1275,16 @@ fn require_number(
     Ok(Some(value))
 }
 
+fn require_required_number(
+    data: &Value,
+    field: &str,
+    minimum: f64,
+    maximum: Option<f64>,
+) -> Result<f64> {
+    require_number(data, field, minimum, maximum, true)?
+        .ok_or_else(|| anyhow!("missing required numeric field `{field}`"))
+}
+
 fn require_nullable_number(data: &Value, field: &str, minimum: f64) -> Result<Option<f64>> {
     let value = data
         .get(field)
@@ -1300,6 +1310,11 @@ fn require_int(data: &Value, field: &str, minimum: u64, required: bool) -> Resul
     Ok(Some(value))
 }
 
+fn require_required_int(data: &Value, field: &str, minimum: u64) -> Result<u64> {
+    require_int(data, field, minimum, true)?
+        .ok_or_else(|| anyhow!("missing required integer field `{field}`"))
+}
+
 fn require_bool(data: &Value, field: &str, required: bool) -> Result<Option<bool>> {
     let Some(value) = data.get(field) else {
         ensure!(!required, "missing required boolean field `{field}`");
@@ -1309,6 +1324,11 @@ fn require_bool(data: &Value, field: &str, required: bool) -> Result<Option<bool
         .as_bool()
         .ok_or_else(|| anyhow!("`{field}` must be a boolean"))?;
     Ok(Some(value))
+}
+
+fn require_required_bool(data: &Value, field: &str) -> Result<bool> {
+    require_bool(data, field, true)?
+        .ok_or_else(|| anyhow!("missing required boolean field `{field}`"))
 }
 
 fn require_enum(data: &Value, field: &str, allowed: &[&str], required: bool) -> Result<()> {
