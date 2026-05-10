@@ -436,6 +436,68 @@ fn repo_tooling_entrypoints_live_in_xtask() {
 }
 
 #[test]
+fn bevy_platform_selection_is_target_cfg_not_feature_flags() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let bevy_manifest = manifest
+        .join("crates")
+        .join("bevy_burn_autogaze")
+        .join("Cargo.toml");
+    let Some(source) = optional_source(&bevy_manifest) else {
+        return;
+    };
+
+    let features_start = source.find("[features]").expect("features section should exist");
+    let features_section = source[features_start..]
+        .split("\n[dependencies]")
+        .next()
+        .unwrap_or(&source[features_start..]);
+    assert!(
+        features_section.contains("default = []"),
+        "bevy_burn_autogaze should not require a platform feature for default native runs"
+    );
+    for forbidden in ["native =", "web =", "wasm ="] {
+        assert!(
+            !features_section.contains(forbidden),
+            "bevy_burn_autogaze should select native/wasm dependencies from target cfg, not a {forbidden} feature"
+        );
+    }
+    assert!(
+        source.contains("[target.'cfg(not(target_arch = \"wasm32\"))'.dependencies]")
+            && source.contains("[target.'cfg(target_arch = \"wasm32\")'.dependencies]"),
+        "bevy_burn_autogaze should keep platform-specific dependencies behind target cfg"
+    );
+
+    let checked_docs = [
+        manifest.join("README.md"),
+        manifest
+            .join("crates")
+            .join("bevy_burn_autogaze")
+            .join("README.md"),
+        manifest.join("web").join("README.md"),
+        manifest.join("docs").join("completion-audit.md"),
+    ];
+    for path in checked_docs {
+        let Some(source) = optional_source(&path) else {
+            continue;
+        };
+        for forbidden in ["--features native", "features native"] {
+            assert!(
+                !source.contains(forbidden),
+                "{} should document target-based Bevy platform selection instead of {forbidden}",
+                path.display()
+            );
+        }
+        for line in source.lines() {
+            assert!(
+                !line.contains("--features web ") && !line.trim_end().ends_with("--features web"),
+                "{} should not document an exact Bevy --features web platform flag",
+                path.display()
+            );
+        }
+    }
+}
+
+#[test]
 fn bevy_realtime_admission_uses_configured_core_policy() {
     let Some(source) = bevy_source() else {
         return;
