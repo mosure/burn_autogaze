@@ -149,7 +149,8 @@ RUSTC=/home/mosure/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin/rustc
 cargo test -p burn_autogaze --features ndarray --test source_hygiene -- --nocapture
 ```
 
-That focused run passed 10 tests, including the production panic hygiene check.
+That focused run now passes 11 tests, including the production panic hygiene
+check and the Bevy target-cfg platform selection guard.
 
 The Bevy perf-summary metric contract is now also an xtask release gate.
 `cargo run -p xtask -- validate-bevy-perf-summary` rejects missing or non-finite FPS/timing
@@ -914,7 +915,7 @@ Focused in-repo checks after that push still pass:
 cargo run -p xtask -- completion-audit
 
 cargo test -p burn_autogaze --features ndarray --test source_hygiene -- --nocapture
-# 10 passed
+# 11 passed
 
 cargo test -p burn_autogaze --features ndarray readout -- --nocapture
 # 31 passed, including readout, packet, sync/async, and tiled no-trace coverage
