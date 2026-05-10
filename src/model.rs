@@ -2807,7 +2807,7 @@ fn greedy_select_multi_tokens<B: Backend>(
         }
 
         let mask_values = builder.disallowed_mask(vocab, context);
-        let selected = greedy_step_values_from_data(
+        let Some(selected) = greedy_step_values_from_data(
             greedy_step_tensor(
                 &logits,
                 &task_loss,
@@ -2819,7 +2819,9 @@ fn greedy_select_multi_tokens<B: Backend>(
             )
             .into_data(),
             batch,
-        );
+        ) else {
+            break;
+        };
 
         builder.push_step(
             multi_idx,
@@ -2871,7 +2873,9 @@ async fn greedy_select_multi_tokens_async<B: Backend>(
         )
         .into_data_async()
         .await?;
-        let selected = greedy_step_values_from_data(selected_data, batch);
+        let Some(selected) = greedy_step_values_from_data(selected_data, batch) else {
+            break;
+        };
 
         builder.push_step(
             multi_idx,
@@ -2940,10 +2944,11 @@ fn pack_greedy_step_tensors<B: Backend>(
     )
 }
 
-fn greedy_step_values_from_data(data: TensorData, batch: usize) -> GreedyStepValues {
-    let values = data
-        .to_vec::<f32>()
-        .expect("convert packed greedy selection values to f32 vec");
+fn greedy_step_values_from_data(data: TensorData, batch: usize) -> Option<GreedyStepValues> {
+    let values = data.to_vec::<f32>().ok()?;
+    if values.len() < batch.saturating_mul(4) {
+        return None;
+    }
     let mut tokens = Vec::with_capacity(batch);
     let mut scores = Vec::with_capacity(batch);
     let mut confidences = Vec::with_capacity(batch);
@@ -2954,12 +2959,12 @@ fn greedy_step_values_from_data(data: TensorData, batch: usize) -> GreedyStepVal
         confidences.push(row[2]);
         task_losses.push(row[3]);
     }
-    GreedyStepValues {
+    Some(GreedyStepValues {
         tokens,
         scores,
         confidences,
         task_losses,
-    }
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -3894,6 +3899,15 @@ mod tests {
         assert_eq!(selected.0, vec![vec![0, 4, 2]]);
         assert_eq!(selected.0, reference.0);
         assert_eq!(selected.1, reference.1);
+    }
+
+    #[test]
+    fn greedy_step_values_rejects_malformed_packed_data() {
+        let truncated = TensorData::new(vec![0.0_f32, 1.0, 0.5], [1, 3]);
+        assert!(greedy_step_values_from_data(truncated, 1).is_none());
+
+        let wrong_dtype = TensorData::new(vec![0_i64, 1, 2, 3], [1, 4]);
+        assert!(greedy_step_values_from_data(wrong_dtype, 1).is_none());
     }
 
     #[test]
