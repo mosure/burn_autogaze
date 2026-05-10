@@ -574,8 +574,8 @@ cargo package -p burn_autogaze --allow-dirty
 git diff --check
 ```
 
-Additional API robustness checks passed on 2026-05-10 after replacing the
-remaining production `expect` in generated sparse-readout decoding with an
+Additional API robustness checks passed on 2026-05-10 after replacing a
+production `expect` in generated sparse-readout decoding with an
 explicit error and making invalid native `--image-path` static-source loading
 log and fall back instead of panicking:
 
@@ -914,7 +914,7 @@ Focused in-repo checks after that push still pass:
 cargo run -p xtask -- completion-audit
 
 cargo test -p burn_autogaze --features ndarray --test source_hygiene -- --nocapture
-# 8 passed
+# 10 passed
 
 cargo test -p burn_autogaze --features ndarray readout -- --nocapture
 # 31 passed, including readout, packet, sync/async, and tiled no-trace coverage
