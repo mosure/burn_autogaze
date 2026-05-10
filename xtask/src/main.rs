@@ -376,6 +376,7 @@ fn release_readiness(root: PathBuf, args: ReleaseReadinessArgs) -> Result<()> {
     }
 
     runner.run(runner.command(&cargo, ["check", "-p", "xtask"]))?;
+    runner.run(runner.command(&cargo, ["clippy", "-p", "xtask", "--", "-D", "warnings"]))?;
     completion_audit(
         root.clone(),
         CompletionAuditArgs {

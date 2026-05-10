@@ -515,7 +515,9 @@ so CI and the documented release gate share the same command list instead of
 drifting separately. The script installs the matching `wasm-bindgen-cli`,
 preflights `node`/`npm`/`npx`, runs `npm ci`, installs Playwright Chromium,
 builds the Bevy wasm artifacts, and runs the browser smoke when `--browser` is
-passed. The non-browser gate completed successfully in this workspace:
+passed. The release gate checks and clippy-lints the `xtask` crate itself so
+repo task orchestration stays no-warning ready. The non-browser gate completed
+successfully in this workspace:
 
 ```sh
 cargo run -p xtask -- release-readiness --browser --dry-run
