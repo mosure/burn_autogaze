@@ -1,5 +1,5 @@
 use crate::{FixationPoint, FixationSet, FrameFixationTrace};
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, ensure};
 use half::f16;
 use safetensors::{SafeTensors, tensor::TensorView};
 use std::fs;
@@ -49,6 +49,26 @@ impl AutoGazeTraceStore {
         let scale_values = tensor_to_f32(&scales)?;
         let confidence_values = tensor_to_f32(&confidences)?;
         let stop_values = tensor_to_f32(&stops)?;
+        let scalar_count = clips
+            .checked_mul(clip_len)
+            .and_then(|value| value.checked_mul(k))
+            .ok_or_else(|| anyhow!("trace store shape overflow"))?;
+        ensure!(
+            fixation_values.len() == scalar_count * 2,
+            "fixations tensor data length does not match shape"
+        );
+        ensure!(
+            scale_values.len() == scalar_count,
+            "scales tensor must have shape [clips, frames, k]"
+        );
+        ensure!(
+            confidence_values.len() == scalar_count,
+            "confidences tensor must have shape [clips, frames, k]"
+        );
+        ensure!(
+            stop_values.len() == clips * clip_len,
+            "stop_probabilities tensor must have shape [clips, frames]"
+        );
         let visibility = tensors.tensor("visibility_maps").ok();
         let (visibility_maps, visibility_height, visibility_width) = if let Some(view) = visibility
         {
@@ -133,20 +153,42 @@ impl AutoGazeTraceStore {
 }
 
 fn tensor_to_f32(view: &TensorView<'_>) -> Result<Vec<f32>> {
+    let element_count = view
+        .shape()
+        .iter()
+        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+        .ok_or_else(|| anyhow!("safetensors trace store shape overflow"))?;
+    let bytes = view.data();
     match view.dtype() {
-        safetensors::Dtype::F32 => Ok(view
-            .data()
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("f32 chunk")))
-            .collect()),
-        safetensors::Dtype::F16 => Ok(view
-            .data()
-            .chunks_exact(2)
-            .map(|chunk| {
-                let value = u16::from_le_bytes(chunk.try_into().expect("f16 chunk"));
-                f16::from_bits(value).to_f32()
-            })
-            .collect()),
+        safetensors::Dtype::F32 => {
+            let expected_bytes = element_count
+                .checked_mul(4)
+                .ok_or_else(|| anyhow!("F32 tensor byte length overflow"))?;
+            ensure!(
+                bytes.len() == expected_bytes,
+                "F32 tensor byte length does not match shape"
+            );
+            Ok(bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect())
+        }
+        safetensors::Dtype::F16 => {
+            let expected_bytes = element_count
+                .checked_mul(2)
+                .ok_or_else(|| anyhow!("F16 tensor byte length overflow"))?;
+            ensure!(
+                bytes.len() == expected_bytes,
+                "F16 tensor byte length does not match shape"
+            );
+            Ok(bytes
+                .chunks_exact(2)
+                .map(|chunk| {
+                    let value = u16::from_le_bytes([chunk[0], chunk[1]]);
+                    f16::from_bits(value).to_f32()
+                })
+                .collect())
+        }
         other => Err(anyhow!(
             "unsupported dtype in safetensors trace store: {other:?}"
         )),
@@ -231,6 +273,34 @@ mod tests {
         assert_eq!(
             store.visibility_map(0, 1).expect("visibility"),
             &[0.2, 0.4, 0.6, 0.8]
+        );
+    }
+
+    #[test]
+    fn rejects_trace_store_tensor_shape_mismatches() {
+        let temp = NamedTempFile::new().expect("tempfile");
+        let tensors = vec![
+            (
+                "fixations".to_string(),
+                tensor_f32(&[1, 2, 1, 2], &[0.25, 0.75, 0.5, 0.25]),
+            ),
+            ("scales".to_string(), tensor_f32(&[1, 1, 1], &[0.2])),
+            (
+                "confidences".to_string(),
+                tensor_f32(&[1, 2, 1], &[0.9, 0.8]),
+            ),
+            (
+                "stop_probabilities".to_string(),
+                tensor_f32(&[1, 2], &[0.1, 0.2]),
+            ),
+        ];
+        serialize_to_file(tensors, None, temp.path()).expect("write safetensors");
+
+        let err = AutoGazeTraceStore::from_file(temp.path()).expect_err("shape mismatch");
+
+        assert!(
+            err.to_string().contains("scales tensor must have shape"),
+            "unexpected error: {err:#}"
         );
     }
 }

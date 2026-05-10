@@ -1,7 +1,9 @@
 use crate::{
     AutoGazeConfig, AutoGazeInferenceMode, AutoGazeLoadOptions, AutoGazePipeline,
-    AutoGazeRgbaClipShape, AutoGazeVisualizationMode, AutoGazeVisualizationState,
-    NativeAutoGazeModel, rgba_clip_to_tensor,
+    AutoGazePipelineOptions, AutoGazeRgbaClipShape, AutoGazeVisualizationMode,
+    AutoGazeVisualizationState, DEFAULT_BLEND_ALPHA, DEFAULT_KEYFRAME_DURATION,
+    DEFAULT_REALTIME_TOP_K, DEFAULT_TILED_TILE_BATCH_SIZE, NativeAutoGazeModel, format_psnr_db,
+    last_rgba_frame,
 };
 use std::sync::OnceLock;
 use wasm_bindgen::prelude::*;
@@ -47,19 +49,21 @@ impl WasmAutoGaze {
             AutoGazeLoadOptions::strict(),
         )
         .map_err(|err| js_error(format!("failed to load AutoGaze weights: {err:#}")))?;
-        let pipeline = AutoGazePipeline::new(model);
+        let pipeline = AutoGazePipeline::new(model).with_options(
+            AutoGazePipelineOptions::default().with_tile_batch_size(DEFAULT_TILED_TILE_BATCH_SIZE),
+        );
         Ok(Self {
             pipeline,
             device,
             mode: AutoGazeInferenceMode::ResizeToModelInput,
-            top_k: 4,
+            top_k: DEFAULT_REALTIME_TOP_K,
             mask_cell_scale: 1.0,
-            blend_alpha: 0.72,
+            blend_alpha: DEFAULT_BLEND_ALPHA,
             visualization_mode: AutoGazeVisualizationMode::FullBlend,
-            keyframe_duration: 30,
+            keyframe_duration: DEFAULT_KEYFRAME_DURATION,
             visualization_state: AutoGazeVisualizationState::new(
                 AutoGazeVisualizationMode::FullBlend,
-                30,
+                DEFAULT_KEYFRAME_DURATION,
             ),
         })
     }
@@ -192,11 +196,9 @@ impl WasmAutoGaze {
         }
 
         let shape = AutoGazeRgbaClipShape::new(frames, height, width);
-        let video = rgba_clip_to_tensor::<WasmBackend>(rgba, shape, &self.device)
-            .map_err(|err| js_error(format!("failed to build RGBA clip tensor: {err:#}")))?;
         let traces = self
             .pipeline
-            .trace_video_with_mode_async(video, self.top_k, self.mode)
+            .trace_rgba_clip_with_mode_async(rgba, shape, self.top_k, self.mode, &self.device)
             .await
             .map_err(|err| js_error(format!("failed to read AutoGaze tensor data: {err:?}")))?;
 
@@ -208,7 +210,8 @@ impl WasmAutoGaze {
             .unwrap_or_default();
         let points_json = serde_json::to_string(&points)
             .map_err(|err| js_error(format!("failed to serialize fixation points: {err}")))?;
-        let last_frame = last_rgba_frame(rgba, width, height, frames);
+        let last_frame = last_rgba_frame(rgba, shape)
+            .map_err(|err| js_error(format!("failed to select latest RGBA frame: {err:#}")))?;
         self.visualization_state
             .configure(self.visualization_mode, self.keyframe_duration);
         let visualization = self
@@ -231,6 +234,11 @@ impl WasmAutoGaze {
             updated_pixel_count: visualization.updated_pixel_count,
             mask_ratio: visualization.mask_ratio(),
             update_ratio: visualization.update_ratio(),
+            psnr_db: visualization.output_psnr_db(last_frame).map_err(|err| {
+                js_error(format!(
+                    "failed to calculate AutoGaze output PSNR against input frame: {err:#}"
+                ))
+            })?,
             mask_rgba: visualization.mask_rgba,
             blend_rgba: visualization.blend_rgba,
             side_by_side_rgba: visualization.side_by_side_rgba,
@@ -252,6 +260,7 @@ pub struct WasmAutoGazeOutput {
     updated_pixel_count: usize,
     mask_ratio: f64,
     update_ratio: f64,
+    psnr_db: f64,
     mask_rgba: Vec<u8>,
     blend_rgba: Vec<u8>,
     side_by_side_rgba: Vec<u8>,
@@ -297,6 +306,15 @@ impl WasmAutoGazeOutput {
     #[wasm_bindgen(getter)]
     pub fn update_ratio(&self) -> f64 {
         self.update_ratio
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn psnr_db(&self) -> f64 {
+        self.psnr_db
+    }
+
+    pub fn psnr_text(&self) -> String {
+        format_psnr_db(self.psnr_db)
     }
 
     #[wasm_bindgen(getter)]
@@ -353,12 +371,6 @@ async fn webgpu_device() -> WasmDevice {
     .await;
     let _ = WEBGPU_DEVICE.set(device.clone());
     device
-}
-
-fn last_rgba_frame(rgba: &[u8], width: usize, height: usize, frames: usize) -> &[u8] {
-    let frame_bytes = width * height * 4;
-    let start = frames.saturating_sub(1) * frame_bytes;
-    &rgba[start..start + frame_bytes]
 }
 
 fn mode_label(mode: AutoGazeInferenceMode) -> String {

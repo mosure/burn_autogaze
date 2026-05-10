@@ -1,5 +1,9 @@
-use crate::FixationPoint;
+use crate::{
+    DEFAULT_KEYFRAME_DURATION, FixationPoint,
+    pipeline::{AUTO_GAZE_IMAGE_MEAN, AUTO_GAZE_IMAGE_STD},
+};
 use anyhow::{Result, ensure};
+use burn::tensor::{Int, Tensor, TensorData, backend::Backend};
 use std::{fmt, str::FromStr};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -29,6 +33,38 @@ impl AutoGazeVisualization {
 
     pub fn output_psnr_db(&self, input_rgba: &[u8]) -> Result<f64> {
         rgba_psnr_db(input_rgba, &self.blend_rgba)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AutoGazeVisualizationPanels {
+    pub width: usize,
+    pub height: usize,
+    pub mask_rgba: Vec<u8>,
+    pub blend_rgba: Vec<u8>,
+    pub mask_pixel_count: usize,
+    pub updated_pixel_count: usize,
+}
+
+impl AutoGazeVisualizationPanels {
+    pub fn output_rgba(&self) -> &[u8] {
+        &self.blend_rgba
+    }
+
+    pub fn mask_ratio(&self) -> f64 {
+        ratio(self.mask_pixel_count, self.width * self.height)
+    }
+
+    pub fn update_ratio(&self) -> f64 {
+        ratio(self.updated_pixel_count, self.width * self.height)
+    }
+
+    pub fn output_psnr_db(&self, input_rgba: &[u8]) -> Result<f64> {
+        rgba_psnr_db(input_rgba, &self.blend_rgba)
+    }
+
+    pub fn into_side_by_side(self, input_rgba: &[u8]) -> Result<AutoGazeVisualization> {
+        build_visualization(input_rgba, self)
     }
 }
 
@@ -82,7 +118,10 @@ pub struct AutoGazeVisualizationState {
 
 impl Default for AutoGazeVisualizationState {
     fn default() -> Self {
-        Self::new(AutoGazeVisualizationMode::FullBlend, 30)
+        Self::new(
+            AutoGazeVisualizationMode::FullBlend,
+            DEFAULT_KEYFRAME_DURATION,
+        )
     }
 }
 
@@ -130,46 +169,66 @@ impl AutoGazeVisualizationState {
         cell_scale: f32,
         blend_alpha: f32,
     ) -> Result<AutoGazeVisualization> {
-        let mask = mask_rgba_and_alpha(rgba, width, height, points, cell_scale)?;
-        let pixels = validate_rgba_dimensions(rgba, width, height)?;
-        let (output_rgba, updated_pixel_count) = match self.mode {
+        self.visualize_rgba_panels(rgba, width, height, points, cell_scale, blend_alpha)?
+            .into_side_by_side(rgba)
+    }
+
+    pub fn visualize_rgba_panels(
+        &mut self,
+        rgba: &[u8],
+        width: usize,
+        height: usize,
+        points: &[FixationPoint],
+        cell_scale: f32,
+        blend_alpha: f32,
+    ) -> Result<AutoGazeVisualizationPanels> {
+        let _ = validate_rgba_dimensions(rgba, width, height)?;
+        let (mask_rgba, output_rgba, mask_pixel_count, updated_pixel_count) = match self.mode {
             AutoGazeVisualizationMode::FullBlend => {
-                (blend_masked_rgba(rgba, &mask.alpha, blend_alpha), pixels)
+                let mask = mask_rgba_and_alpha(rgba, width, height, points, cell_scale)?;
+                (
+                    mask.mask_rgba,
+                    blend_masked_rgba(rgba, &mask.alpha, blend_alpha),
+                    mask.mask_pixel_count,
+                    mask.mask_pixel_count,
+                )
             }
             AutoGazeVisualizationMode::Interframe => {
-                self.interframe_rgba(rgba, width, height, &mask.alpha)?
+                let mask = mask_rgba_and_rects(rgba, width, height, points, cell_scale)?;
+                let (output_rgba, updated_pixel_count) = self.interframe_rgba(rgba, &mask.plan)?;
+                (
+                    mask.mask_rgba,
+                    output_rgba,
+                    mask.plan.pixel_count,
+                    updated_pixel_count,
+                )
             }
         };
         self.frame_index = self.frame_index.saturating_add(1);
-        build_visualization(
-            rgba,
+        Ok(AutoGazeVisualizationPanels {
             width,
             height,
-            mask.mask_rgba,
-            output_rgba,
-            mask.mask_pixel_count,
+            mask_rgba,
+            blend_rgba: output_rgba,
+            mask_pixel_count,
             updated_pixel_count,
-        )
+        })
     }
 
     fn interframe_rgba(
         &mut self,
         rgba: &[u8],
-        width: usize,
-        height: usize,
-        alpha: &[u8],
+        plan: &AutoGazeSparseUpdatePlan,
     ) -> Result<(Vec<u8>, usize)> {
+        let width = plan.width;
+        let height = plan.height;
         let pixels = validate_rgba_dimensions(rgba, width, height)?;
-        ensure!(
-            alpha.len() == pixels,
-            "interframe alpha mask length must match input frame"
-        );
         let dimensions_changed = self.interframe_width != width || self.interframe_height != height;
         let keyframe = dimensions_changed
             || self.interframe_output_rgba.len() != pixels * 4
             || self.frame_index == 0
             || self.frame_index.is_multiple_of(self.keyframe_duration);
-        let mut updated_pixel_count = if keyframe { pixels } else { 0 };
+        let updated_pixel_count = if keyframe { pixels } else { plan.pixel_count };
 
         if keyframe {
             self.interframe_output_rgba.clear();
@@ -179,18 +238,390 @@ impl AutoGazeVisualizationState {
         }
 
         if !keyframe {
-            for (pixel, &mask) in alpha.iter().enumerate().take(pixels) {
-                let offset = pixel * 4;
-                if mask > 0 {
-                    self.interframe_output_rgba[offset..offset + 4]
-                        .copy_from_slice(&rgba[offset..offset + 4]);
-                    updated_pixel_count += 1;
-                }
-            }
+            copy_sparse_update_rgba(rgba, &mut self.interframe_output_rgba, plan)?;
         }
 
         Ok((self.interframe_output_rgba.clone(), updated_pixel_count))
     }
+}
+
+pub struct AutoGazeTensorVisualization<B: Backend> {
+    pub width: usize,
+    pub height: usize,
+    pub side_by_side_width: usize,
+    pub side_by_side_rgba: Tensor<B, 3>,
+    pub output_rgba: Tensor<B, 3>,
+    pub mask_pixel_count: usize,
+    pub updated_pixel_count: usize,
+}
+
+impl<B: Backend> AutoGazeTensorVisualization<B> {
+    pub fn mask_ratio(&self) -> f64 {
+        ratio(self.mask_pixel_count, self.width * self.height)
+    }
+
+    pub fn update_ratio(&self) -> f64 {
+        ratio(self.updated_pixel_count, self.width * self.height)
+    }
+}
+
+#[derive(Clone)]
+pub struct AutoGazeTensorVisualizationPanels<B: Backend> {
+    pub width: usize,
+    pub height: usize,
+    pub input_rgba: Tensor<B, 3>,
+    pub mask_rgba: Tensor<B, 3>,
+    pub output_rgba: Tensor<B, 3>,
+    pub mask_pixel_count: usize,
+    pub updated_pixel_count: usize,
+}
+
+impl<B: Backend> AutoGazeTensorVisualizationPanels<B> {
+    pub fn mask_ratio(&self) -> f64 {
+        ratio(self.mask_pixel_count, self.width * self.height)
+    }
+
+    pub fn update_ratio(&self) -> f64 {
+        ratio(self.updated_pixel_count, self.width * self.height)
+    }
+
+    pub fn into_side_by_side(self) -> AutoGazeTensorVisualization<B> {
+        let Self {
+            width,
+            height,
+            input_rgba,
+            mask_rgba,
+            output_rgba,
+            mask_pixel_count,
+            updated_pixel_count,
+        } = self;
+        let side_by_side_rgba = Tensor::cat(vec![input_rgba, mask_rgba, output_rgba.clone()], 1);
+        AutoGazeTensorVisualization {
+            width,
+            height,
+            side_by_side_width: width * 3,
+            side_by_side_rgba,
+            output_rgba,
+            mask_pixel_count,
+            updated_pixel_count,
+        }
+    }
+}
+
+pub const DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RECTS: usize = 4;
+pub const DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RATIO: f64 = 0.02;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AutoGazeTensorVisualizationOptions {
+    pub width: usize,
+    pub height: usize,
+    pub cell_scale: f32,
+    pub blend_alpha: f32,
+    pub sparse_update_max_rects: usize,
+    pub sparse_update_max_ratio: f64,
+}
+
+impl AutoGazeTensorVisualizationOptions {
+    pub const fn new(width: usize, height: usize, cell_scale: f32, blend_alpha: f32) -> Self {
+        Self {
+            width,
+            height,
+            cell_scale,
+            blend_alpha,
+            sparse_update_max_rects: DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RECTS,
+            sparse_update_max_ratio: DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RATIO,
+        }
+    }
+
+    pub const fn with_sparse_update_policy(
+        mut self,
+        max_rects: usize,
+        max_update_ratio: f64,
+    ) -> Self {
+        self.sparse_update_max_rects = max_rects;
+        self.sparse_update_max_ratio = max_update_ratio;
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AutoGazeTensorInterframePath {
+    Keyframe,
+    SparseRects,
+    DenseMask,
+}
+
+impl AutoGazeTensorInterframePath {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Keyframe => "keyframe",
+            Self::SparseRects => "sparse-rects",
+            Self::DenseMask => "dense-mask",
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct AutoGazeTensorVisualizationState<B: Backend> {
+    mode: AutoGazeVisualizationMode,
+    keyframe_duration: usize,
+    frame_index: usize,
+    width: usize,
+    height: usize,
+    interframe_output_rgba: Option<Tensor<B, 3>>,
+    last_interframe_path: Option<AutoGazeTensorInterframePath>,
+}
+
+impl<B: Backend> AutoGazeTensorVisualizationState<B> {
+    pub fn new(mode: AutoGazeVisualizationMode, keyframe_duration: usize) -> Self {
+        Self {
+            mode,
+            keyframe_duration: keyframe_duration.max(1),
+            frame_index: 0,
+            width: 0,
+            height: 0,
+            interframe_output_rgba: None,
+            last_interframe_path: None,
+        }
+    }
+
+    pub fn mode(&self) -> AutoGazeVisualizationMode {
+        self.mode
+    }
+
+    pub fn keyframe_duration(&self) -> usize {
+        self.keyframe_duration
+    }
+
+    pub fn last_interframe_path(&self) -> Option<AutoGazeTensorInterframePath> {
+        self.last_interframe_path
+    }
+
+    pub fn configure(&mut self, mode: AutoGazeVisualizationMode, keyframe_duration: usize) {
+        if self.mode != mode {
+            self.reset();
+        }
+        self.mode = mode;
+        self.keyframe_duration = keyframe_duration.max(1);
+    }
+
+    pub fn reset(&mut self) {
+        self.frame_index = 0;
+        self.width = 0;
+        self.height = 0;
+        self.interframe_output_rgba = None;
+        self.last_interframe_path = None;
+    }
+
+    pub fn visualize_normalized_rgb_clip(
+        &mut self,
+        tensor: Tensor<B, 5>,
+        points: &[FixationPoint],
+        options: AutoGazeTensorVisualizationOptions,
+        device: &B::Device,
+    ) -> Result<AutoGazeTensorVisualization<B>> {
+        self.visualize_normalized_rgb_clip_panels(tensor, points, options, device)
+            .map(AutoGazeTensorVisualizationPanels::into_side_by_side)
+    }
+
+    pub fn visualize_normalized_rgb_clip_panels(
+        &mut self,
+        tensor: Tensor<B, 5>,
+        points: &[FixationPoint],
+        options: AutoGazeTensorVisualizationOptions,
+        device: &B::Device,
+    ) -> Result<AutoGazeTensorVisualizationPanels<B>> {
+        let width = options.width;
+        let height = options.height;
+        let pixels = validate_dimensions(width, height)?;
+        let mask_rgba = fixation_scale_mask_rgba(width, height, points, options.cell_scale);
+        let input = normalized_rgb_clip_to_unit_rgba_tensor(tensor, width, height, device)?;
+        let mask = rgba_u8_to_unit_tensor(&mask_rgba, width, height, device)?;
+        let mut interframe_path = None;
+        let (output, mask_pixel_count, updated_pixel_count) = match self.mode {
+            AutoGazeVisualizationMode::FullBlend => {
+                let alpha =
+                    fixation_effective_alpha_mask(width, height, points, options.cell_scale);
+                let mask_pixel_count = alpha.iter().filter(|&&mask| mask > 0).count();
+                let alpha = alpha_u8_to_unit_tensor(&alpha, width, height, device)?;
+                let blend = alpha_blend_tensor(alpha, width, height, options.blend_alpha, device);
+                let inverse = Tensor::<B, 3>::ones([height, width, 4], device).sub(blend.clone());
+                (
+                    input.clone().mul(inverse).add(blend),
+                    mask_pixel_count,
+                    mask_pixel_count,
+                )
+            }
+            AutoGazeVisualizationMode::Interframe => {
+                let rects =
+                    fixation_effective_cell_rects(width, height, points, options.cell_scale);
+                let keyframe = self.is_keyframe(width, height);
+                let use_sparse = !keyframe
+                    && should_use_sparse_tensor_update_rects(
+                        width,
+                        height,
+                        &rects,
+                        options.sparse_update_max_rects,
+                        options.sparse_update_max_ratio,
+                    );
+                if use_sparse {
+                    interframe_path = Some(AutoGazeTensorInterframePath::SparseRects);
+                    let plan = AutoGazeSparseUpdatePlan::new(width, height, rects)?;
+                    let previous = self
+                        .interframe_output_rgba
+                        .clone()
+                        .unwrap_or_else(|| input.clone());
+                    let output = copy_sparse_update_tensor(input.clone(), previous, &plan)?;
+                    (output, plan.pixel_count, plan.pixel_count)
+                } else {
+                    interframe_path = Some(if keyframe {
+                        AutoGazeTensorInterframePath::Keyframe
+                    } else {
+                        AutoGazeTensorInterframePath::DenseMask
+                    });
+                    let alpha = alpha_mask_from_rects(width, height, &rects);
+                    let mask_pixel_count = alpha.iter().filter(|&&mask| mask > 0).count();
+                    let updated_pixel_count = if keyframe { pixels } else { mask_pixel_count };
+                    let output = if keyframe {
+                        input.clone()
+                    } else {
+                        let previous = self
+                            .interframe_output_rgba
+                            .clone()
+                            .unwrap_or_else(|| input.clone());
+                        let alpha = alpha_u8_to_unit_tensor(&alpha, width, height, device)?;
+                        dense_interframe_update_tensor(input.clone(), previous, alpha)
+                    };
+                    (output, mask_pixel_count, updated_pixel_count)
+                }
+            }
+        };
+
+        self.advance(width, height, output.clone());
+        self.last_interframe_path = interframe_path;
+        Ok(AutoGazeTensorVisualizationPanels {
+            width,
+            height,
+            input_rgba: input,
+            mask_rgba: mask,
+            output_rgba: output,
+            mask_pixel_count,
+            updated_pixel_count,
+        })
+    }
+
+    fn is_keyframe(&self, width: usize, height: usize) -> bool {
+        self.width != width
+            || self.height != height
+            || self.interframe_output_rgba.is_none()
+            || self.frame_index == 0
+            || self.frame_index.is_multiple_of(self.keyframe_duration)
+    }
+
+    fn advance(&mut self, width: usize, height: usize, output: Tensor<B, 3>) {
+        self.width = width;
+        self.height = height;
+        self.interframe_output_rgba = Some(output);
+        self.frame_index = self.frame_index.saturating_add(1);
+    }
+}
+
+pub fn copy_sparse_update_tensor<B: Backend>(
+    source_rgba: Tensor<B, 3>,
+    target_rgba: Tensor<B, 3>,
+    plan: &AutoGazeSparseUpdatePlan,
+) -> Result<Tensor<B, 3>> {
+    validate_unit_rgba_tensor_shape(&source_rgba, plan.width, plan.height)?;
+    validate_unit_rgba_tensor_shape(&target_rgba, plan.width, plan.height)?;
+
+    let mut output = target_rgba;
+    for rect in &plan.rects {
+        let rect = rect.clamped(plan.width, plan.height);
+        if rect.is_empty() {
+            continue;
+        }
+        let y = rect.y0..rect.y1;
+        let x = rect.x0..rect.x1;
+        let channels = 0..4;
+        let source_patch = source_rgba
+            .clone()
+            .slice([y.clone(), x.clone(), channels.clone()]);
+        output = output.slice_assign([y, x, channels], source_patch);
+    }
+
+    Ok(output)
+}
+
+fn validate_unit_rgba_tensor_shape<B: Backend>(
+    tensor: &Tensor<B, 3>,
+    width: usize,
+    height: usize,
+) -> Result<()> {
+    let dims = tensor.shape().dims::<3>();
+    ensure!(
+        dims == [height, width, 4],
+        "expected unit RGBA tensor shape [{height},{width},4], got {dims:?}"
+    );
+    Ok(())
+}
+
+fn dense_interframe_update_tensor<B: Backend>(
+    input: Tensor<B, 3>,
+    previous: Tensor<B, 3>,
+    alpha: Tensor<B, 3>,
+) -> Tensor<B, 3> {
+    let update = alpha.repeat_dim(2, 4);
+    previous
+        .clone()
+        .add(input.clone().sub(previous).mul(update))
+}
+
+fn should_use_sparse_tensor_update_rects(
+    width: usize,
+    height: usize,
+    rects: &[FixationPixelRect],
+    max_rects: usize,
+    max_update_ratio: f64,
+) -> bool {
+    if rects.is_empty()
+        || max_rects == 0
+        || rects.len() > max_rects
+        || !max_update_ratio.is_finite()
+        || max_update_ratio <= 0.0
+    {
+        return false;
+    }
+
+    let pixels = width.max(1) * height.max(1);
+    let pixel_count_upper_bound = rects
+        .iter()
+        .map(|rect| rect.pixel_count(width, height))
+        .sum::<usize>();
+    ratio(pixel_count_upper_bound, pixels) <= max_update_ratio.clamp(0.0, 1.0)
+}
+
+pub fn normalized_rgb_clip_to_unit_rgba_tensor<B: Backend>(
+    tensor: Tensor<B, 5>,
+    width: usize,
+    height: usize,
+    device: &B::Device,
+) -> Result<Tensor<B, 3>> {
+    let _ = validate_dimensions(width, height)?;
+    let dims = tensor.shape().dims::<5>();
+    ensure!(
+        dims == [1, 1, 3, height, width],
+        "expected normalized RGB clip tensor shape [1,1,3,{height},{width}], got {dims:?}"
+    );
+    let rgb = tensor
+        .reshape([3, height, width])
+        .permute([1, 2, 0])
+        .mul(channel_vector_tensor(AUTO_GAZE_IMAGE_STD, device))
+        .add(channel_vector_tensor(AUTO_GAZE_IMAGE_MEAN, device))
+        .add_scalar(1.0)
+        .div_scalar(2.0)
+        .clamp(0.0, 1.0);
+    let alpha = Tensor::<B, 3>::ones([height, width, 1], device);
+    Ok(Tensor::cat(vec![rgb, alpha], 2))
 }
 
 pub fn fixation_alpha_mask(
@@ -201,25 +632,48 @@ pub fn fixation_alpha_mask(
 ) -> Vec<u8> {
     let width = width.max(1);
     let height = height.max(1);
+    let rects = fixation_cell_rects(width, height, points, cell_scale);
+    alpha_mask_from_rects(width, height, &rects)
+}
+
+fn alpha_mask_from_rects(width: usize, height: usize, rects: &[FixationPixelRect]) -> Vec<u8> {
+    let width = width.max(1);
+    let height = height.max(1);
     let mut alpha = vec![0u8; width * height];
 
-    for point in points {
-        if point.confidence <= 0.0 {
+    for rect in rects {
+        let rect = rect.clamped(width, height);
+        if rect.is_empty() {
             continue;
         }
-
-        let bounds = point.scaled_bounds(cell_scale);
-        let (x0, x1) = pixel_range(bounds.x_min, bounds.x_max, width);
-        let (y0, y1) = pixel_range(bounds.y_min, bounds.y_max, height);
-        for y in y0..y1 {
-            let row = y * width;
-            for x in x0..x1 {
-                alpha[row + x] = 255;
-            }
+        for y in rect.y0..rect.y1 {
+            let start = y * width + rect.x0;
+            let end = y * width + rect.x1;
+            alpha[start..end].fill(255);
         }
     }
 
     alpha
+}
+
+/// Build the sparse output/update footprint from multi-scale gaze tokens.
+///
+/// AutoGaze predicts tokens from a multi-scale image pyramid. A coarse 2x2
+/// token is useful to draw in the mask panel at its native pyramid scale, but it
+/// is too broad for output reconstruction and codec-style update metrics. This
+/// helper projects every selected token onto the finest active display grid so
+/// gaze ratio and interframe output measure selected token cells rather than
+/// coarse full-frame overlays.
+pub fn fixation_effective_alpha_mask(
+    width: usize,
+    height: usize,
+    points: &[FixationPoint],
+    cell_scale: f32,
+) -> Vec<u8> {
+    let width = width.max(1);
+    let height = height.max(1);
+    let rects = fixation_effective_cell_rects(width, height, points, cell_scale);
+    alpha_mask_from_rects(width, height, &rects)
 }
 
 pub fn fixation_scale_mask_rgba(
@@ -252,7 +706,7 @@ pub fn fixation_scale_mask_rgba(
         let bounds = point.scaled_bounds(cell_scale);
         let (x0, x1) = pixel_range(bounds.x_min, bounds.x_max, width);
         let (y0, y1) = pixel_range(bounds.y_min, bounds.y_max, height);
-        let rect = CellRect { x0, x1, y0, y1 };
+        let rect = FixationPixelRect { x0, x1, y0, y1 };
         fill_cell(&mut rgba, width, rect, color, 0.42);
         stroke_cell(&mut rgba, width, rect, color);
     }
@@ -260,29 +714,299 @@ pub fn fixation_scale_mask_rgba(
     rgba
 }
 
-#[derive(Clone, Copy)]
-struct CellRect {
-    x0: usize,
-    x1: usize,
-    y0: usize,
-    y1: usize,
+/// Colorize the same projected cells used by [`fixation_effective_alpha_mask`].
+///
+/// This is useful when a downstream codec wants a sparse finest-grid token
+/// footprint. The default visualization uses [`fixation_scale_mask_rgba`] so
+/// the displayed cells retain their native pyramid scale, matching upstream.
+pub fn fixation_effective_scale_mask_rgba(
+    width: usize,
+    height: usize,
+    points: &[FixationPoint],
+    cell_scale: f32,
+) -> Vec<u8> {
+    let width = width.max(1);
+    let height = height.max(1);
+    let mut rgba = vec![0u8; width * height * 4];
+    for pixel in rgba.chunks_exact_mut(4) {
+        pixel[3] = 255;
+    }
+
+    let mut ordered = points
+        .iter()
+        .copied()
+        .filter(|point| point.confidence > 0.0)
+        .collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        right
+            .cell_width()
+            .total_cmp(&left.cell_width())
+            .then_with(|| right.cell_height().total_cmp(&left.cell_height()))
+    });
+
+    let target_grid = effective_display_grid(&ordered);
+    for point in ordered {
+        let color = scale_color_for_point(point);
+        let rect = effective_point_pixel_rect(width, height, point, target_grid, cell_scale);
+        fill_cell(&mut rgba, width, rect, color, 0.42);
+        stroke_cell(&mut rgba, width, rect, color);
+    }
+
+    rgba
 }
 
-fn fill_cell(rgba: &mut [u8], width: usize, rect: CellRect, color: [u8; 3], opacity: f32) {
-    let opacity = opacity.clamp(0.0, 1.0);
-    for y in rect.y0..rect.y1 {
-        let row = y * width;
-        for x in rect.x0..rect.x1 {
-            let offset = (row + x) * 4;
-            for channel in 0..3 {
-                let overlay = color[channel] as f32;
-                rgba[offset + channel] = (overlay * opacity).round() as u8;
-            }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FixationPixelRect {
+    pub x0: usize,
+    pub x1: usize,
+    pub y0: usize,
+    pub y1: usize,
+}
+
+impl FixationPixelRect {
+    pub const fn new(x0: usize, x1: usize, y0: usize, y1: usize) -> Self {
+        Self { x0, x1, y0, y1 }
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.x0 >= self.x1 || self.y0 >= self.y1
+    }
+
+    pub fn clamped(&self, width: usize, height: usize) -> Self {
+        Self {
+            x0: self.x0.min(width),
+            x1: self.x1.min(width),
+            y0: self.y0.min(height),
+            y1: self.y1.min(height),
         }
+    }
+
+    pub fn pixel_count(&self, width: usize, height: usize) -> usize {
+        let rect = self.clamped(width, height);
+        rect.x1.saturating_sub(rect.x0) * rect.y1.saturating_sub(rect.y0)
     }
 }
 
-fn stroke_cell(rgba: &mut [u8], width: usize, rect: CellRect, color: [u8; 3]) {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AutoGazeSparseUpdatePlan {
+    pub width: usize,
+    pub height: usize,
+    pub rects: Vec<FixationPixelRect>,
+    pub pixel_count: usize,
+}
+
+impl AutoGazeSparseUpdatePlan {
+    pub fn new(width: usize, height: usize, rects: Vec<FixationPixelRect>) -> Result<Self> {
+        let _ = validate_dimensions(width, height)?;
+        let pixel_count = fixation_rect_union_pixel_count(&rects, width, height);
+        Ok(Self {
+            width,
+            height,
+            rects,
+            pixel_count,
+        })
+    }
+
+    pub fn update_ratio(&self) -> f64 {
+        ratio(self.pixel_count, self.width * self.height)
+    }
+}
+
+/// Build the native-scale sparse update rectangles used by the default AutoGaze visualization.
+pub fn fixation_sparse_update_plan(
+    width: usize,
+    height: usize,
+    points: &[FixationPoint],
+    cell_scale: f32,
+) -> Result<AutoGazeSparseUpdatePlan> {
+    AutoGazeSparseUpdatePlan::new(
+        width,
+        height,
+        fixation_cell_rects(width, height, points, cell_scale),
+    )
+}
+
+/// Build sparse update rectangles projected onto the finest active gaze grid.
+pub fn fixation_effective_sparse_update_plan(
+    width: usize,
+    height: usize,
+    points: &[FixationPoint],
+    cell_scale: f32,
+) -> Result<AutoGazeSparseUpdatePlan> {
+    AutoGazeSparseUpdatePlan::new(
+        width,
+        height,
+        fixation_effective_cell_rects(width, height, points, cell_scale),
+    )
+}
+
+/// Copy source RGBA pixels for sparse update rectangles into a persistent output frame.
+pub fn copy_sparse_update_rgba(
+    source_rgba: &[u8],
+    target_rgba: &mut [u8],
+    plan: &AutoGazeSparseUpdatePlan,
+) -> Result<usize> {
+    let _ = validate_rgba_dimensions(source_rgba, plan.width, plan.height)?;
+    ensure!(
+        target_rgba.len() == source_rgba.len(),
+        "target RGBA byte length must match source frame"
+    );
+    copy_rects_rgba(
+        source_rgba,
+        plan.width,
+        plan.height,
+        &plan.rects,
+        target_rgba,
+    );
+    Ok(plan.pixel_count)
+}
+
+pub fn fixation_cell_rects(
+    width: usize,
+    height: usize,
+    points: &[FixationPoint],
+    cell_scale: f32,
+) -> Vec<FixationPixelRect> {
+    let width = width.max(1);
+    let height = height.max(1);
+    points
+        .iter()
+        .copied()
+        .filter(|point| point.confidence > 0.0)
+        .map(|point| {
+            let bounds = point.scaled_bounds(cell_scale);
+            let (x0, x1) = pixel_range(bounds.x_min, bounds.x_max, width);
+            let (y0, y1) = pixel_range(bounds.y_min, bounds.y_max, height);
+            FixationPixelRect { x0, x1, y0, y1 }
+        })
+        .collect()
+}
+
+pub fn fixation_effective_cell_rects(
+    width: usize,
+    height: usize,
+    points: &[FixationPoint],
+    cell_scale: f32,
+) -> Vec<FixationPixelRect> {
+    let width = width.max(1);
+    let height = height.max(1);
+    let target_grid = effective_display_grid(points);
+    points
+        .iter()
+        .copied()
+        .filter(|point| point.confidence > 0.0)
+        .map(|point| effective_point_pixel_rect(width, height, point, target_grid, cell_scale))
+        .collect()
+}
+
+fn effective_display_grid(points: &[FixationPoint]) -> usize {
+    points
+        .iter()
+        .copied()
+        .filter(|point| point.confidence > 0.0)
+        .map(|point| {
+            point
+                .cell_grid()
+                .unwrap_or_else(|| nearest_scale_grid(point))
+        })
+        .max()
+        .unwrap_or(14)
+        .max(14)
+}
+
+fn effective_point_pixel_rect(
+    width: usize,
+    height: usize,
+    point: FixationPoint,
+    target_grid: usize,
+    cell_scale: f32,
+) -> FixationPixelRect {
+    let (row, col) = project_point_to_grid_cell(point, target_grid);
+    if (cell_scale - 1.0).abs() <= f32::EPSILON {
+        let (x0, x1) = grid_cell_pixel_range(col, target_grid, width);
+        let (y0, y1) = grid_cell_pixel_range(row, target_grid, height);
+        return FixationPixelRect { x0, x1, y0, y1 };
+    }
+
+    let target_grid = target_grid.max(1);
+    let grid = target_grid as f64;
+    let extent = (cell_scale.max(1.0e-6) as f64 / grid).clamp(1.0e-6, 1.0);
+    let center_x = (col as f64 + 0.5) / grid;
+    let center_y = (row as f64 + 0.5) / grid;
+    let half = extent * 0.5;
+    let (x0, x1) = pixel_range_f64(
+        (center_x - half).clamp(0.0, 1.0),
+        (center_x + half).clamp(0.0, 1.0),
+        width,
+    );
+    let (y0, y1) = pixel_range_f64(
+        (center_y - half).clamp(0.0, 1.0),
+        (center_y + half).clamp(0.0, 1.0),
+        height,
+    );
+    FixationPixelRect { x0, x1, y0, y1 }
+}
+
+fn project_point_to_grid_cell(point: FixationPoint, target_grid: usize) -> (usize, usize) {
+    let target_grid = target_grid.max(1);
+    if let Some(source_grid) = point.cell_grid() {
+        let source_grid = source_grid.max(1);
+        let source_col = ((point.x.clamp(0.0, 1.0 - f32::EPSILON) as f64 * source_grid as f64)
+            .floor() as usize)
+            .min(source_grid - 1);
+        let source_row = ((point.y.clamp(0.0, 1.0 - f32::EPSILON) as f64 * source_grid as f64)
+            .floor() as usize)
+            .min(source_grid - 1);
+        let col = ((2 * source_col + 1) * target_grid / (2 * source_grid)).min(target_grid - 1);
+        let row = ((2 * source_row + 1) * target_grid / (2 * source_grid)).min(target_grid - 1);
+        (row, col)
+    } else {
+        let grid = target_grid as f32;
+        (
+            (point.y.clamp(0.0, 1.0 - f32::EPSILON) * grid).floor() as usize,
+            (point.x.clamp(0.0, 1.0 - f32::EPSILON) * grid).floor() as usize,
+        )
+    }
+}
+
+fn grid_cell_pixel_range(index: usize, grid: usize, extent: usize) -> (usize, usize) {
+    let grid = grid.max(1);
+    let extent = extent.max(1);
+    let index = index.min(grid - 1);
+    let start = index.saturating_mul(extent) / grid;
+    let end = (index + 1).saturating_mul(extent).saturating_add(grid - 1) / grid;
+    (
+        start.min(extent.saturating_sub(1)),
+        end.min(extent).max(start + 1),
+    )
+}
+
+fn fill_cell(rgba: &mut [u8], width: usize, rect: FixationPixelRect, color: [u8; 3], opacity: f32) {
+    let opacity = opacity.clamp(0.0, 1.0);
+    if rect.is_empty() {
+        return;
+    }
+
+    let pixel = [
+        (color[0] as f32 * opacity).round() as u8,
+        (color[1] as f32 * opacity).round() as u8,
+        (color[2] as f32 * opacity).round() as u8,
+        255,
+    ];
+    let span = rect.x1 - rect.x0;
+    let mut scanline = Vec::with_capacity(span * 4);
+    for _ in 0..span {
+        scanline.extend_from_slice(&pixel);
+    }
+
+    for y in rect.y0..rect.y1 {
+        let start = (y * width + rect.x0) * 4;
+        let end = start + span * 4;
+        rgba[start..end].copy_from_slice(&scanline);
+    }
+}
+
+fn stroke_cell(rgba: &mut [u8], width: usize, rect: FixationPixelRect, color: [u8; 3]) {
     if rect.x0 >= rect.x1 || rect.y0 >= rect.y1 {
         return;
     }
@@ -313,15 +1037,17 @@ pub fn visualize_fixations_rgba(
     blend_alpha: f32,
 ) -> Result<AutoGazeVisualization> {
     let mask_blend = mask_and_blend_rgba(rgba, width, height, points, cell_scale, blend_alpha)?;
-    let pixels = validate_rgba_dimensions(rgba, width, height)?;
+    let _ = validate_rgba_dimensions(rgba, width, height)?;
     build_visualization(
         rgba,
-        width,
-        height,
-        mask_blend.mask_rgba,
-        mask_blend.blend_rgba,
-        mask_blend.mask_pixel_count,
-        pixels,
+        AutoGazeVisualizationPanels {
+            width,
+            height,
+            mask_rgba: mask_blend.mask_rgba,
+            blend_rgba: mask_blend.blend_rgba,
+            mask_pixel_count: mask_blend.mask_pixel_count,
+            updated_pixel_count: mask_blend.mask_pixel_count,
+        },
     )
 }
 
@@ -358,28 +1084,87 @@ pub fn rgba_psnr_db(reference_rgba: &[u8], candidate_rgba: &[u8]) -> Result<f64>
 }
 
 fn validate_rgba_dimensions(rgba: &[u8], width: usize, height: usize) -> Result<usize> {
-    let pixels = width
-        .checked_mul(height)
-        .ok_or_else(|| anyhow::anyhow!("visualization dimensions overflow"))?;
+    let pixels = validate_dimensions(width, height)?;
+    let expected_len = pixels
+        .checked_mul(4)
+        .ok_or_else(|| anyhow::anyhow!("visualization byte length overflow"))?;
+    ensure!(
+        rgba.len() == expected_len,
+        "expected {expected_len} RGBA bytes for {width}x{height}, got {}",
+        rgba.len()
+    );
+    Ok(pixels)
+}
+
+fn validate_dimensions(width: usize, height: usize) -> Result<usize> {
     ensure!(
         width > 0 && height > 0,
         "visualization dimensions must be nonzero"
     );
+    width
+        .checked_mul(height)
+        .ok_or_else(|| anyhow::anyhow!("visualization dimensions overflow"))
+}
+
+fn channel_vector_tensor<B: Backend>(values: [f32; 3], device: &B::Device) -> Tensor<B, 3> {
+    Tensor::<B, 3>::from_data(TensorData::new(values.to_vec(), [1, 1, 3]), device)
+}
+
+fn rgba_u8_to_unit_tensor<B: Backend>(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    device: &B::Device,
+) -> Result<Tensor<B, 3>> {
+    let pixels = validate_rgba_dimensions(rgba, width, height)?;
+    Ok(Tensor::<B, 1, Int>::from_data(rgba, device)
+        .float()
+        .div_scalar(255.0)
+        .reshape([pixels, 4])
+        .reshape([height, width, 4]))
+}
+
+fn alpha_u8_to_unit_tensor<B: Backend>(
+    alpha: &[u8],
+    width: usize,
+    height: usize,
+    device: &B::Device,
+) -> Result<Tensor<B, 3>> {
+    let pixels = validate_dimensions(width, height)?;
     ensure!(
-        rgba.len() == pixels * 4,
-        "expected {} RGBA bytes for {}x{}, got {}",
-        pixels * 4,
-        width,
-        height,
-        rgba.len()
+        alpha.len() == pixels,
+        "expected {pixels} alpha bytes for {width}x{height}, got {}",
+        alpha.len()
     );
-    Ok(pixels)
+    Ok(Tensor::<B, 1, Int>::from_data(alpha, device)
+        .float()
+        .div_scalar(255.0)
+        .reshape([height, width, 1]))
+}
+
+fn alpha_blend_tensor<B: Backend>(
+    alpha: Tensor<B, 3>,
+    width: usize,
+    height: usize,
+    blend_alpha: f32,
+    device: &B::Device,
+) -> Tensor<B, 3> {
+    let rgb = alpha
+        .repeat_dim(2, 3)
+        .mul_scalar(blend_alpha.clamp(0.0, 1.0));
+    let alpha = Tensor::<B, 3>::zeros([height, width, 1], device);
+    Tensor::cat(vec![rgb, alpha], 2)
 }
 
 struct MaskRgbaAndAlpha {
     mask_rgba: Vec<u8>,
     alpha: Vec<u8>,
     mask_pixel_count: usize,
+}
+
+struct MaskRgbaAndRects {
+    mask_rgba: Vec<u8>,
+    plan: AutoGazeSparseUpdatePlan,
 }
 
 fn mask_rgba_and_alpha(
@@ -390,15 +1175,30 @@ fn mask_rgba_and_alpha(
     cell_scale: f32,
 ) -> Result<MaskRgbaAndAlpha> {
     let _ = validate_rgba_dimensions(rgba, width, height)?;
-    let alpha = fixation_alpha_mask(width, height, points, cell_scale);
+    let rects = fixation_effective_cell_rects(width, height, points, cell_scale);
+    let alpha = alpha_mask_from_rects(width, height, &rects);
     let mask_rgba = fixation_scale_mask_rgba(width, height, points, cell_scale);
-    let mask_pixel_count = alpha.iter().filter(|&&mask| mask > 0).count();
+    let mask_pixel_count = fixation_rect_union_pixel_count(&rects, width, height);
 
     Ok(MaskRgbaAndAlpha {
         mask_rgba,
         alpha,
         mask_pixel_count,
     })
+}
+
+fn mask_rgba_and_rects(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    points: &[FixationPoint],
+    cell_scale: f32,
+) -> Result<MaskRgbaAndRects> {
+    let _ = validate_rgba_dimensions(rgba, width, height)?;
+    let plan = fixation_effective_sparse_update_plan(width, height, points, cell_scale)?;
+    let mask_rgba = fixation_scale_mask_rgba(width, height, points, cell_scale);
+
+    Ok(MaskRgbaAndRects { mask_rgba, plan })
 }
 
 struct MaskBlendRgba {
@@ -444,15 +1244,89 @@ fn blend_masked_rgba(rgba: &[u8], alpha: &[u8], blend_alpha: f32) -> Vec<u8> {
     blend_rgba
 }
 
-fn build_visualization(
-    rgba: &[u8],
+fn copy_rects_rgba(
+    source_rgba: &[u8],
     width: usize,
     height: usize,
-    mask_rgba: Vec<u8>,
-    blend_rgba: Vec<u8>,
-    mask_pixel_count: usize,
-    updated_pixel_count: usize,
+    rects: &[FixationPixelRect],
+    target_rgba: &mut [u8],
+) {
+    debug_assert_eq!(source_rgba.len(), width * height * 4);
+    debug_assert_eq!(target_rgba.len(), source_rgba.len());
+    let row_bytes = width * 4;
+    for rect in rects {
+        let x0 = rect.x0.min(width);
+        let x1 = rect.x1.min(width);
+        if x0 >= x1 {
+            continue;
+        }
+        for y in rect.y0.min(height)..rect.y1.min(height) {
+            let row = y * row_bytes;
+            let start = row + x0 * 4;
+            let end = row + x1 * 4;
+            target_rgba[start..end].copy_from_slice(&source_rgba[start..end]);
+        }
+    }
+}
+
+pub fn fixation_rect_union_pixel_count(
+    rects: &[FixationPixelRect],
+    width: usize,
+    height: usize,
+) -> usize {
+    if rects.is_empty() || width == 0 || height == 0 {
+        return 0;
+    }
+
+    let mut spans = Vec::new();
+    for rect in rects {
+        let x0 = rect.x0.min(width);
+        let x1 = rect.x1.min(width);
+        if x0 >= x1 {
+            continue;
+        }
+        for y in rect.y0.min(height)..rect.y1.min(height) {
+            spans.push((y, x0, x1));
+        }
+    }
+    if spans.is_empty() {
+        return 0;
+    }
+
+    spans.sort_unstable();
+    let mut count = 0usize;
+    let mut current_y = spans[0].0;
+    let mut current_x0 = spans[0].1;
+    let mut current_x1 = spans[0].2;
+    for (y, x0, x1) in spans.into_iter().skip(1) {
+        if y != current_y {
+            count = count.saturating_add(current_x1.saturating_sub(current_x0));
+            current_y = y;
+            current_x0 = x0;
+            current_x1 = x1;
+        } else if x0 <= current_x1 {
+            current_x1 = current_x1.max(x1);
+        } else {
+            count = count.saturating_add(current_x1.saturating_sub(current_x0));
+            current_x0 = x0;
+            current_x1 = x1;
+        }
+    }
+    count.saturating_add(current_x1.saturating_sub(current_x0))
+}
+
+fn build_visualization(
+    rgba: &[u8],
+    panels: AutoGazeVisualizationPanels,
 ) -> Result<AutoGazeVisualization> {
+    let AutoGazeVisualizationPanels {
+        width,
+        height,
+        mask_rgba,
+        blend_rgba,
+        mask_pixel_count,
+        updated_pixel_count,
+    } = panels;
     let _ = validate_rgba_dimensions(rgba, width, height)?;
     ensure!(
         mask_rgba.len() == rgba.len(),
@@ -538,9 +1412,25 @@ fn pixel_range(min: f32, max: f32, extent: usize) -> (usize, usize) {
     (start, end)
 }
 
+fn pixel_range_f64(min: f64, max: f64, extent: usize) -> (usize, usize) {
+    let extent_f = extent as f64;
+    let mut start = (min.clamp(0.0, 1.0) * extent_f).floor() as usize;
+    let mut end = (max.clamp(0.0, 1.0) * extent_f).ceil() as usize;
+    start = start.min(extent.saturating_sub(1));
+    end = end.min(extent);
+    if end <= start {
+        end = (start + 1).min(extent);
+    }
+    (start, end)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::{AutoGazeRgbaClipShape, rgba_clip_to_tensor};
+    use burn::backend::NdArray;
+
+    type TestBackend = NdArray<f32>;
 
     #[test]
     fn draws_crisp_binary_cell_mask() {
@@ -552,6 +1442,70 @@ mod tests {
                 let expected = if x < 4 && y < 4 { 255 } else { 0 };
                 assert_eq!(alpha[y * 8 + x], expected, "pixel {x},{y}");
             }
+        }
+    }
+
+    #[test]
+    fn effective_alpha_mask_does_not_turn_all_coarse_tokens_into_full_frame_update() {
+        let points = [
+            FixationPoint::with_grid_extent(0.25, 0.25, 0.5, 0.5, 1.0, 2),
+            FixationPoint::with_grid_extent(0.75, 0.25, 0.5, 0.5, 1.0, 2),
+            FixationPoint::with_grid_extent(0.25, 0.75, 0.5, 0.5, 1.0, 2),
+            FixationPoint::with_grid_extent(0.75, 0.75, 0.5, 0.5, 1.0, 2),
+        ];
+        let naive = fixation_alpha_mask(28, 28, &points, 1.0);
+        let effective = fixation_effective_alpha_mask(28, 28, &points, 1.0);
+
+        assert_eq!(naive.iter().filter(|&&value| value > 0).count(), 28 * 28);
+        assert_eq!(effective.iter().filter(|&&value| value > 0).count(), 16);
+    }
+
+    #[test]
+    fn visualization_draws_native_mask_but_updates_effective_footprint() {
+        let points = [
+            FixationPoint::with_grid_extent(0.25, 0.25, 0.5, 0.5, 1.0, 2),
+            FixationPoint::with_grid_extent(0.75, 0.25, 0.5, 0.5, 1.0, 2),
+            FixationPoint::with_grid_extent(0.25, 0.75, 0.5, 0.5, 1.0, 2),
+            FixationPoint::with_grid_extent(0.75, 0.75, 0.5, 0.5, 1.0, 2),
+        ];
+        let rgba = [10, 20, 30, 255].repeat(28 * 28);
+        let visualization =
+            visualize_fixations_rgba(&rgba, 28, 28, &points, 1.0, 1.0).expect("visualize");
+        let white_pixels = visualization
+            .blend_rgba
+            .chunks_exact(4)
+            .filter(|pixel| pixel[0] == 255 && pixel[1] == 255 && pixel[2] == 255)
+            .count();
+        let colored_mask_pixels = visualization
+            .mask_rgba
+            .chunks_exact(4)
+            .filter(|pixel| pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0)
+            .count();
+
+        assert_eq!(visualization.mask_pixel_count, 16);
+        assert_eq!(white_pixels, 16);
+        assert_eq!(colored_mask_pixels, 28 * 28);
+        assert_eq!(visualization.mask_ratio(), 16.0 / (28.0 * 28.0));
+    }
+
+    #[test]
+    fn effective_mask_color_and_alpha_use_identical_projected_cells() {
+        let coarse = FixationPoint::with_grid_extent(0.25, 0.25, 0.5, 0.5, 1.0, 2);
+        let fine = FixationPoint::with_grid_extent(
+            11.5 / 14.0,
+            11.5 / 14.0,
+            1.0 / 14.0,
+            1.0 / 14.0,
+            1.0,
+            14,
+        );
+        let points = [coarse, fine];
+        let alpha = fixation_effective_alpha_mask(28, 28, &points, 1.0);
+        let mask = fixation_effective_scale_mask_rgba(28, 28, &points, 1.0);
+
+        for (index, pixel) in mask.chunks_exact(4).enumerate() {
+            let colored = pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0;
+            assert_eq!(colored, alpha[index] > 0, "pixel {index}");
         }
     }
 
@@ -595,9 +1549,9 @@ mod tests {
         assert_eq!(&visualization.blend_rgba[0..4], &[178, 153, 128, 255]);
         assert_eq!(&visualization.blend_rgba[4..8], &[10, 20, 30, 255]);
         assert_eq!(visualization.mask_pixel_count, 1);
-        assert_eq!(visualization.updated_pixel_count, 2);
+        assert_eq!(visualization.updated_pixel_count, 1);
         assert_eq!(visualization.mask_ratio(), 0.5);
-        assert_eq!(visualization.update_ratio(), 1.0);
+        assert_eq!(visualization.update_ratio(), 0.5);
     }
 
     #[test]
@@ -617,6 +1571,73 @@ mod tests {
             &visualization.side_by_side_rgba[16..24],
             &visualization.blend_rgba
         );
+    }
+
+    #[test]
+    fn panel_visualization_matches_side_by_side_visualization() {
+        let rgba = [100, 50, 0, 255, 10, 20, 30, 255];
+        let point = FixationPoint::with_extent(0.25, 0.5, 0.5, 1.0, 1.0);
+        let mut panel_state =
+            AutoGazeVisualizationState::new(AutoGazeVisualizationMode::FullBlend, 30);
+        let panels = panel_state
+            .visualize_rgba_panels(&rgba, 2, 1, &[point], 1.0, 0.5)
+            .expect("panel visualization");
+        let side_by_side_from_panels = panels
+            .clone()
+            .into_side_by_side(&rgba)
+            .expect("side-by-side from panels");
+
+        let mut regular_state =
+            AutoGazeVisualizationState::new(AutoGazeVisualizationMode::FullBlend, 30);
+        let regular = regular_state
+            .visualize_rgba(&rgba, 2, 1, &[point], 1.0, 0.5)
+            .expect("regular visualization");
+
+        assert_eq!(panels.mask_rgba, regular.mask_rgba);
+        assert_eq!(panels.blend_rgba, regular.blend_rgba);
+        assert_eq!(panels.mask_ratio(), regular.mask_ratio());
+        assert_eq!(panels.update_ratio(), regular.update_ratio());
+        assert_eq!(
+            side_by_side_from_panels.side_by_side_rgba,
+            regular.side_by_side_rgba
+        );
+    }
+
+    #[test]
+    fn tensor_panel_visualization_matches_byte_panel_visualization() {
+        let device = Default::default();
+        let width = 2;
+        let height = 1;
+        let rgba = [100, 50, 0, 255, 10, 20, 30, 255];
+        let point = FixationPoint::with_extent(0.25, 0.5, 0.5, 1.0, 1.0);
+        let mut byte_state =
+            AutoGazeVisualizationState::new(AutoGazeVisualizationMode::FullBlend, 30);
+        let byte = byte_state
+            .visualize_rgba_panels(&rgba, width, height, &[point], 1.0, 0.5)
+            .expect("byte panels");
+        let tensor = rgba_clip_to_tensor::<TestBackend>(
+            &rgba,
+            AutoGazeRgbaClipShape::new(1, height, width),
+            &device,
+        )
+        .expect("normalized tensor");
+        let mut tensor_state = AutoGazeTensorVisualizationState::<TestBackend>::new(
+            AutoGazeVisualizationMode::FullBlend,
+            30,
+        );
+        let tensor = tensor_state
+            .visualize_normalized_rgb_clip_panels(
+                tensor,
+                &[point],
+                AutoGazeTensorVisualizationOptions::new(width, height, 1.0, 0.5),
+                &device,
+            )
+            .expect("tensor panels");
+
+        assert_eq!(tensor.update_ratio(), byte.update_ratio());
+        assert_eq!(tensor_to_rgba_bytes(tensor.input_rgba), rgba);
+        assert_eq!(tensor_to_rgba_bytes(tensor.mask_rgba), byte.mask_rgba);
+        assert_eq!(tensor_to_rgba_bytes(tensor.output_rgba), byte.blend_rgba);
     }
 
     #[test]
@@ -700,6 +1721,319 @@ mod tests {
     }
 
     #[test]
+    fn rect_union_pixel_count_deduplicates_overlapping_multiscale_cells() {
+        let rects = [
+            FixationPixelRect {
+                x0: 0,
+                x1: 3,
+                y0: 0,
+                y1: 2,
+            },
+            FixationPixelRect {
+                x0: 2,
+                x1: 4,
+                y0: 1,
+                y1: 3,
+            },
+        ];
+
+        assert_eq!(fixation_rect_union_pixel_count(&rects, 4, 4), 9);
+    }
+
+    #[test]
+    fn sparse_update_plan_matches_interframe_rect_copy() {
+        let width = 4;
+        let height = 2;
+        let source_a = vec![10u8; width * height * 4];
+        let mut source_b = vec![20u8; width * height * 4];
+        for pixel in source_b.chunks_exact_mut(4) {
+            pixel[3] = 255;
+        }
+        let point = FixationPoint::with_grid_extent(0.125, 0.25, 0.25, 0.5, 1.0, 4);
+        let plan =
+            fixation_sparse_update_plan(width, height, &[point], 1.0).expect("sparse update plan");
+        assert_eq!(
+            plan.rects,
+            vec![FixationPixelRect {
+                x0: 0,
+                x1: 1,
+                y0: 0,
+                y1: 1
+            }]
+        );
+        assert_eq!(plan.pixel_count, 1);
+
+        let mut target = source_a.clone();
+        let copied =
+            copy_sparse_update_rgba(&source_b, &mut target, &plan).expect("sparse rgba update");
+        assert_eq!(copied, 1);
+        assert_eq!(&target[0..4], &source_b[0..4]);
+        assert_eq!(&target[4..], &source_a[4..]);
+    }
+
+    #[test]
+    fn sparse_update_tensor_matches_rect_copy() {
+        let device = Default::default();
+        let width = 4;
+        let height = 2;
+        let source_a = deterministic_rgba(width, height, 3);
+        let source_b = deterministic_rgba(width, height, 11);
+        let point = FixationPoint::with_grid_extent(0.125, 0.25, 0.25, 0.5, 1.0, 4);
+        let plan =
+            fixation_sparse_update_plan(width, height, &[point], 1.0).expect("sparse update plan");
+
+        let mut expected = source_a.clone();
+        copy_sparse_update_rgba(&source_b, &mut expected, &plan).expect("sparse rgba update");
+        let source_tensor =
+            rgba_u8_to_unit_tensor::<TestBackend>(&source_b, width, height, &device)
+                .expect("source tensor");
+        let target_tensor =
+            rgba_u8_to_unit_tensor::<TestBackend>(&source_a, width, height, &device)
+                .expect("target tensor");
+        let actual = copy_sparse_update_tensor(source_tensor, target_tensor, &plan)
+            .expect("sparse tensor update");
+
+        assert_eq!(tensor_to_rgba_bytes(actual), expected);
+    }
+
+    #[test]
+    fn sparse_tensor_update_heuristic_only_uses_tiny_regions() {
+        let tiny = AutoGazeSparseUpdatePlan::new(
+            100,
+            100,
+            vec![FixationPixelRect {
+                x0: 0,
+                x1: 4,
+                y0: 0,
+                y1: 4,
+            }],
+        )
+        .expect("tiny plan");
+        assert!(should_use_sparse_tensor_update_rects(
+            tiny.width,
+            tiny.height,
+            &tiny.rects,
+            DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RECTS,
+            DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RATIO,
+        ));
+
+        let coarse = AutoGazeSparseUpdatePlan::new(
+            100,
+            100,
+            vec![FixationPixelRect {
+                x0: 0,
+                x1: 50,
+                y0: 0,
+                y1: 50,
+            }],
+        )
+        .expect("coarse plan");
+        assert!(!should_use_sparse_tensor_update_rects(
+            coarse.width,
+            coarse.height,
+            &coarse.rects,
+            DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RECTS,
+            DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RATIO,
+        ));
+
+        let many = AutoGazeSparseUpdatePlan::new(
+            100,
+            100,
+            (0..5)
+                .map(|index| FixationPixelRect {
+                    x0: index,
+                    x1: index + 1,
+                    y0: 0,
+                    y1: 1,
+                })
+                .collect(),
+        )
+        .expect("many plan");
+        assert!(!should_use_sparse_tensor_update_rects(
+            many.width,
+            many.height,
+            &many.rects,
+            DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RECTS,
+            DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RATIO,
+        ));
+        assert!(should_use_sparse_tensor_update_rects(
+            many.width,
+            many.height,
+            &many.rects,
+            8,
+            DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RATIO,
+        ));
+        assert!(!should_use_sparse_tensor_update_rects(
+            tiny.width,
+            tiny.height,
+            &tiny.rects,
+            0,
+            DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RATIO,
+        ));
+        assert!(!should_use_sparse_tensor_update_rects(
+            tiny.width,
+            tiny.height,
+            &tiny.rects,
+            DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RECTS,
+            f64::NAN,
+        ));
+    }
+
+    #[test]
+    fn tensor_interframe_path_reports_keyframe_sparse_and_dense_modes() {
+        let device = Default::default();
+        let width = 100;
+        let height = 100;
+        let previous = deterministic_rgba(width, height, 5);
+        let current = deterministic_rgba(width, height, 13);
+        let tiny = [FixationPoint::with_grid_extent(
+            0.02, 0.02, 0.04, 0.04, 1.0, 100,
+        )];
+        let many = [
+            FixationPoint::with_grid_extent(0.02, 0.02, 0.04, 0.04, 1.0, 100),
+            FixationPoint::with_grid_extent(0.08, 0.02, 0.04, 0.04, 1.0, 100),
+            FixationPoint::with_grid_extent(0.14, 0.02, 0.04, 0.04, 1.0, 100),
+            FixationPoint::with_grid_extent(0.20, 0.02, 0.04, 0.04, 1.0, 100),
+            FixationPoint::with_grid_extent(0.26, 0.02, 0.04, 0.04, 1.0, 100),
+        ];
+        let mut state = AutoGazeTensorVisualizationState::<TestBackend>::new(
+            AutoGazeVisualizationMode::Interframe,
+            30,
+        );
+
+        let previous_tensor = rgba_clip_to_tensor::<TestBackend>(
+            &previous,
+            AutoGazeRgbaClipShape::new(1, height, width),
+            &device,
+        )
+        .expect("previous tensor");
+        state
+            .visualize_normalized_rgb_clip_panels(
+                previous_tensor,
+                &tiny,
+                AutoGazeTensorVisualizationOptions::new(width, height, 1.0, 0.38),
+                &device,
+            )
+            .expect("keyframe");
+        assert_eq!(
+            state.last_interframe_path(),
+            Some(AutoGazeTensorInterframePath::Keyframe)
+        );
+
+        let current_tensor = rgba_clip_to_tensor::<TestBackend>(
+            &current,
+            AutoGazeRgbaClipShape::new(1, height, width),
+            &device,
+        )
+        .expect("current tensor");
+        state
+            .visualize_normalized_rgb_clip_panels(
+                current_tensor.clone(),
+                &tiny,
+                AutoGazeTensorVisualizationOptions::new(width, height, 1.0, 0.38),
+                &device,
+            )
+            .expect("tiny sparse update");
+        assert_eq!(
+            state.last_interframe_path(),
+            Some(AutoGazeTensorInterframePath::SparseRects)
+        );
+
+        state
+            .visualize_normalized_rgb_clip_panels(
+                current_tensor,
+                &many,
+                AutoGazeTensorVisualizationOptions::new(width, height, 1.0, 0.38),
+                &device,
+            )
+            .expect("coarse dense update");
+        assert_eq!(
+            state.last_interframe_path(),
+            Some(AutoGazeTensorInterframePath::DenseMask)
+        );
+
+        let mut state = AutoGazeTensorVisualizationState::<TestBackend>::new(
+            AutoGazeVisualizationMode::Interframe,
+            30,
+        );
+        let previous_tensor = rgba_clip_to_tensor::<TestBackend>(
+            &previous,
+            AutoGazeRgbaClipShape::new(1, height, width),
+            &device,
+        )
+        .expect("previous tensor");
+        state
+            .visualize_normalized_rgb_clip_panels(
+                previous_tensor,
+                &tiny,
+                AutoGazeTensorVisualizationOptions::new(width, height, 1.0, 0.38)
+                    .with_sparse_update_policy(8, 0.05),
+                &device,
+            )
+            .expect("custom policy keyframe");
+        let current_tensor = rgba_clip_to_tensor::<TestBackend>(
+            &current,
+            AutoGazeRgbaClipShape::new(1, height, width),
+            &device,
+        )
+        .expect("current tensor");
+        state
+            .visualize_normalized_rgb_clip_panels(
+                current_tensor,
+                &many,
+                AutoGazeTensorVisualizationOptions::new(width, height, 1.0, 0.38)
+                    .with_sparse_update_policy(8, 0.05),
+                &device,
+            )
+            .expect("custom policy sparse update");
+        assert_eq!(
+            state.last_interframe_path(),
+            Some(AutoGazeTensorInterframePath::SparseRects)
+        );
+    }
+
+    #[test]
+    fn effective_sparse_update_plan_projects_coarse_tokens_to_finest_active_grid() {
+        let coarse = FixationPoint::with_grid_extent(0.25, 0.25, 0.5, 0.5, 1.0, 2);
+        let fine = FixationPoint::with_grid_extent(0.875, 0.875, 0.25, 0.25, 1.0, 4);
+        let native =
+            fixation_sparse_update_plan(16, 16, &[coarse, fine], 1.0).expect("native update plan");
+        let effective = fixation_effective_sparse_update_plan(16, 16, &[coarse, fine], 1.0)
+            .expect("effective update plan");
+
+        assert!(
+            native.pixel_count > effective.pixel_count,
+            "native coarse cells should cover more pixels than finest-grid projected cells"
+        );
+        assert_eq!(effective.rects.len(), 2);
+    }
+
+    #[test]
+    fn interframe_update_ratio_deduplicates_overlapping_multiscale_cells() {
+        let coarse = FixationPoint::with_extent(0.25, 0.5, 0.5, 1.0, 1.0);
+        let fine = FixationPoint::with_grid_extent(0.25, 0.5, 0.5, 1.0, 1.0, 4);
+        let mut state = AutoGazeVisualizationState::new(AutoGazeVisualizationMode::Interframe, 10);
+
+        let first = [10, 0, 0, 255, 20, 0, 0, 255];
+        state
+            .visualize_rgba(&first, 2, 1, &[], 1.0, 1.0)
+            .expect("initial keyframe");
+
+        let second = [30, 0, 0, 255, 40, 0, 0, 255];
+        let visualization = state
+            .visualize_rgba(&second, 2, 1, &[coarse, fine], 1.0, 1.0)
+            .expect("interframe update");
+
+        assert_eq!(
+            &visualization.blend_rgba[0..8],
+            &[30, 0, 0, 255, 20, 0, 0, 255]
+        );
+        assert_eq!(visualization.mask_pixel_count, 1);
+        assert_eq!(visualization.updated_pixel_count, 1);
+        assert_eq!(visualization.update_ratio(), 0.5);
+    }
+
+    #[test]
     fn full_blend_opacity_controls_white_overlay_strength() {
         let point = FixationPoint::with_extent(0.5, 0.5, 1.0, 1.0, 1.0);
         let rgba = [100, 50, 0, 200];
@@ -736,6 +2070,75 @@ mod tests {
     }
 
     #[test]
+    fn tensor_visualization_matches_byte_visualization() {
+        let device = Default::default();
+        let width = 6;
+        let height = 4;
+        let previous = deterministic_rgba(width, height, 7);
+        let current = deterministic_rgba(width, height, 19);
+        let points = [
+            FixationPoint::with_grid_extent(0.25, 0.5, 0.5, 1.0, 1.0, 2),
+            FixationPoint::with_grid_extent(0.75, 0.25, 0.25, 0.5, 1.0, 4),
+        ];
+
+        assert_tensor_visualization_matches_bytes(
+            &current,
+            width,
+            height,
+            &points,
+            AutoGazeVisualizationMode::FullBlend,
+            30,
+            &device,
+        );
+
+        let mut byte_state =
+            AutoGazeVisualizationState::new(AutoGazeVisualizationMode::Interframe, 30);
+        let mut tensor_state = AutoGazeTensorVisualizationState::<TestBackend>::new(
+            AutoGazeVisualizationMode::Interframe,
+            30,
+        );
+        let _ = byte_state
+            .visualize_rgba(&previous, width, height, &points, 1.0, 0.38)
+            .expect("prime byte interframe");
+        let previous_tensor = rgba_clip_to_tensor::<TestBackend>(
+            &previous,
+            AutoGazeRgbaClipShape::new(1, height, width),
+            &device,
+        )
+        .expect("previous tensor");
+        let _ = tensor_state
+            .visualize_normalized_rgb_clip(
+                previous_tensor,
+                &points,
+                AutoGazeTensorVisualizationOptions::new(width, height, 1.0, 0.38),
+                &device,
+            )
+            .expect("prime tensor interframe");
+        let byte = byte_state
+            .visualize_rgba(&current, width, height, &points, 1.0, 0.38)
+            .expect("byte interframe");
+        let current_tensor = rgba_clip_to_tensor::<TestBackend>(
+            &current,
+            AutoGazeRgbaClipShape::new(1, height, width),
+            &device,
+        )
+        .expect("current tensor");
+        let tensor = tensor_state
+            .visualize_normalized_rgb_clip(
+                current_tensor,
+                &points,
+                AutoGazeTensorVisualizationOptions::new(width, height, 1.0, 0.38),
+                &device,
+            )
+            .expect("tensor interframe");
+        assert_eq!(tensor.update_ratio(), byte.update_ratio());
+        assert_eq!(
+            tensor_to_rgba_bytes(tensor.side_by_side_rgba),
+            byte.side_by_side_rgba
+        );
+    }
+
+    #[test]
     fn psnr_is_infinite_for_identical_rgba_buffers() {
         let rgba = [10, 20, 30, 255, 40, 50, 60, 255];
 
@@ -750,5 +2153,64 @@ mod tests {
         let expected = 10.0f64 * ((255.0f64 * 255.0f64) / (100.0f64 / 3.0f64)).log10();
 
         assert!((psnr - expected).abs() < 1.0e-12);
+    }
+
+    fn assert_tensor_visualization_matches_bytes(
+        rgba: &[u8],
+        width: usize,
+        height: usize,
+        points: &[FixationPoint],
+        mode: AutoGazeVisualizationMode,
+        keyframe_duration: usize,
+        device: &burn::backend::ndarray::NdArrayDevice,
+    ) {
+        let mut byte_state = AutoGazeVisualizationState::new(mode, keyframe_duration);
+        let byte = byte_state
+            .visualize_rgba(rgba, width, height, points, 1.0, 0.38)
+            .expect("byte visualization");
+        let tensor = rgba_clip_to_tensor::<TestBackend>(
+            rgba,
+            AutoGazeRgbaClipShape::new(1, height, width),
+            device,
+        )
+        .expect("normalized tensor");
+        let mut tensor_state =
+            AutoGazeTensorVisualizationState::<TestBackend>::new(mode, keyframe_duration);
+        let tensor = tensor_state
+            .visualize_normalized_rgb_clip(
+                tensor,
+                points,
+                AutoGazeTensorVisualizationOptions::new(width, height, 1.0, 0.38),
+                device,
+            )
+            .expect("tensor visualization");
+        assert_eq!(tensor.update_ratio(), byte.update_ratio());
+        assert_eq!(
+            tensor_to_rgba_bytes(tensor.side_by_side_rgba),
+            byte.side_by_side_rgba
+        );
+    }
+
+    fn tensor_to_rgba_bytes(tensor: Tensor<TestBackend, 3>) -> Vec<u8> {
+        tensor
+            .into_data()
+            .to_vec::<f32>()
+            .expect("tensor data")
+            .into_iter()
+            .map(|value| (value.clamp(0.0, 1.0) * 255.0).round() as u8)
+            .collect()
+    }
+
+    fn deterministic_rgba(width: usize, height: usize, seed: usize) -> Vec<u8> {
+        let mut rgba = Vec::with_capacity(width * height * 4);
+        for y in 0..height {
+            for x in 0..width {
+                rgba.push(((x * 31 + seed) % 256) as u8);
+                rgba.push(((y * 47 + seed * 3) % 256) as u8);
+                rgba.push(((x * 11 + y * 13 + seed * 5) % 256) as u8);
+                rgba.push(255);
+            }
+        }
+        rgba
     }
 }

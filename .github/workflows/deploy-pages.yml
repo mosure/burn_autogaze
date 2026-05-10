@@ -38,43 +38,15 @@ jobs:
       - name: cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: install wasm-bindgen-cli
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="$(awk '
-            $0 == "[[package]]" { in_package = 0 }
-            $0 == "name = \"wasm-bindgen\"" { in_package = 1 }
-            in_package && $1 == "version" {
-              gsub("\"", "", $3)
-              print $3
-              exit
-            }
-          ' Cargo.lock)"
-          if [[ -z "${version}" ]]; then
-            echo "failed to find wasm-bindgen version in Cargo.lock" >&2
-            exit 1
-          fi
-          cargo install wasm-bindgen-cli --version "${version}" --locked
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/bevy_burn_autogaze/package-lock.json
 
-      - name: check bevy wasm target
-        run: cargo check -p bevy_burn_autogaze --target wasm32-unknown-unknown
-
-      - name: build bevy wasm artifacts
-        working-directory: crates/bevy_burn_autogaze
-        run: npm run build:wasm
-
-      - name: install bevy browser test dependencies
-        working-directory: crates/bevy_burn_autogaze
-        run: npm ci
-
-      - name: install playwright chromium
-        working-directory: crates/bevy_burn_autogaze
-        run: npx playwright install --with-deps chromium
-
-      - name: browser smoke static source
-        working-directory: crates/bevy_burn_autogaze
-        run: npm run test:browser
+      - name: build and test bevy wasm demo
+        run: tools/check_bevy_wasm_demo.sh --browser
 
       - name: prepare pages artifact
         run: |

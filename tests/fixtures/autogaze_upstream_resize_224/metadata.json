@@ -1,0 +1,61 @@
+{
+  "seed": 123,
+  "height": 224,
+  "width": 224,
+  "frames": 2,
+  "target_scales": null,
+  "target_patch_size": 16,
+  "gazing_ratio": 0.03,
+  "elapsed_s": 0.02277736004907638,
+  "num_vision_tokens_each_frame": 265,
+  "num_gazing_each_frame": [
+    7,
+    7
+  ],
+  "mask_shapes": [
+    [
+      1,
+      2,
+      4
+    ],
+    [
+      1,
+      2,
+      16
+    ],
+    [
+      1,
+      2,
+      49
+    ],
+    [
+      1,
+      2,
+      196
+    ]
+  ],
+  "mask_sums": [
+    3,
+    4,
+    7,
+    0
+  ],
+  "mask_frame_sums": [
+    [
+      2,
+      1
+    ],
+    [
+      4,
+      0
+    ],
+    [
+      1,
+      6
+    ],
+    [
+      0,
+      0
+    ]
+  ]
+}

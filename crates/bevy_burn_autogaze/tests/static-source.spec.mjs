@@ -20,7 +20,7 @@ function expectNoKnownWasmPanic(consoleLines, pageErrors) {
 
 function latestTimingMetrics(consoleLines) {
   const timingPattern =
-    /AutoGaze timing: ([0-9.]+) fps e2e \(([0-9.]+) ms\) clip=([0-9]+) ([0-9]+)x([0-9]+)/;
+    /AutoGaze timing: ([0-9.]+) output fps \/ ([0-9.]+) model-frame fps \(([0-9.]+) ms\) clip=([0-9]+) model_frames=([0-9]+) points=([0-9]+) gaze=([0-9.]+)% ([0-9]+)x([0-9]+)/;
   for (let index = consoleLines.length - 1; index >= 0; index -= 1) {
     const line = consoleLines[index];
     const match = line.match(timingPattern);
@@ -29,10 +29,14 @@ function latestTimingMetrics(consoleLines) {
     }
     return {
       fps: Number.parseFloat(match[1]),
-      totalMs: Number.parseFloat(match[2]),
-      clipFrames: Number.parseInt(match[3], 10),
-      width: Number.parseInt(match[4], 10),
-      height: Number.parseInt(match[5], 10),
+      modelFrameFps: Number.parseFloat(match[2]),
+      totalMs: Number.parseFloat(match[3]),
+      clipFrames: Number.parseInt(match[4], 10),
+      modelFrames: Number.parseInt(match[5], 10),
+      points: Number.parseInt(match[6], 10),
+      gazeRatioPercent: Number.parseFloat(match[7]),
+      width: Number.parseInt(match[8], 10),
+      height: Number.parseInt(match[9], 10),
     };
   }
   return null;
@@ -197,7 +201,7 @@ test("runs optional real wasm inference smoke when model assets are available", 
   });
 
   await page.goto(
-    "/?source=static&show-fps=true&show-gaze-ratio=true&show-psnr=false&mode=resize-224&visualization-mode=interframe&frames-per-clip=1&static-width=224&static-height=224&static-fps=1&top-k=1&max-gaze-tokens-each-frame=1&disable-task-loss-requirement=true&log-pipeline-timing=true&perf-summary-frames=1&config-url=./config.json&weights-url=./model.safetensors",
+    "/?source=static&show-fps=true&show-gaze-ratio=true&show-psnr=false&mode=resize-224&visualization-mode=interframe&display-transfer=gpu&frames-per-clip=2&max-in-flight=2&streaming-cache=false&static-width=224&static-height=224&inference-width=224&inference-height=224&static-fps=1&top-k=1&max-gaze-tokens-each-frame=1&disable-task-loss-requirement=true&log-pipeline-timing=true&perf-summary-frames=2&config-url=./config.json&weights-url=./model.safetensors",
     { waitUntil: "domcontentloaded" },
   );
 
@@ -208,8 +212,8 @@ test("runs optional real wasm inference smoke when model assets are available", 
         const output = combinedOutput(consoleLines, pageErrors);
         if (wasmPanicNeedles.some((needle) => output.includes(needle))) {
           state = "known-panic";
-        } else if (latestTimingMetrics(consoleLines)) {
-          state = "timing";
+        } else if (await page.evaluate(() => Boolean(window.__autogazePerfSummary))) {
+          state = "summary";
         } else if (isDeviceLost(output)) {
           state = "device-lost";
         } else if (output.includes("failed to load AutoGaze model")) {
@@ -229,19 +233,98 @@ test("runs optional real wasm inference smoke when model assets are available", 
     return;
   }
 
-  expect(state).toBe("timing");
+  expect(state).toBe("summary");
 
   const timing = latestTimingMetrics(consoleLines);
   expect(timing).not.toBeNull();
   expect(timing.fps).toBeGreaterThan(0);
   expect(timing.totalMs).toBeGreaterThan(0);
-  expect(timing.clipFrames).toBe(1);
+  expect(timing.clipFrames).toBe(2);
+  expect(timing.modelFrames).toBe(1);
+  expect(timing.gazeRatioPercent).toBeGreaterThanOrEqual(0);
+  expect(timing.gazeRatioPercent).toBeLessThanOrEqual(100);
   expect(timing.width).toBe(224);
   expect(timing.height).toBe(224);
   const perf = await page.evaluate(() => window.__autogazePerf || null);
   expect(perf).not.toBeNull();
-  expect(perf.processed_frames).toBeGreaterThanOrEqual(1);
-  expect(perf.latest_sequence).toBeGreaterThanOrEqual(1);
+  expect(perf.processed_frames).toBeGreaterThanOrEqual(2);
+  expect(perf.latest_sequence).toBeGreaterThanOrEqual(2);
+  expect(perf.latest_gaze_update_ratio).toBeGreaterThanOrEqual(0);
+  expect(perf.latest_gaze_update_ratio).toBeLessThanOrEqual(1);
+  expect(perf.latest_width).toBe(224);
+  expect(perf.latest_height).toBe(224);
+  expect(perf.mode).toBe("realtime");
+  expect(perf.visualization_mode).toBe("interframe");
+  expect(perf.display_transfer).toBe("gpu");
+  expect(perf.streaming_cache).toBe(false);
+  expect(perf.streaming_cache_effective).toBe(false);
+  expect(perf.show_psnr).toBe(false);
+  expect(perf.latest_psnr_db).toBeNull();
+  expect(perf.latest_psnr_db_infinite).toBe(false);
+  expect(perf.ema_psnr_db).toBeNull();
+  expect(perf.ema_psnr_db_infinite).toBe(false);
+  expect(perf.configured_max_in_flight).toBe(2);
+  expect(perf.effective_max_in_flight).toBe(2);
+  expect(perf.frames_per_clip).toBe(2);
+  expect(perf.top_k).toBe(1);
+  expect(perf.max_gaze_tokens_each_frame).toBe(1);
+  expect(perf.tile_batch_size).toBeGreaterThan(0);
+  expect(perf.inference_width).toBe(224);
+  expect(perf.inference_height).toBe(224);
+  expect(perf.tensor_sparse_update_max_rects).toBeGreaterThanOrEqual(0);
+  expect(perf.tensor_sparse_update_max_ratio).toBeGreaterThanOrEqual(0);
+  expect(perf.tensor_sparse_update_max_ratio).toBeLessThanOrEqual(1);
+  expect(["sparse-rects", "dense-mask"]).toContain(
+    perf.latest_tensor_interframe_path,
+  );
+  expect(typeof perf.render_adapter_name).toBe("string");
+  expect(perf.render_adapter_name.length).toBeGreaterThan(0);
+  expect(typeof perf.render_adapter_device_type).toBe("string");
+  expect(typeof perf.render_adapter_backend).toBe("string");
   expect(perf.p95_total_ms).toBeGreaterThan(0);
+  const perfSummary = await page.evaluate(
+    () => window.__autogazePerfSummary || null,
+  );
+  expect(perfSummary).not.toBeNull();
+  expect(perfSummary.processed_frames).toBeGreaterThanOrEqual(2);
+  expect(["sparse-rects", "dense-mask"]).toContain(
+    perfSummary.latest_tensor_interframe_path,
+  );
+  expect(perfSummary.render_adapter_name).toBe(perf.render_adapter_name);
+  expect(perfSummary.render_adapter_backend).toBe(perf.render_adapter_backend);
+  expect(perfSummary.mode).toBe(perf.mode);
+  expect(perfSummary.visualization_mode).toBe(perf.visualization_mode);
+  expect(perfSummary.display_transfer).toBe(perf.display_transfer);
+  expect(perfSummary.streaming_cache).toBe(perf.streaming_cache);
+  expect(perfSummary.streaming_cache_effective).toBe(
+    perf.streaming_cache_effective,
+  );
+  expect(perfSummary.show_psnr).toBe(perf.show_psnr);
+  expect(perfSummary.latest_psnr_db).toBe(perf.latest_psnr_db);
+  expect(perfSummary.latest_psnr_db_infinite).toBe(
+    perf.latest_psnr_db_infinite,
+  );
+  expect(perfSummary.ema_psnr_db).toBe(perf.ema_psnr_db);
+  expect(perfSummary.ema_psnr_db_infinite).toBe(perf.ema_psnr_db_infinite);
+  expect(perfSummary.configured_max_in_flight).toBe(
+    perf.configured_max_in_flight,
+  );
+  expect(perfSummary.effective_max_in_flight).toBe(
+    perf.effective_max_in_flight,
+  );
+  expect(perfSummary.frames_per_clip).toBe(perf.frames_per_clip);
+  expect(perfSummary.top_k).toBe(perf.top_k);
+  expect(perfSummary.max_gaze_tokens_each_frame).toBe(
+    perf.max_gaze_tokens_each_frame,
+  );
+  expect(perfSummary.tile_batch_size).toBe(perf.tile_batch_size);
+  expect(perfSummary.tensor_sparse_update_max_rects).toBe(
+    perf.tensor_sparse_update_max_rects,
+  );
+  expect(perfSummary.tensor_sparse_update_max_ratio).toBe(
+    perf.tensor_sparse_update_max_ratio,
+  );
+  expect(perfSummary.latest_width).toBe(224);
+  expect(perfSummary.latest_height).toBe(224);
   expectNoKnownWasmPanic(consoleLines, pageErrors);
 });

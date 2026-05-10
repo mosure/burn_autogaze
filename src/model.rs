@@ -217,6 +217,147 @@ pub struct AutoGazeGenerateOutput {
     pub confidences: Vec<Vec<f32>>,
 }
 
+impl AutoGazeGenerateOutput {
+    /// Decode generated AutoGaze token ids into upstream-style per-scale token masks.
+    ///
+    /// The original NVIDIA implementation keeps one boolean mask per pyramid scale
+    /// instead of immediately unioning tokens into a full-resolution pixel mask.
+    /// Keeping that representation available makes visualization and downstream
+    /// sparse video/image pipelines less error-prone.
+    pub fn scale_token_masks(&self, config: &AutoGazeConfig) -> Vec<Vec<AutoGazeScaleTokenMask>> {
+        generated_scale_token_masks(self, config)
+    }
+
+    /// Decode generated AutoGaze token ids into fixation traces.
+    ///
+    /// This is the same conversion used by the high-level tracing APIs. Use the
+    /// direct sparse readout helpers when downstream code only needs image-token
+    /// selections and does not need a full trace allocation.
+    pub fn traces(
+        &self,
+        config: &AutoGazeConfig,
+        min_points_per_frame: usize,
+    ) -> Vec<FrameFixationTrace> {
+        generated_to_traces(self, config, min_points_per_frame)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct GeneratedFrameFixations {
+    pub points: Vec<FixationPoint>,
+    pub stop_probability: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AutoGazeScaleTokenMask {
+    pub grid: usize,
+    pub token_count: usize,
+    pub frames: Vec<Vec<bool>>,
+}
+
+/// Stateful generation cache for advancing an AutoGaze video stream one frame at a time.
+///
+/// This keeps decoder KV tensors, pending generated-token embeddings, and RoPE position state
+/// across frames. It is intended for realtime pipelines that already have a rolling frame source
+/// and want to avoid re-decoding older frames for every sliding window.
+#[derive(Clone, Debug)]
+pub struct AutoGazeStreamingCache<B: Backend> {
+    horizon_frames: usize,
+    state: Option<AutoGazeStreamingCacheState<B>>,
+}
+
+impl<B: Backend> AutoGazeStreamingCache<B> {
+    pub fn new(horizon_frames: usize) -> Self {
+        Self {
+            horizon_frames: horizon_frames.max(1),
+            state: None,
+        }
+    }
+
+    pub fn horizon_frames(&self) -> usize {
+        self.horizon_frames
+    }
+
+    pub fn processed_frames(&self) -> usize {
+        self.state
+            .as_ref()
+            .map(|state| state.processed_frames)
+            .unwrap_or(0)
+    }
+
+    pub fn reset(&mut self) {
+        self.state = None;
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AutoGazeStreamingCacheState<B: Backend> {
+    past_conv_values: Option<Vec<Tensor<B, 5>>>,
+    past_key_values: Option<AutoGazePastKeyValues<B>>,
+    pending_query_embeds: Option<Tensor<B, 3>>,
+    prefix_attention_mask: Vec<Vec<i64>>,
+    prefix_position_ids: Vec<Vec<i64>>,
+    pending_position_indices: Vec<Vec<usize>>,
+    processed_frames: usize,
+    batch: usize,
+    vision_tokens: usize,
+    dim: usize,
+    max_tokens: usize,
+    cache_capacity: usize,
+}
+
+impl<B: Backend> AutoGazeStreamingCacheState<B> {
+    fn new(
+        batch: usize,
+        vision_tokens: usize,
+        dim: usize,
+        max_tokens: usize,
+        horizon_frames: usize,
+    ) -> Self {
+        Self {
+            past_conv_values: None,
+            past_key_values: None,
+            pending_query_embeds: None,
+            prefix_attention_mask: vec![vec![]; batch],
+            prefix_position_ids: vec![vec![]; batch],
+            pending_position_indices: vec![Vec::<usize>::new(); batch],
+            processed_frames: 0,
+            batch,
+            vision_tokens,
+            dim,
+            max_tokens,
+            cache_capacity: horizon_frames.max(1) * (vision_tokens + max_tokens.max(1)),
+        }
+    }
+
+    fn matches(
+        &self,
+        batch: usize,
+        vision_tokens: usize,
+        dim: usize,
+        max_tokens: usize,
+        horizon_frames: usize,
+    ) -> bool {
+        self.batch == batch
+            && self.vision_tokens == vision_tokens
+            && self.dim == dim
+            && self.max_tokens == max_tokens
+            && self.processed_frames < horizon_frames.max(1)
+    }
+
+    fn matches_runtime(
+        &self,
+        batch: usize,
+        max_tokens: usize,
+        horizon_frames: usize,
+        incoming_frames: usize,
+    ) -> bool {
+        self.batch == batch
+            && self.max_tokens == max_tokens
+            && self.processed_frames.saturating_add(incoming_frames) <= horizon_frames.max(1)
+    }
+}
+
 type GreedyTokenSelection = (Vec<Vec<i64>>, Vec<Vec<bool>>, Vec<Vec<f32>>);
 
 #[derive(Clone, Copy, Debug)]
@@ -768,13 +909,12 @@ impl<B: Backend> AutoGazeGazingModel<B> {
         past_conv_values: Option<Vec<Tensor<B, 5>>>,
     ) -> (Tensor<B, 4>, Vec<Tensor<B, 5>>) {
         let [_batch, _time, channels, height, width] = video.shape().dims::<5>();
-        let device = video.device();
-        let video = adapt_video_channels(video, channels, &device);
-        let video = if height != width {
-            panic!("AutoGaze Burn port currently expects square frames");
-        } else {
-            video
-        };
+        let video =
+            if channels != 3 || height != self.input_img_size || width != self.input_img_size {
+                self.resize_video(video)
+            } else {
+                video
+            };
         let (vision_features, new_past) =
             self.vision_model
                 .forward(video, use_cache, past_conv_values);
@@ -971,6 +1111,228 @@ impl<B: Backend> AutoGazeGazingModel<B> {
             }
             pending_position_indices = last_generated_indices;
             pending_query_embeds = next_query_embeds;
+        }
+
+        AutoGazeGenerateOutput {
+            gazing_pos,
+            num_gazing_each_frame,
+            if_padded_gazing,
+            confidences,
+        }
+    }
+
+    pub fn generate_streaming_cached(
+        &self,
+        video: Tensor<B, 5>,
+        cache: &mut AutoGazeStreamingCache<B>,
+        max_gaze_tokens_each_frame: usize,
+        task_loss_requirement: Option<f32>,
+    ) -> AutoGazeGenerateOutput {
+        let video = self.resize_video(video);
+        let [batch, frames, _channels, _height, _width] = video.shape().dims::<5>();
+        let max_tokens = max_gaze_tokens_each_frame.max(1);
+        let horizon_frames = cache.horizon_frames.max(1);
+        if cache
+            .state
+            .as_ref()
+            .map(|state| !state.matches_runtime(batch, max_tokens, horizon_frames, frames))
+            .unwrap_or(false)
+        {
+            cache.state = None;
+        }
+
+        let past_conv_values = cache
+            .state
+            .as_mut()
+            .and_then(|state| state.past_conv_values.take());
+        let (video_embeds, new_past_conv_values) = self.embed_video(video, true, past_conv_values);
+        let [batch, frames, vision_tokens, dim] = video_embeds.shape().dims::<4>();
+        let device = video_embeds.device();
+
+        let mut gazing_pos = vec![Vec::<i64>::new(); batch];
+        let mut if_padded_gazing = vec![Vec::<bool>::new(); batch];
+        let mut confidences = vec![Vec::<f32>::new(); batch];
+        let mut num_gazing_each_frame = Vec::with_capacity(frames);
+
+        for output_frame_idx in 0..frames {
+            let should_reset = cache
+                .state
+                .as_ref()
+                .map(|state| !state.matches(batch, vision_tokens, dim, max_tokens, horizon_frames))
+                .unwrap_or(true);
+            if should_reset {
+                cache.state = None;
+            }
+            let state = cache.state.get_or_insert_with(|| {
+                AutoGazeStreamingCacheState::new(
+                    batch,
+                    vision_tokens,
+                    dim,
+                    max_tokens,
+                    horizon_frames,
+                )
+            });
+
+            commit_pending_position_ids(
+                &state.prefix_attention_mask,
+                &mut state.prefix_position_ids,
+                &state.pending_position_indices,
+            );
+            state
+                .pending_position_indices
+                .iter_mut()
+                .for_each(Vec::clear);
+
+            let frame_embed = video_embeds
+                .clone()
+                .slice_dim(1, output_frame_idx..(output_frame_idx + 1))
+                .reshape([batch, vision_tokens, dim]);
+            for batch_idx in 0..batch {
+                let valid_start = state.prefix_attention_mask[batch_idx]
+                    .iter()
+                    .filter(|&&mask| mask != 0)
+                    .count() as i64;
+                for valid_count in (valid_start..).take(vision_tokens) {
+                    state.prefix_attention_mask[batch_idx].push(1);
+                    state.prefix_position_ids[batch_idx].push(valid_count);
+                }
+            }
+            let initial_query_embeds = if let Some(pending) = state.pending_query_embeds.take() {
+                Tensor::cat(vec![pending, frame_embed], 1)
+            } else {
+                frame_embed
+            };
+
+            let mut frame_tokens = vec![Vec::<i64>::new(); batch];
+            let mut frame_padded = vec![Vec::<bool>::new(); batch];
+            let mut frame_confidences = vec![Vec::<f32>::new(); batch];
+            let mut finished = vec![false; batch];
+            let mut is_first_token = true;
+            let generation_prefix_len = state
+                .prefix_attention_mask
+                .first()
+                .map(Vec::len)
+                .unwrap_or(0);
+            let generation_tail_positions =
+                generation_tail_positions(&state.prefix_position_ids, self.num_multi_token_pred);
+            let mut last_generated_indices = vec![Vec::<usize>::new(); batch];
+            let mut next_query_embeds = Some(initial_query_embeds);
+
+            while frame_tokens.iter().map(Vec::len).max().unwrap_or(0) < max_tokens
+                && finished.iter().any(|done| !done)
+            {
+                let Some(query_embeds) = next_query_embeds.take() else {
+                    break;
+                };
+                let query_len = query_embeds.shape().dims::<3>()[1];
+                let query_start = cached_sequence_len(&state.past_key_values);
+                let key_len = query_start + query_len;
+                let attention_mask = attention_mask_tensor_or_none::<B>(
+                    &state.prefix_attention_mask,
+                    key_len,
+                    &device,
+                );
+                let position_ids = position_ids_slice_tensor_optimized::<B>(
+                    &state.prefix_position_ids,
+                    query_start,
+                    query_len,
+                    &device,
+                );
+                let outputs = self.gaze_decoder.forward_cached(
+                    query_embeds,
+                    attention_mask,
+                    position_ids,
+                    state.past_key_values.take(),
+                    state.cache_capacity,
+                );
+                state.past_key_values = Some(outputs.past_key_values);
+                let last_logits = outputs
+                    .logits
+                    .slice_dim(1, query_len.saturating_sub(1)..query_len)
+                    .reshape([
+                        batch,
+                        self.num_multi_token_pred,
+                        self.gaze_decoder.vocab_size,
+                    ]);
+                let last_task = outputs
+                    .task_loss_prediction
+                    .slice_dim(1, query_len.saturating_sub(1)..query_len)
+                    .reshape([batch, self.num_multi_token_pred]);
+                let (next_tokens, next_valid, next_confidences) = greedy_select_multi_tokens(
+                    last_logits,
+                    last_task,
+                    &frame_tokens,
+                    &finished,
+                    self.eos_token_id,
+                    max_tokens,
+                    TaskLossStop {
+                        requirement: task_loss_requirement,
+                        is_first_token,
+                    },
+                );
+
+                let new_tokens = next_tokens.first().map(Vec::len).unwrap_or(0);
+                if new_tokens == 0 {
+                    break;
+                }
+                let flat_tokens: Vec<i64> = next_tokens
+                    .iter()
+                    .flat_map(|tokens| tokens.iter().copied())
+                    .collect();
+                let token_tensor = Tensor::<B, 2, Int>::from_data(
+                    TensorData::new(flat_tokens, [batch, new_tokens]),
+                    &device,
+                );
+                let token_embeds = self.gaze_decoder.model.embed_tokens.forward(token_tensor);
+
+                for batch_idx in 0..batch {
+                    last_generated_indices[batch_idx].clear();
+                    for local_idx in 0..new_tokens {
+                        last_generated_indices[batch_idx]
+                            .push(state.prefix_attention_mask[batch_idx].len());
+                        let token = next_tokens[batch_idx][local_idx];
+                        let valid = next_valid[batch_idx][local_idx];
+                        let confidence = next_confidences[batch_idx][local_idx];
+                        frame_tokens[batch_idx].push(token);
+                        frame_padded[batch_idx].push(!valid);
+                        frame_confidences[batch_idx].push(confidence);
+                        state.prefix_attention_mask[batch_idx].push(1);
+                        let tail = &generation_tail_positions[batch_idx];
+                        state.prefix_position_ids[batch_idx].push(tail[local_idx % tail.len()]);
+                        if !valid {
+                            finished[batch_idx] = true;
+                        }
+                    }
+                }
+                next_query_embeds = Some(token_embeds);
+                is_first_token = false;
+            }
+
+            let frame_count = frame_tokens.first().map(Vec::len).unwrap_or(0);
+            num_gazing_each_frame.push(frame_count);
+            let frame_offset = (output_frame_idx * self.num_vision_tokens_each_frame) as i64;
+            for batch_idx in 0..batch {
+                for (local_idx, padded) in frame_padded[batch_idx].iter().copied().enumerate() {
+                    if padded {
+                        state.prefix_attention_mask[batch_idx][generation_prefix_len + local_idx] =
+                            0;
+                    }
+                }
+                gazing_pos[batch_idx].extend(
+                    frame_tokens[batch_idx]
+                        .iter()
+                        .map(|token| token + frame_offset),
+                );
+                if_padded_gazing[batch_idx].extend(frame_padded[batch_idx].iter().copied());
+                confidences[batch_idx].extend(frame_confidences[batch_idx].iter().copied());
+            }
+            state.pending_position_indices = last_generated_indices;
+            state.pending_query_embeds = next_query_embeds;
+            state.processed_frames = state.processed_frames.saturating_add(1);
+        }
+
+        if let Some(state) = cache.state.as_mut() {
+            state.past_conv_values = Some(new_past_conv_values);
         }
 
         AutoGazeGenerateOutput {
@@ -1343,6 +1705,229 @@ impl<B: Backend> AutoGazeGazingModel<B> {
         })
     }
 
+    pub async fn generate_streaming_cached_async(
+        &self,
+        video: Tensor<B, 5>,
+        cache: &mut AutoGazeStreamingCache<B>,
+        max_gaze_tokens_each_frame: usize,
+        task_loss_requirement: Option<f32>,
+    ) -> Result<AutoGazeGenerateOutput, ExecutionError> {
+        let video = self.resize_video(video);
+        let [batch, frames, _channels, _height, _width] = video.shape().dims::<5>();
+        let max_tokens = max_gaze_tokens_each_frame.max(1);
+        let horizon_frames = cache.horizon_frames.max(1);
+        if cache
+            .state
+            .as_ref()
+            .map(|state| !state.matches_runtime(batch, max_tokens, horizon_frames, frames))
+            .unwrap_or(false)
+        {
+            cache.state = None;
+        }
+
+        let past_conv_values = cache
+            .state
+            .as_mut()
+            .and_then(|state| state.past_conv_values.take());
+        let (video_embeds, new_past_conv_values) = self.embed_video(video, true, past_conv_values);
+        let [batch, frames, vision_tokens, dim] = video_embeds.shape().dims::<4>();
+        let device = video_embeds.device();
+
+        let mut gazing_pos = vec![Vec::<i64>::new(); batch];
+        let mut if_padded_gazing = vec![Vec::<bool>::new(); batch];
+        let mut confidences = vec![Vec::<f32>::new(); batch];
+        let mut num_gazing_each_frame = Vec::with_capacity(frames);
+
+        for output_frame_idx in 0..frames {
+            let should_reset = cache
+                .state
+                .as_ref()
+                .map(|state| !state.matches(batch, vision_tokens, dim, max_tokens, horizon_frames))
+                .unwrap_or(true);
+            if should_reset {
+                cache.state = None;
+            }
+            let state = cache.state.get_or_insert_with(|| {
+                AutoGazeStreamingCacheState::new(
+                    batch,
+                    vision_tokens,
+                    dim,
+                    max_tokens,
+                    horizon_frames,
+                )
+            });
+
+            commit_pending_position_ids(
+                &state.prefix_attention_mask,
+                &mut state.prefix_position_ids,
+                &state.pending_position_indices,
+            );
+            state
+                .pending_position_indices
+                .iter_mut()
+                .for_each(Vec::clear);
+
+            let frame_embed = video_embeds
+                .clone()
+                .slice_dim(1, output_frame_idx..(output_frame_idx + 1))
+                .reshape([batch, vision_tokens, dim]);
+            for batch_idx in 0..batch {
+                let valid_start = state.prefix_attention_mask[batch_idx]
+                    .iter()
+                    .filter(|&&mask| mask != 0)
+                    .count() as i64;
+                for valid_count in (valid_start..).take(vision_tokens) {
+                    state.prefix_attention_mask[batch_idx].push(1);
+                    state.prefix_position_ids[batch_idx].push(valid_count);
+                }
+            }
+            let initial_query_embeds = if let Some(pending) = state.pending_query_embeds.take() {
+                Tensor::cat(vec![pending, frame_embed], 1)
+            } else {
+                frame_embed
+            };
+
+            let mut frame_tokens = vec![Vec::<i64>::new(); batch];
+            let mut frame_padded = vec![Vec::<bool>::new(); batch];
+            let mut frame_confidences = vec![Vec::<f32>::new(); batch];
+            let mut finished = vec![false; batch];
+            let mut is_first_token = true;
+            let generation_prefix_len = state
+                .prefix_attention_mask
+                .first()
+                .map(Vec::len)
+                .unwrap_or(0);
+            let generation_tail_positions =
+                generation_tail_positions(&state.prefix_position_ids, self.num_multi_token_pred);
+            let mut last_generated_indices = vec![Vec::<usize>::new(); batch];
+            let mut next_query_embeds = Some(initial_query_embeds);
+
+            while frame_tokens.iter().map(Vec::len).max().unwrap_or(0) < max_tokens
+                && finished.iter().any(|done| !done)
+            {
+                let Some(query_embeds) = next_query_embeds.take() else {
+                    break;
+                };
+                let query_len = query_embeds.shape().dims::<3>()[1];
+                let query_start = cached_sequence_len(&state.past_key_values);
+                let key_len = query_start + query_len;
+                let attention_mask = attention_mask_tensor_or_none::<B>(
+                    &state.prefix_attention_mask,
+                    key_len,
+                    &device,
+                );
+                let position_ids = position_ids_slice_tensor_optimized::<B>(
+                    &state.prefix_position_ids,
+                    query_start,
+                    query_len,
+                    &device,
+                );
+                let outputs = self.gaze_decoder.forward_cached(
+                    query_embeds,
+                    attention_mask,
+                    position_ids,
+                    state.past_key_values.take(),
+                    state.cache_capacity,
+                );
+                state.past_key_values = Some(outputs.past_key_values);
+                let last_logits = outputs
+                    .logits
+                    .slice_dim(1, query_len.saturating_sub(1)..query_len)
+                    .reshape([
+                        batch,
+                        self.num_multi_token_pred,
+                        self.gaze_decoder.vocab_size,
+                    ]);
+                let last_task = outputs
+                    .task_loss_prediction
+                    .slice_dim(1, query_len.saturating_sub(1)..query_len)
+                    .reshape([batch, self.num_multi_token_pred]);
+                let (next_tokens, next_valid, next_confidences) = greedy_select_multi_tokens_async(
+                    last_logits,
+                    last_task,
+                    &frame_tokens,
+                    &finished,
+                    self.eos_token_id,
+                    max_tokens,
+                    TaskLossStop {
+                        requirement: task_loss_requirement,
+                        is_first_token,
+                    },
+                )
+                .await?;
+
+                let new_tokens = next_tokens.first().map(Vec::len).unwrap_or(0);
+                if new_tokens == 0 {
+                    break;
+                }
+                let flat_tokens: Vec<i64> = next_tokens
+                    .iter()
+                    .flat_map(|tokens| tokens.iter().copied())
+                    .collect();
+                let token_tensor = Tensor::<B, 2, Int>::from_data(
+                    TensorData::new(flat_tokens, [batch, new_tokens]),
+                    &device,
+                );
+                let token_embeds = self.gaze_decoder.model.embed_tokens.forward(token_tensor);
+
+                for batch_idx in 0..batch {
+                    last_generated_indices[batch_idx].clear();
+                    for local_idx in 0..new_tokens {
+                        last_generated_indices[batch_idx]
+                            .push(state.prefix_attention_mask[batch_idx].len());
+                        let token = next_tokens[batch_idx][local_idx];
+                        let valid = next_valid[batch_idx][local_idx];
+                        let confidence = next_confidences[batch_idx][local_idx];
+                        frame_tokens[batch_idx].push(token);
+                        frame_padded[batch_idx].push(!valid);
+                        frame_confidences[batch_idx].push(confidence);
+                        state.prefix_attention_mask[batch_idx].push(1);
+                        let tail = &generation_tail_positions[batch_idx];
+                        state.prefix_position_ids[batch_idx].push(tail[local_idx % tail.len()]);
+                        if !valid {
+                            finished[batch_idx] = true;
+                        }
+                    }
+                }
+                next_query_embeds = Some(token_embeds);
+                is_first_token = false;
+            }
+
+            let frame_count = frame_tokens.first().map(Vec::len).unwrap_or(0);
+            num_gazing_each_frame.push(frame_count);
+            let frame_offset = (output_frame_idx * self.num_vision_tokens_each_frame) as i64;
+            for batch_idx in 0..batch {
+                for (local_idx, padded) in frame_padded[batch_idx].iter().copied().enumerate() {
+                    if padded {
+                        state.prefix_attention_mask[batch_idx][generation_prefix_len + local_idx] =
+                            0;
+                    }
+                }
+                gazing_pos[batch_idx].extend(
+                    frame_tokens[batch_idx]
+                        .iter()
+                        .map(|token| token + frame_offset),
+                );
+                if_padded_gazing[batch_idx].extend(frame_padded[batch_idx].iter().copied());
+                confidences[batch_idx].extend(frame_confidences[batch_idx].iter().copied());
+            }
+            state.pending_position_indices = last_generated_indices;
+            state.pending_query_embeds = next_query_embeds;
+            state.processed_frames = state.processed_frames.saturating_add(1);
+        }
+
+        if let Some(state) = cache.state.as_mut() {
+            state.past_conv_values = Some(new_past_conv_values);
+        }
+
+        Ok(AutoGazeGenerateOutput {
+            gazing_pos,
+            num_gazing_each_frame,
+            if_padded_gazing,
+            confidences,
+        })
+    }
+
     pub async fn generate_uncached_async(
         &self,
         video: Tensor<B, 5>,
@@ -1680,6 +2265,38 @@ impl<B: Backend> NativeAutoGazeModel<B> {
             .await
     }
 
+    pub fn generate_streaming_with_task_loss_requirement(
+        &self,
+        video: Tensor<B, 5>,
+        cache: &mut AutoGazeStreamingCache<B>,
+        max_gaze_tokens_each_frame: usize,
+        task_loss_requirement: Option<f32>,
+    ) -> AutoGazeGenerateOutput {
+        self.gazing_model.generate_streaming_cached(
+            video,
+            cache,
+            max_gaze_tokens_each_frame,
+            task_loss_requirement,
+        )
+    }
+
+    pub async fn generate_streaming_with_task_loss_requirement_async(
+        &self,
+        video: Tensor<B, 5>,
+        cache: &mut AutoGazeStreamingCache<B>,
+        max_gaze_tokens_each_frame: usize,
+        task_loss_requirement: Option<f32>,
+    ) -> Result<AutoGazeGenerateOutput, ExecutionError> {
+        self.gazing_model
+            .generate_streaming_cached_async(
+                video,
+                cache,
+                max_gaze_tokens_each_frame,
+                task_loss_requirement,
+            )
+            .await
+    }
+
     pub fn default_max_gaze_tokens_each_frame(&self) -> usize {
         self.config
             .inference_gazing_ratio()
@@ -1752,6 +2369,44 @@ impl<B: Backend> NativeAutoGazeModel<B> {
         let trace_budget = max_gaze_tokens_each_frame.max(k.max(1));
         let generated = self
             .generate_with_task_loss_requirement_async(video, trace_budget, task_loss_requirement)
+            .await?;
+        Ok(generated_to_traces(&generated, &self.config, trace_budget))
+    }
+
+    pub fn trace_streaming_with_task_loss_requirement(
+        &self,
+        video: Tensor<B, 5>,
+        cache: &mut AutoGazeStreamingCache<B>,
+        k: usize,
+        max_gaze_tokens_each_frame: usize,
+        task_loss_requirement: Option<f32>,
+    ) -> Vec<FrameFixationTrace> {
+        let trace_budget = max_gaze_tokens_each_frame.max(k.max(1));
+        let generated = self.generate_streaming_with_task_loss_requirement(
+            video,
+            cache,
+            trace_budget,
+            task_loss_requirement,
+        );
+        generated_to_traces(&generated, &self.config, trace_budget)
+    }
+
+    pub async fn trace_streaming_with_task_loss_requirement_async(
+        &self,
+        video: Tensor<B, 5>,
+        cache: &mut AutoGazeStreamingCache<B>,
+        k: usize,
+        max_gaze_tokens_each_frame: usize,
+        task_loss_requirement: Option<f32>,
+    ) -> Result<Vec<FrameFixationTrace>, ExecutionError> {
+        let trace_budget = max_gaze_tokens_each_frame.max(k.max(1));
+        let generated = self
+            .generate_streaming_with_task_loss_requirement_async(
+                video,
+                cache,
+                trace_budget,
+                task_loss_requirement,
+            )
             .await?;
         Ok(generated_to_traces(&generated, &self.config, trace_budget))
     }
@@ -2152,46 +2807,26 @@ fn greedy_select_multi_tokens<B: Backend>(
         }
 
         let mask_values = builder.disallowed_mask(vocab, context);
-        let mask =
-            Tensor::<B, 2, Bool>::from_data(TensorData::new(mask_values, [batch, vocab]), &device);
-        let step_logits = logits
-            .clone()
-            .slice_dim(1, multi_idx..(multi_idx + 1))
-            .squeeze_dim::<2>(1);
-        let masked_logits = step_logits.mask_fill(mask, f32::NEG_INFINITY);
-        let exp_sum = masked_logits.clone().exp().sum_dim(1);
-        let best_indices = masked_logits
-            .clone()
-            .add(greedy_tie_breaker::<B>(batch, vocab, &device))
-            .argmax(1);
-        let best_scores = masked_logits.gather(1, best_indices.clone());
-        let confidences = best_scores.clone().exp().div(exp_sum);
-        let step_task_loss = task_loss.clone().slice_dim(1, multi_idx..(multi_idx + 1));
-
-        let best_scores = best_scores
-            .into_data()
-            .to_vec::<f32>()
-            .expect("convert selected logits to f32 vec");
-        let best_tokens = best_indices
-            .into_data()
-            .convert::<i64>()
-            .to_vec::<i64>()
-            .expect("convert selected token ids to i64 vec");
-        let confidences = confidences
-            .into_data()
-            .to_vec::<f32>()
-            .expect("convert selected confidences to f32 vec");
-        let task_losses = step_task_loss
-            .into_data()
-            .to_vec::<f32>()
-            .expect("convert selected task loss predictions to f32 vec");
+        let selected = greedy_step_values_from_data(
+            greedy_step_tensor(
+                &logits,
+                &task_loss,
+                multi_idx,
+                mask_values,
+                batch,
+                vocab,
+                &device,
+            )
+            .into_data(),
+            batch,
+        );
 
         builder.push_step(
             multi_idx,
-            &best_tokens,
-            &best_scores,
-            &confidences,
-            &task_losses,
+            &selected.tokens,
+            &selected.scores,
+            &selected.confidences,
+            &selected.task_losses,
             context,
         );
     }
@@ -2225,55 +2860,57 @@ async fn greedy_select_multi_tokens_async<B: Backend>(
         }
 
         let mask_values = builder.disallowed_mask(vocab, context);
-        let mask =
-            Tensor::<B, 2, Bool>::from_data(TensorData::new(mask_values, [batch, vocab]), &device);
-        let step_logits = logits
-            .clone()
-            .slice_dim(1, multi_idx..(multi_idx + 1))
-            .squeeze_dim::<2>(1);
-        let masked_logits = step_logits.mask_fill(mask, f32::NEG_INFINITY);
-        let exp_sum = masked_logits.clone().exp().sum_dim(1);
-        let best_indices = masked_logits
-            .clone()
-            .add(greedy_tie_breaker::<B>(batch, vocab, &device))
-            .argmax(1);
-        let best_scores = masked_logits.gather(1, best_indices.clone());
-        let confidences = best_scores.clone().exp().div(exp_sum);
-        let step_task_loss = task_loss.clone().slice_dim(1, multi_idx..(multi_idx + 1));
-
-        let best_scores = best_scores
-            .into_data_async()
-            .await?
-            .to_vec::<f32>()
-            .expect("convert selected logits to f32 vec");
-        let best_tokens = best_indices
-            .into_data_async()
-            .await?
-            .convert::<i64>()
-            .to_vec::<i64>()
-            .expect("convert selected token ids to i64 vec");
-        let confidences = confidences
-            .into_data_async()
-            .await?
-            .to_vec::<f32>()
-            .expect("convert selected confidences to f32 vec");
-        let task_losses = step_task_loss
-            .into_data_async()
-            .await?
-            .to_vec::<f32>()
-            .expect("convert selected task loss predictions to f32 vec");
+        let selected_data = greedy_step_tensor(
+            &logits,
+            &task_loss,
+            multi_idx,
+            mask_values,
+            batch,
+            vocab,
+            &device,
+        )
+        .into_data_async()
+        .await?;
+        let selected = greedy_step_values_from_data(selected_data, batch);
 
         builder.push_step(
             multi_idx,
-            &best_tokens,
-            &best_scores,
-            &confidences,
-            &task_losses,
+            &selected.tokens,
+            &selected.scores,
+            &selected.confidences,
+            &selected.task_losses,
             context,
         );
     }
 
     Ok(builder.finish(eos_token_id))
+}
+
+fn greedy_step_tensor<B: Backend>(
+    logits: &Tensor<B, 3>,
+    task_loss: &Tensor<B, 2>,
+    multi_idx: usize,
+    mask_values: Vec<bool>,
+    batch: usize,
+    vocab: usize,
+    device: &B::Device,
+) -> Tensor<B, 2> {
+    let mask =
+        Tensor::<B, 2, Bool>::from_data(TensorData::new(mask_values, [batch, vocab]), device);
+    let step_logits = logits
+        .clone()
+        .slice_dim(1, multi_idx..(multi_idx + 1))
+        .squeeze_dim::<2>(1);
+    let masked_logits = step_logits.mask_fill(mask, f32::NEG_INFINITY);
+    let exp_sum = masked_logits.clone().exp().sum_dim(1);
+    let best_indices = masked_logits
+        .clone()
+        .add(greedy_tie_breaker::<B>(batch, vocab, device))
+        .argmax(1);
+    let best_scores = masked_logits.gather(1, best_indices.clone());
+    let confidences = best_scores.clone().exp().div(exp_sum);
+    let step_task_loss = task_loss.clone().slice_dim(1, multi_idx..(multi_idx + 1));
+    pack_greedy_step_tensors(best_scores, best_indices, confidences, step_task_loss)
 }
 
 fn greedy_tie_breaker<B: Backend>(batch: usize, vocab: usize, device: &B::Device) -> Tensor<B, 2> {
@@ -2282,6 +2919,47 @@ fn greedy_tie_breaker<B: Backend>(batch: usize, vocab: usize, device: &B::Device
         .mul_scalar(-1.0e-9)
         .reshape([1, vocab])
         .repeat_dim(0, batch)
+}
+
+struct GreedyStepValues {
+    tokens: Vec<i64>,
+    scores: Vec<f32>,
+    confidences: Vec<f32>,
+    task_losses: Vec<f32>,
+}
+
+fn pack_greedy_step_tensors<B: Backend>(
+    best_scores: Tensor<B, 2>,
+    best_indices: Tensor<B, 2, Int>,
+    confidences: Tensor<B, 2>,
+    task_losses: Tensor<B, 2>,
+) -> Tensor<B, 2> {
+    Tensor::cat(
+        vec![best_indices.float(), best_scores, confidences, task_losses],
+        1,
+    )
+}
+
+fn greedy_step_values_from_data(data: TensorData, batch: usize) -> GreedyStepValues {
+    let values = data
+        .to_vec::<f32>()
+        .expect("convert packed greedy selection values to f32 vec");
+    let mut tokens = Vec::with_capacity(batch);
+    let mut scores = Vec::with_capacity(batch);
+    let mut confidences = Vec::with_capacity(batch);
+    let mut task_losses = Vec::with_capacity(batch);
+    for row in values.chunks_exact(4).take(batch) {
+        tokens.push(row[0].round() as i64);
+        scores.push(row[1]);
+        confidences.push(row[2]);
+        task_losses.push(row[3]);
+    }
+    GreedyStepValues {
+        tokens,
+        scores,
+        confidences,
+        task_losses,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2533,37 +3211,185 @@ fn generated_to_traces(
     config: &AutoGazeConfig,
     k: usize,
 ) -> Vec<FrameFixationTrace> {
-    let scale_layouts = scale_token_layouts(config);
     let mut traces = Vec::with_capacity(generated.gazing_pos.len());
     for batch_idx in 0..generated.gazing_pos.len() {
-        let mut cursor = 0usize;
-        let mut frames = Vec::with_capacity(generated.num_gazing_each_frame.len());
-        for (frame_idx, frame_len) in generated.num_gazing_each_frame.iter().copied().enumerate() {
-            let mut points = Vec::new();
-            let mut stop_probability = 0.0f32;
-            for local_idx in 0..frame_len {
-                let global_idx = cursor + local_idx;
-                let token = generated.gazing_pos[batch_idx][global_idx]
-                    - (frame_idx * config.num_vision_tokens_each_frame) as i64;
-                let padded = generated.if_padded_gazing[batch_idx][global_idx];
-                if padded {
-                    stop_probability = 1.0;
-                    continue;
-                }
-                if let Some(point) = token_to_fixation_point(
-                    token.max(0) as usize,
-                    &scale_layouts,
-                    generated.confidences[batch_idx][global_idx],
-                ) {
-                    points.push(point);
-                }
-            }
-            cursor += frame_len;
-            frames.push(FixationSet::new(points, stop_probability, k));
-        }
+        let frames = generated_to_frame_fixations(generated, config, batch_idx)
+            .into_iter()
+            .map(|frame| FixationSet::with_min_len(frame.points, frame.stop_probability, k))
+            .collect();
         traces.push(FrameFixationTrace::new(frames));
     }
     traces
+}
+
+pub(crate) fn generated_to_frame_fixations(
+    generated: &AutoGazeGenerateOutput,
+    config: &AutoGazeConfig,
+    batch_idx: usize,
+) -> Vec<GeneratedFrameFixations> {
+    let scale_layouts = scale_token_layouts(config);
+    let mut cursor = 0usize;
+    let mut frames = Vec::with_capacity(generated.num_gazing_each_frame.len());
+    for (frame_idx, frame_len) in generated.num_gazing_each_frame.iter().copied().enumerate() {
+        let frame = generated_frame_fixations_from_layouts(
+            generated,
+            config,
+            batch_idx,
+            frame_idx,
+            cursor,
+            frame_len,
+            &scale_layouts,
+        );
+        cursor += frame_len;
+        frames.push(frame);
+    }
+    frames
+}
+
+pub(crate) fn generated_frame_fixations(
+    generated: &AutoGazeGenerateOutput,
+    config: &AutoGazeConfig,
+    batch_idx: usize,
+    frame_idx: usize,
+) -> Option<GeneratedFrameFixations> {
+    if batch_idx >= generated.gazing_pos.len() || frame_idx >= generated.num_gazing_each_frame.len()
+    {
+        return None;
+    }
+    let cursor = generated
+        .num_gazing_each_frame
+        .iter()
+        .take(frame_idx)
+        .sum::<usize>();
+    let frame_len = generated.num_gazing_each_frame[frame_idx];
+    let scale_layouts = scale_token_layouts(config);
+    Some(generated_frame_fixations_from_layouts(
+        generated,
+        config,
+        batch_idx,
+        frame_idx,
+        cursor,
+        frame_len,
+        &scale_layouts,
+    ))
+}
+
+fn generated_frame_fixations_from_layouts(
+    generated: &AutoGazeGenerateOutput,
+    config: &AutoGazeConfig,
+    batch_idx: usize,
+    frame_idx: usize,
+    cursor: usize,
+    frame_len: usize,
+    scale_layouts: &[ScaleTokenLayout],
+) -> GeneratedFrameFixations {
+    let tokens = generated.gazing_pos.get(batch_idx);
+    let padded = generated.if_padded_gazing.get(batch_idx);
+    let confidences = generated.confidences.get(batch_idx);
+    let mut points = Vec::new();
+    let mut stop_probability = 0.0f32;
+    for local_idx in 0..frame_len {
+        let global_idx = cursor + local_idx;
+        let Some(&raw_token) = tokens.and_then(|tokens| tokens.get(global_idx)) else {
+            continue;
+        };
+        let is_padded = padded
+            .and_then(|flags| flags.get(global_idx))
+            .copied()
+            .unwrap_or(true);
+        if is_padded {
+            stop_probability = 1.0;
+            continue;
+        }
+        let frame_offset = (frame_idx * config.num_vision_tokens_each_frame) as i64;
+        let token = raw_token - frame_offset;
+        if token < 0 {
+            continue;
+        }
+        let confidence = confidences
+            .and_then(|confidences| confidences.get(global_idx))
+            .copied()
+            .unwrap_or(1.0);
+        if let Some(point) = token_to_fixation_point(token as usize, scale_layouts, confidence) {
+            points.push(point);
+        }
+    }
+    GeneratedFrameFixations {
+        points,
+        stop_probability,
+    }
+}
+
+pub(crate) fn generated_to_frame_points(
+    generated: &AutoGazeGenerateOutput,
+    config: &AutoGazeConfig,
+) -> Vec<Vec<Vec<FixationPoint>>> {
+    (0..generated.gazing_pos.len())
+        .map(|batch_idx| {
+            generated_to_frame_fixations(generated, config, batch_idx)
+                .into_iter()
+                .map(|frame| frame.points)
+                .collect()
+        })
+        .collect()
+}
+
+fn generated_scale_token_masks(
+    generated: &AutoGazeGenerateOutput,
+    config: &AutoGazeConfig,
+) -> Vec<Vec<AutoGazeScaleTokenMask>> {
+    let scale_layouts = scale_token_layouts(config);
+    let frames = generated.num_gazing_each_frame.len();
+    let mut batches = Vec::with_capacity(generated.gazing_pos.len());
+
+    for batch_idx in 0..generated.gazing_pos.len() {
+        let mut masks = scale_layouts
+            .iter()
+            .map(|layout| AutoGazeScaleTokenMask {
+                grid: layout.grid,
+                token_count: layout.token_count,
+                frames: vec![vec![false; layout.token_count]; frames],
+            })
+            .collect::<Vec<_>>();
+
+        let mut cursor = 0usize;
+        for (frame_idx, frame_len) in generated.num_gazing_each_frame.iter().copied().enumerate() {
+            for local_idx in 0..frame_len {
+                let global_idx = cursor + local_idx;
+                let Some(&raw_token) = generated
+                    .gazing_pos
+                    .get(batch_idx)
+                    .and_then(|tokens| tokens.get(global_idx))
+                else {
+                    continue;
+                };
+                let padded = generated
+                    .if_padded_gazing
+                    .get(batch_idx)
+                    .and_then(|flags| flags.get(global_idx))
+                    .copied()
+                    .unwrap_or(true);
+                if padded {
+                    continue;
+                }
+                let frame_offset = (frame_idx * config.num_vision_tokens_each_frame) as i64;
+                let token = raw_token - frame_offset;
+                if token < 0 {
+                    continue;
+                }
+                if let Some((scale_idx, local_token)) =
+                    scale_token_index(token as usize, &scale_layouts)
+                {
+                    masks[scale_idx].frames[frame_idx][local_token] = true;
+                }
+            }
+            cursor += frame_len;
+        }
+
+        batches.push(masks);
+    }
+
+    batches
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2572,28 +3398,32 @@ struct ScaleTokenLayout {
     grid: usize,
 }
 
+fn scale_token_index(token: usize, scale_layouts: &[ScaleTokenLayout]) -> Option<(usize, usize)> {
+    let mut offset = 0usize;
+    for (scale_idx, layout) in scale_layouts.iter().enumerate() {
+        if token < offset + layout.token_count {
+            return Some((scale_idx, token - offset));
+        }
+        offset += layout.token_count;
+    }
+    None
+}
+
 fn token_to_fixation_point(
     token: usize,
     scale_layouts: &[ScaleTokenLayout],
     confidence: f32,
 ) -> Option<FixationPoint> {
-    let mut offset = 0usize;
-    for layout in scale_layouts {
-        if token < offset + layout.token_count {
-            let local = token - offset;
-            let grid = layout.grid.max(1);
-            let row = local / grid;
-            let col = local % grid;
-            let x = (col as f32 + 0.5) / grid as f32;
-            let y = (row as f32 + 0.5) / grid as f32;
-            let cell = (1.0 / grid as f32).clamp(1.0e-6, 1.0);
-            return Some(FixationPoint::with_grid_extent(
-                x, y, cell, cell, confidence, grid,
-            ));
-        }
-        offset += layout.token_count;
-    }
-    None
+    let (scale_idx, local) = scale_token_index(token, scale_layouts)?;
+    let grid = scale_layouts[scale_idx].grid.max(1);
+    let row = local / grid;
+    let col = local % grid;
+    let x = (col as f32 + 0.5) / grid as f32;
+    let y = (row as f32 + 0.5) / grid as f32;
+    let cell = (1.0 / grid as f32).clamp(1.0e-6, 1.0);
+    Some(FixationPoint::with_grid_extent(
+        x, y, cell, cell, confidence, grid,
+    ))
 }
 
 fn scale_token_layouts(config: &AutoGazeConfig) -> Vec<ScaleTokenLayout> {
@@ -2814,6 +3644,89 @@ mod tests {
     }
 
     #[cfg(feature = "ndarray")]
+    #[test]
+    fn streaming_cached_generation_matches_batched_cached_generation() {
+        type B = burn::backend::NdArray<f32>;
+        let device = Default::default();
+        let config = tiny_cache_test_config();
+        let mut mapper = DeterministicParamMapper { cursor: 0 };
+        let model = NativeAutoGazeModel::<B>::new(&config, &device).map(&mut mapper);
+        let values = (0..(2 * 3 * 16 * 16))
+            .map(|idx| ((idx % 251) as f32 / 125.0) - 1.0)
+            .collect::<Vec<_>>();
+        let video = Tensor::<B, 5>::from_data(TensorData::new(values, [1, 2, 3, 16, 16]), &device);
+
+        let cached = model.gazing_model.generate_cached(video.clone(), 4, None);
+        let mut cache = AutoGazeStreamingCache::new(2);
+        let streaming =
+            model
+                .gazing_model
+                .generate_streaming_cached(video.clone(), &mut cache, 4, None);
+
+        assert_eq!(streaming.gazing_pos, cached.gazing_pos);
+        assert_eq!(
+            streaming.num_gazing_each_frame,
+            cached.num_gazing_each_frame
+        );
+        assert_eq!(streaming.if_padded_gazing, cached.if_padded_gazing);
+        assert_eq!(streaming.confidences[0].len(), cached.confidences[0].len());
+        for (left, right) in streaming.confidences[0].iter().zip(&cached.confidences[0]) {
+            assert!((left - right).abs() < 1.0e-5);
+        }
+
+        let cached_traces = generated_to_traces(&cached, &config, 4);
+        let mut cache = AutoGazeStreamingCache::new(2);
+        for frame_idx in 0..2 {
+            let frame = video.clone().slice_dim(1, frame_idx..(frame_idx + 1));
+            let next = model
+                .gazing_model
+                .generate_streaming_cached(frame, &mut cache, 4, None);
+            let next_traces = generated_to_traces(&next, &config, 4);
+            assert_fixation_points_close(
+                &next_traces[0].frames[0].points,
+                &cached_traces[0].frames[frame_idx].points,
+                1.0e-5,
+            );
+            assert_eq!(
+                next_traces[0].frames[0].stop_probability,
+                cached_traces[0].frames[frame_idx].stop_probability
+            );
+        }
+    }
+
+    #[cfg(feature = "ndarray")]
+    #[test]
+    fn low_level_embed_video_prepares_non_model_sized_inputs_without_panic() {
+        type B = burn::backend::NdArray<f32>;
+        let device = Default::default();
+        let config = tiny_cache_test_config();
+        let model = AutoGazeGazingModel::<B>::new(&config.gaze_model_config, &device);
+        let video = Tensor::<B, 5>::zeros([1, 1, 1, 16, 8], &device);
+
+        let (embeddings, _past) = model.embed_video(video, false, None);
+        let [batch, frames, tokens, dim] = embeddings.shape().dims::<4>();
+
+        assert_eq!(batch, 1);
+        assert_eq!(frames, 1);
+        assert_eq!(tokens, config.gaze_model_config.connector_config.num_tokens);
+        assert_eq!(dim, config.gaze_model_config.connector_config.hidden_dim);
+    }
+
+    #[cfg(feature = "ndarray")]
+    fn assert_fixation_points_close(left: &[FixationPoint], right: &[FixationPoint], epsilon: f32) {
+        assert_eq!(left.len(), right.len());
+        for (left, right) in left.iter().zip(right) {
+            assert!((left.x - right.x).abs() <= epsilon);
+            assert!((left.y - right.y).abs() <= epsilon);
+            assert!((left.scale - right.scale).abs() <= epsilon);
+            assert!((left.confidence - right.confidence).abs() <= epsilon);
+            assert!((left.width - right.width).abs() <= epsilon);
+            assert!((left.height - right.height).abs() <= epsilon);
+            assert_eq!(left.grid, right.grid);
+        }
+    }
+
+    #[cfg(feature = "ndarray")]
     fn tiny_cache_test_config() -> AutoGazeConfig {
         let hidden = 8;
         let heads = 2;
@@ -3030,5 +3943,54 @@ mod tests {
             .map(|point| point.cell_grid())
             .collect::<Vec<_>>();
         assert_eq!(grids, vec![Some(2), Some(4), Some(7), Some(14)]);
+
+        let traces = generated_to_traces(&generated, &config, 1);
+        let grids = traces[0].frames[0]
+            .points
+            .iter()
+            .filter(|point| point.confidence > 0.0)
+            .map(|point| point.cell_grid())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            grids,
+            vec![Some(2), Some(4), Some(7), Some(14)],
+            "generated output conversion must preserve all real tokens even when the display lower-bound is smaller"
+        );
+    }
+
+    #[test]
+    fn generated_scale_token_masks_match_upstream_per_scale_layout() {
+        let mut config = AutoGazeConfig {
+            scales: "32+64+112+224".to_string(),
+            num_vision_tokens_each_frame: 265,
+            ..Default::default()
+        };
+        config.gaze_model_config.num_vision_tokens_each_frame = 265;
+        let generated = AutoGazeGenerateOutput {
+            gazing_pos: vec![vec![0, 4, 20, 69, 1 + 265, 5 + 265]],
+            num_gazing_each_frame: vec![4, 2],
+            if_padded_gazing: vec![vec![false, false, false, false, false, true]],
+            confidences: vec![vec![0.9, 0.8, 0.7, 0.6, 0.5, 0.0]],
+        };
+
+        let masks = generated.scale_token_masks(&config);
+
+        assert_eq!(masks.len(), 1);
+        assert_eq!(
+            masks[0]
+                .iter()
+                .map(|mask| (mask.grid, mask.token_count))
+                .collect::<Vec<_>>(),
+            vec![(2, 4), (4, 16), (7, 49), (14, 196)]
+        );
+        assert!(masks[0][0].frames[0][0]);
+        assert!(masks[0][1].frames[0][0]);
+        assert!(masks[0][2].frames[0][0]);
+        assert!(masks[0][3].frames[0][0]);
+        assert!(masks[0][0].frames[1][1]);
+        assert!(
+            !masks[0][1].frames[1][1],
+            "padded gaze tokens must not set scale masks"
+        );
     }
 }

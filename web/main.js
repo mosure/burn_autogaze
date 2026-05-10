@@ -34,6 +34,7 @@ let frameQueue = [];
 let lastInferenceAt = 0;
 let smoothedFps = 0;
 let smoothedGazeRatio = 0;
+let smoothedPsnr = 0;
 
 configUrl.value = DEFAULT_CONFIG;
 weightsUrl.value = DEFAULT_WEIGHTS;
@@ -111,6 +112,7 @@ async function toggleCamera() {
     lastInferenceAt = 0;
     smoothedFps = 0;
     smoothedGazeRatio = 0;
+    smoothedPsnr = 0;
     running = true;
     startCamera.textContent = "Stop";
     setStatus("camera running");
@@ -188,8 +190,15 @@ function runInference(width, height, frames) {
       smoothedGazeRatio = smoothedGazeRatio
         ? smoothedGazeRatio * 0.85 + gazeRatio * 0.15
         : gazeRatio;
+      const psnrText = output.psnr_text();
+      if (Number.isFinite(output.psnr_db)) {
+        smoothedPsnr = smoothedPsnr
+          ? smoothedPsnr * 0.85 + output.psnr_db * 0.15
+          : output.psnr_db;
+      }
       lastInferenceAt = now;
-      stats.textContent = `${width}x${height} ${output.mode}, ${output.visualization_mode}, ${output.tile_count} tile(s), ${elapsed.toFixed(1)} ms, ${smoothedFps.toFixed(1)} fps, gaze ${gazeRatio.toFixed(1)}% ema ${smoothedGazeRatio.toFixed(1)}%`;
+      const psnrEma = smoothedPsnr ? smoothedPsnr.toFixed(1) : psnrText;
+      stats.textContent = `${width}x${height} ${output.mode}, ${output.visualization_mode}, ${output.tile_count} tile(s), ${elapsed.toFixed(1)} ms, ${smoothedFps.toFixed(1)} fps, gaze ${gazeRatio.toFixed(1)}% ema ${smoothedGazeRatio.toFixed(1)}%, psnr ${psnrText} dB ema ${psnrEma}`;
       output.free();
     } catch (error) {
       console.error(error);

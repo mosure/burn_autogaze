@@ -1,6 +1,7 @@
+use bevy::app::AppExit;
 #[cfg(not(target_arch = "wasm32"))]
 use bevy_burn_autogaze::{
-    BevyAutoGazeMode, DEFAULT_TILED_INFERENCE_WIDTH, default_frames_per_clip,
+    BevyAutoGazeMode, BevyDisplayTransfer, DEFAULT_TILED_INFERENCE_WIDTH, default_frames_per_clip,
     default_inference_dimensions, default_max_gaze_tokens_each_frame, default_tile_batch_size,
     default_top_k,
 };
@@ -92,6 +93,35 @@ impl From<NativeVisualizationMode> for AutoGazeVisualizationMode {
         match mode {
             NativeVisualizationMode::FullBlend => Self::FullBlend,
             NativeVisualizationMode::Interframe => Self::Interframe,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum NativeDisplayTransfer {
+    #[value(
+        name = "gpu",
+        alias = "device",
+        alias = "interop",
+        help = "Render Burn tensor output directly into the Bevy texture with GPU interop."
+    )]
+    Gpu,
+    #[value(
+        name = "cpu",
+        alias = "host",
+        alias = "rgba",
+        help = "Read visualization output through CPU RGBA and upload it as a Bevy image."
+    )]
+    Cpu,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<NativeDisplayTransfer> for BevyDisplayTransfer {
+    fn from(transfer: NativeDisplayTransfer) -> Self {
+        match transfer {
+            NativeDisplayTransfer::Gpu => Self::Gpu,
+            NativeDisplayTransfer::Cpu => Self::Cpu,
         }
     }
 }
@@ -198,8 +228,8 @@ struct NativeArgs {
     #[arg(
         long,
         value_name = "COUNT",
-        value_parser = parse_nonzero_usize,
-        help = "Number of highest-scoring gaze tokens to visualize per trace. Defaults to 24 in realtime and 2 per tile in tiled mode."
+        value_parser = parse_usize,
+        help = "Trace-slot lower bound. The recovered mask keeps all generated non-padded tokens; pass a larger value to force more trace slots."
     )]
     top_k: Option<usize>,
 
@@ -207,7 +237,7 @@ struct NativeArgs {
         long,
         value_name = "COUNT",
         value_parser = parse_usize,
-        help = "Model-side generated-token cap. Defaults to 0, which uses the model's configured inference budget."
+        help = "Model-side generated-token cap. Defaults to model budget in realtime and 24 per tile in tiled mode; pass 0 to use the model's configured inference budget."
     )]
     max_gaze_tokens_each_frame: Option<usize>,
 
@@ -237,9 +267,18 @@ struct NativeArgs {
         long,
         value_name = "COUNT",
         value_parser = parse_nonzero_usize,
-        help = "Number of input frames buffered per AutoGaze clip. Defaults to 2; use 16 to match the upstream long-context setting."
+        help = "Decoder context horizon in frames. Defaults to 2. Realtime mode advances this as a streaming KV cache by default; larger values increase WebGPU attention memory."
     )]
     frames_per_clip: Option<usize>,
+
+    #[arg(
+        long,
+        value_name = "COUNT",
+        value_parser = parse_nonzero_usize,
+        default_value_t = bevy_burn_autogaze::DEFAULT_MAX_IN_FLIGHT,
+        help = "Maximum concurrent inference tasks. Defaults to 1 so busy camera frames are dropped instead of queued."
+    )]
+    max_in_flight: usize,
 
     #[arg(
         long,
@@ -297,6 +336,50 @@ struct NativeArgs {
 
     #[arg(
         long,
+        value_enum,
+        default_value_t = NativeDisplayTransfer::Cpu,
+        help = "Display transfer path. cpu is the current fastest app path; gpu exercises Bevy/Burn shared-device texture interop."
+    )]
+    display_transfer: NativeDisplayTransfer,
+
+    #[arg(
+        long,
+        alias = "sparse-update-max-rects",
+        value_name = "COUNT",
+        value_parser = parse_usize,
+        default_value_t = bevy_burn_autogaze::DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RECTS,
+        help = "Maximum rect count for tensor-side sparse interframe updates. Use 0 to force dense tensor updates."
+    )]
+    tensor_sparse_update_max_rects: usize,
+
+    #[arg(
+        long,
+        alias = "sparse-update-max-ratio",
+        value_name = "0..1",
+        value_parser = parse_ratio_f64,
+        default_value_t = bevy_burn_autogaze::DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RATIO,
+        help = "Maximum selected-pixel ratio eligible for tensor-side sparse interframe updates."
+    )]
+    tensor_sparse_update_max_ratio: f64,
+
+    #[arg(
+        long,
+        default_value_t = true,
+        action = ArgAction::Set,
+        help = "Use a streaming decoder KV cache for realtime mode so each inference advances only the newest frame."
+    )]
+    streaming_cache: bool,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        action = ArgAction::Set,
+        help = "Exit with an error if Bevy selects a CPU/software render adapter. Use this for trustworthy native perf runs."
+    )]
+    require_hardware_adapter: bool,
+
+    #[arg(
+        long,
         default_value_t = false,
         action = ArgAction::SetTrue,
         help = "Log source capture, resize/prep, pack, input upload/preprocess, model, visualization, display, and total timing periodically."
@@ -310,6 +393,14 @@ struct NativeArgs {
         help = "Process COUNT inference outputs, print a JSON perf summary, then exit."
     )]
     perf_summary_frames: Option<usize>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "perf_summary_frames",
+        help = "Write the perf summary JSON to PATH in addition to logging it."
+    )]
+    perf_summary_path: Option<std::path::PathBuf>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -334,7 +425,7 @@ impl From<NativeArgs> for BevyBurnAutoGazeConfig {
             args.task_loss_requirement,
             args.disable_task_loss_requirement,
         );
-        Self {
+        BevyBurnAutoGazeConfig {
             press_esc_to_close: args.press_esc_to_close,
             show_fps: args.show_fps,
             show_gaze_ratio: args.show_gaze_ratio,
@@ -349,16 +440,24 @@ impl From<NativeArgs> for BevyBurnAutoGazeConfig {
             task_loss_requirement,
             disable_task_loss_requirement,
             frames_per_clip,
+            max_in_flight: args.max_in_flight,
             inference_width,
             inference_height: inference_height.or(defaults.inference_height),
             mask_cell_scale: args.mask_cell_scale,
             blend_alpha: args.blend_alpha,
             visualization_mode,
             keyframe_duration: args.keyframe_duration,
+            display_transfer: args.display_transfer.into(),
+            tensor_sparse_update_max_rects: args.tensor_sparse_update_max_rects,
+            tensor_sparse_update_max_ratio: args.tensor_sparse_update_max_ratio,
+            streaming_cache: args.streaming_cache,
+            require_hardware_adapter: args.require_hardware_adapter,
             log_pipeline_timing: args.log_pipeline_timing,
             perf_summary_frames: args.perf_summary_frames,
+            perf_summary_path: args.perf_summary_path,
             ..defaults
         }
+        .sanitized()
     }
 }
 
@@ -446,7 +545,18 @@ fn parse_alpha(value: &str) -> Result<f32, String> {
     Ok(parsed)
 }
 
-fn main() {
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_ratio_f64(value: &str) -> Result<f64, String> {
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|_| format!("expected a value in 0..1, got `{value}`"))?;
+    if !parsed.is_finite() || !(0.0..=1.0).contains(&parsed) {
+        return Err("expected a finite value in 0..1".to_string());
+    }
+    Ok(parsed)
+}
+
+fn main() -> AppExit {
     let config = runtime_config();
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -459,7 +569,7 @@ fn main() {
         }
     }
 
-    run_app(config);
+    run_app(config)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -520,9 +630,15 @@ fn runtime_config() -> BevyBurnAutoGazeConfig {
 mod tests {
     use super::*;
     use bevy_burn_autogaze::{
-        DEFAULT_MODEL_GENERATION_BUDGET, DEFAULT_REALTIME_INFERENCE_WIDTH,
-        DEFAULT_TILED_INFERENCE_WIDTH, DEFAULT_TILED_TILE_BATCH_SIZE, DEFAULT_TILED_TOP_K,
+        DEFAULT_REALTIME_INFERENCE_WIDTH, DEFAULT_TILED_INFERENCE_WIDTH,
+        DEFAULT_TILED_MAX_GAZE_TOKENS, DEFAULT_TILED_TILE_BATCH_SIZE, DEFAULT_TILED_TOP_K,
     };
+    use clap::CommandFactory;
+
+    #[test]
+    fn native_cli_definition_is_valid() {
+        NativeArgs::command().debug_assert();
+    }
 
     #[test]
     fn native_cli_defaults_to_realtime_640_width_without_forcing_height() {
@@ -558,14 +674,23 @@ mod tests {
             task_loss_requirement: None,
             disable_task_loss_requirement: false,
             frames_per_clip: None,
+            max_in_flight: bevy_burn_autogaze::DEFAULT_MAX_IN_FLIGHT,
             inference_width: None,
             inference_height: None,
             mask_cell_scale: 1.0,
             blend_alpha: bevy_burn_autogaze::DEFAULT_BLEND_ALPHA,
             visualization_mode: NativeVisualizationMode::Interframe,
             keyframe_duration: bevy_burn_autogaze::DEFAULT_KEYFRAME_DURATION,
+            display_transfer: NativeDisplayTransfer::Cpu,
+            tensor_sparse_update_max_rects:
+                bevy_burn_autogaze::DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RECTS,
+            tensor_sparse_update_max_ratio:
+                bevy_burn_autogaze::DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RATIO,
+            streaming_cache: true,
+            require_hardware_adapter: false,
             log_pipeline_timing: false,
             perf_summary_frames: None,
+            perf_summary_path: None,
         };
         let config = BevyBurnAutoGazeConfig::from(args);
 
@@ -573,15 +698,27 @@ mod tests {
         assert_eq!(config.top_k, DEFAULT_TILED_TOP_K);
         assert_eq!(
             config.max_gaze_tokens_each_frame,
-            DEFAULT_MODEL_GENERATION_BUDGET
+            DEFAULT_TILED_MAX_GAZE_TOKENS
         );
         assert_eq!(config.tile_batch_size, DEFAULT_TILED_TILE_BATCH_SIZE);
         assert_eq!(
             config.frames_per_clip,
             bevy_burn_autogaze::DEFAULT_TILED_FRAMES_PER_CLIP
         );
+        assert_eq!(
+            config.max_in_flight,
+            bevy_burn_autogaze::DEFAULT_MAX_IN_FLIGHT
+        );
         assert_eq!(config.inference_width, Some(DEFAULT_TILED_INFERENCE_WIDTH));
         assert_eq!(config.inference_height, None);
+        assert_eq!(
+            config.tensor_sparse_update_max_rects,
+            bevy_burn_autogaze::DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RECTS
+        );
+        assert_eq!(
+            config.tensor_sparse_update_max_ratio,
+            bevy_burn_autogaze::DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RATIO
+        );
     }
 
     #[test]
@@ -606,5 +743,37 @@ mod tests {
             task_loss_config(Some(TaskLossRequirementArg::Value(0.7)), false),
             (Some(0.7), false)
         );
+    }
+
+    #[test]
+    fn native_cli_accepts_hardware_adapter_requirement_flag() {
+        let args =
+            NativeArgs::parse_from(["bevy_burn_autogaze", "--require-hardware-adapter=true"]);
+        assert!(args.require_hardware_adapter);
+        let config = BevyBurnAutoGazeConfig::from(args);
+        assert!(config.require_hardware_adapter);
+    }
+
+    #[test]
+    fn native_cli_exposes_in_flight_admission_limit() {
+        let args = NativeArgs::parse_from(["bevy_burn_autogaze", "--max-in-flight", "2"]);
+        let config = BevyBurnAutoGazeConfig::from(args);
+
+        assert_eq!(config.max_in_flight, 2);
+    }
+
+    #[test]
+    fn native_cli_exposes_tensor_sparse_update_policy() {
+        let args = NativeArgs::parse_from([
+            "bevy_burn_autogaze",
+            "--tensor-sparse-update-max-rects",
+            "8",
+            "--tensor-sparse-update-max-ratio",
+            "0.05",
+        ]);
+        let config = BevyBurnAutoGazeConfig::from(args);
+
+        assert_eq!(config.tensor_sparse_update_max_rects, 8);
+        assert_eq!(config.tensor_sparse_update_max_ratio, 0.05);
     }
 }

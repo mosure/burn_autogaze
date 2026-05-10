@@ -3,8 +3,12 @@ use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, TensorData};
 use burn_autogaze::{
     AutoGazeConfig, AutoGazeInferenceMode, AutoGazePipeline, AutoGazeRgbaClipShape,
+    AutoGazeStreamingCache, AutoGazeTensorVisualizationOptions, AutoGazeTensorVisualizationState,
     AutoGazeVisualizationMode, AutoGazeVisualizationState, ConnectorConfig, FixationPoint,
-    GazeDecoderConfig, GazeModelConfig, NativeAutoGazeModel, VisionModelConfig,
+    GazeDecoderConfig, GazeModelConfig, NativeAutoGazeModel, SparseReadoutGrid,
+    SparseReadoutOptions, SparseVideoReadoutGrid, SparseVideoReadoutOptions, VisionModelConfig,
+    fixation_points_to_readout_tokens, frame_readout_tokens_to_video_coords,
+    video_readout_coords_to_tensor,
 };
 use criterion::{
     BatchSize, BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
@@ -52,6 +56,55 @@ struct VisualizationCase {
     name: &'static str,
     mode: AutoGazeVisualizationMode,
     force_delta_frame: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TensorVisualizationLayout {
+    SideBySide,
+    Panels,
+}
+
+impl TensorVisualizationLayout {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::SideBySide => "side-by-side",
+            Self::Panels => "panels",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TensorFixationCase {
+    ModelDefault,
+    TinySparse,
+    CoarseDense,
+}
+
+impl TensorFixationCase {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::ModelDefault => "model-fixations",
+            Self::TinySparse => "tiny-sparse",
+            Self::CoarseDense => "coarse-dense",
+        }
+    }
+
+    fn points(self, model: ModelCase) -> Vec<FixationPoint> {
+        match self {
+            Self::ModelDefault => deterministic_fixations(model),
+            Self::TinySparse => vec![FixationPoint::with_grid_extent(
+                0.5 / 64.0,
+                0.5 / 64.0,
+                1.0 / 64.0,
+                1.0 / 64.0,
+                1.0,
+                64,
+            )],
+            Self::CoarseDense => vec![FixationPoint::with_grid_extent(
+                0.25, 0.25, 0.5, 0.5, 1.0, 2,
+            )],
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -153,6 +206,15 @@ const VISUALIZATION_CASES: &[VisualizationCase] = &[
         force_delta_frame: true,
     },
 ];
+const TENSOR_VISUALIZATION_LAYOUTS: &[TensorVisualizationLayout] = &[
+    TensorVisualizationLayout::SideBySide,
+    TensorVisualizationLayout::Panels,
+];
+const TENSOR_FIXATION_CASES: &[TensorFixationCase] = &[
+    TensorFixationCase::ModelDefault,
+    TensorFixationCase::TinySparse,
+    TensorFixationCase::CoarseDense,
+];
 const MODEL_INPUT_SIZE: usize = 224;
 const PATCH_SIZE: usize = 16;
 const MODEL_GRID: usize = MODEL_INPUT_SIZE / PATCH_SIZE;
@@ -190,6 +252,27 @@ const REAL_TILE_VIDEO_CASES: &[TileVideoCase] = &[
 ];
 const REAL_CACHE_CASES: &[CacheCase] = &[
     CacheCase {
+        name: "realtime-640x360-2f-max10",
+        width: 640,
+        height: 360,
+        frames: 2,
+        max_tokens: 10,
+    },
+    CacheCase {
+        name: "720p-2f-max2",
+        width: 1280,
+        height: 720,
+        frames: 2,
+        max_tokens: 2,
+    },
+    CacheCase {
+        name: "1080p-2f-max2",
+        width: 1920,
+        height: 1080,
+        frames: 2,
+        max_tokens: 2,
+    },
+    CacheCase {
         name: "720p-2f-max10",
         width: 1280,
         height: 720,
@@ -216,6 +299,20 @@ const REAL_CACHE_CASES: &[CacheCase] = &[
         height: 1080,
         frames: 2,
         max_tokens: 24,
+    },
+    CacheCase {
+        name: "720p-16f-max2",
+        width: 1280,
+        height: 720,
+        frames: 16,
+        max_tokens: 2,
+    },
+    CacheCase {
+        name: "1080p-16f-max2",
+        width: 1920,
+        height: 1080,
+        frames: 16,
+        max_tokens: 2,
     },
     CacheCase {
         name: "720p-16f-max10",
@@ -453,6 +550,74 @@ fn bench_visualization(c: &mut Criterion) {
                 bench_visualization_case(&mut group, case, model, visualization);
             }
         }
+    }
+
+    group.finish();
+}
+
+fn bench_tensor_visualization(c: &mut Criterion) {
+    let mut group = c.benchmark_group("autogaze_tensor_visualization");
+    group.sample_size(10);
+
+    #[cfg(feature = "ndarray")]
+    {
+        register_tensor_visualization::<burn::backend::NdArray<f32>>(
+            &mut group,
+            "ndarray",
+            Default::default(),
+        );
+    }
+
+    #[cfg(feature = "webgpu")]
+    if let Some(device) = webgpu_device() {
+        register_tensor_visualization::<burn::backend::WebGpu<f32, i32>>(
+            &mut group, "webgpu", device,
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    {
+        register_tensor_visualization::<burn::backend::Cuda<f32, i32>>(
+            &mut group,
+            "cuda",
+            burn::backend::cuda::CudaDevice::default(),
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_sparse_readout_adapter(c: &mut Criterion) {
+    let mut group = c.benchmark_group("autogaze_sparse_readout_adapter");
+    group.sample_size(50);
+
+    for &model in MODEL_CASES {
+        bench_sparse_readout_host_case(&mut group, model);
+    }
+
+    #[cfg(feature = "ndarray")]
+    {
+        register_sparse_readout_coord_tensor::<burn::backend::NdArray<f32>>(
+            &mut group,
+            "ndarray",
+            Default::default(),
+        );
+    }
+
+    #[cfg(feature = "webgpu")]
+    if let Some(device) = webgpu_device() {
+        register_sparse_readout_coord_tensor::<burn::backend::WebGpu<f32, i32>>(
+            &mut group, "webgpu", device,
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    {
+        register_sparse_readout_coord_tensor::<burn::backend::Cuda<f32, i32>>(
+            &mut group,
+            "cuda",
+            burn::backend::cuda::CudaDevice::default(),
+        );
     }
 
     group.finish();
@@ -851,6 +1016,13 @@ fn register_real_tile_batch_size<B>(
     };
 
     for &case in REAL_TILE_VIDEO_CASES {
+        if should_skip_long_context_case(backend, case.frames) {
+            eprintln!(
+                "skipping {backend} real tile stress case {}; set AUTOGAZE_BENCH_LONG_CONTEXT=1 to include it",
+                case.name
+            );
+            continue;
+        }
         for &(top_k, tile_batch_size) in REAL_TILE_BATCH_CASES {
             let pipeline = model
                 .clone()
@@ -902,6 +1074,13 @@ fn register_real_kv_cache<B>(
     };
 
     for &case in REAL_CACHE_CASES {
+        if should_skip_long_context_case(backend, case.frames) {
+            eprintln!(
+                "skipping {backend} real KV stress case {}; set AUTOGAZE_BENCH_LONG_CONTEXT=1 to include it",
+                case.name
+            );
+            continue;
+        }
         let video = deterministic_video::<B>(
             BATCH,
             case.frames,
@@ -910,7 +1089,40 @@ fn register_real_kv_cache<B>(
             case.width,
             &device,
         );
+        let stream_frames = (0..case.frames)
+            .map(|frame_idx| video.clone().slice_dim(1, frame_idx..(frame_idx + 1)))
+            .collect::<Vec<_>>();
         group.throughput(Throughput::Elements(case.frames_per_batch()));
+
+        group.bench_with_input(
+            BenchmarkId::new(
+                format!("{backend}/streaming-cache/max-{}", case.max_tokens),
+                case.name,
+            ),
+            &case,
+            |b, _| {
+                b.iter_batched(
+                    || {
+                        (
+                            stream_frames.clone(),
+                            AutoGazeStreamingCache::new(case.frames),
+                        )
+                    },
+                    |(stream_frames, mut cache)| {
+                        for frame in stream_frames {
+                            black_box(model.gazing_model.generate_streaming_cached(
+                                frame,
+                                &mut cache,
+                                case.max_tokens,
+                                None,
+                            ));
+                        }
+                        B::sync(&device).expect("backend sync");
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
 
         group.bench_with_input(
             BenchmarkId::new(
@@ -1202,6 +1414,236 @@ fn bench_visualization_case(
                     black_box(output.updated_pixel_count);
                     black_box(output.update_ratio());
                     black_box(output.side_by_side_rgba.len());
+                },
+                BatchSize::SmallInput,
+            );
+        },
+    );
+}
+
+fn bench_sparse_readout_host_case(group: &mut BenchmarkGroup<'_, WallTime>, model: ModelCase) {
+    let points = deterministic_fixations(model);
+    let image_grid = SparseReadoutGrid::new(64, 64);
+    let video_grid = SparseVideoReadoutGrid::new(FRAMES, 64, 64);
+    let readout_options = SparseReadoutOptions::default().with_max_tokens_per_frame(512);
+    let video_options = SparseVideoReadoutOptions::default()
+        .with_tubelet_size(1)
+        .with_exact_tokens(1024);
+    group.throughput(Throughput::Elements(
+        video_options.max_tokens.unwrap_or(0) as u64
+    ));
+    group.bench_function(
+        BenchmarkId::new("host/readout-to-coords", model.name),
+        |b| {
+            b.iter(|| {
+                let frame_tokens = (0..FRAMES)
+                    .map(|_| {
+                        fixation_points_to_readout_tokens(
+                            black_box(&points),
+                            image_grid,
+                            readout_options,
+                        )
+                        .expect("frame readout tokens")
+                    })
+                    .collect::<Vec<_>>();
+                let coords = frame_readout_tokens_to_video_coords(
+                    black_box(&frame_tokens),
+                    image_grid,
+                    video_grid,
+                    video_options,
+                    0,
+                )
+                .expect("video readout coords");
+                black_box(coords);
+            });
+        },
+    );
+}
+
+fn register_sparse_readout_coord_tensor<B>(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    backend: &str,
+    device: B::Device,
+) where
+    B: Backend,
+    B::Device: Clone,
+{
+    for &model in MODEL_CASES {
+        let points = deterministic_fixations(model);
+        let image_grid = SparseReadoutGrid::new(64, 64);
+        let video_grid = SparseVideoReadoutGrid::new(FRAMES, 64, 64);
+        let frame_tokens = (0..FRAMES)
+            .map(|_| {
+                fixation_points_to_readout_tokens(
+                    &points,
+                    image_grid,
+                    SparseReadoutOptions::default().with_max_tokens_per_frame(512),
+                )
+                .expect("frame readout tokens")
+            })
+            .collect::<Vec<_>>();
+        let coords = frame_readout_tokens_to_video_coords(
+            &frame_tokens,
+            image_grid,
+            video_grid,
+            SparseVideoReadoutOptions::default()
+                .with_tubelet_size(1)
+                .with_exact_tokens(1024),
+            0,
+        )
+        .expect("video readout coords");
+        group.throughput(Throughput::Elements(coords.len() as u64));
+        group.bench_function(
+            BenchmarkId::new(format!("{backend}/coord-tensor"), model.name),
+            |b| {
+                b.iter(|| {
+                    let tensor = video_readout_coords_to_tensor::<B>(black_box(&coords), &device);
+                    black_box(tensor);
+                    B::sync(&device).expect("backend sync");
+                });
+            },
+        );
+    }
+}
+
+fn register_tensor_visualization<B>(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    backend: &str,
+    device: B::Device,
+) where
+    B: Backend,
+    B::Device: Clone,
+{
+    for &case in VIDEO_CASES {
+        group.throughput(Throughput::Elements((case.width * case.height) as u64));
+        for &model in MODEL_CASES {
+            for &visualization in VISUALIZATION_CASES {
+                for &fixations in TENSOR_FIXATION_CASES {
+                    for &layout in TENSOR_VISUALIZATION_LAYOUTS {
+                        bench_tensor_visualization_case::<B>(
+                            group,
+                            backend,
+                            TensorVisualizationBenchCase {
+                                video: case,
+                                model,
+                                visualization,
+                                fixations,
+                                layout,
+                            },
+                            device.clone(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TensorVisualizationBenchCase {
+    video: VideoCase,
+    model: ModelCase,
+    visualization: VisualizationCase,
+    fixations: TensorFixationCase,
+    layout: TensorVisualizationLayout,
+}
+
+fn bench_tensor_visualization_case<B>(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    backend: &str,
+    case: TensorVisualizationBenchCase,
+    device: B::Device,
+) where
+    B: Backend,
+    B::Device: Clone,
+{
+    let current =
+        deterministic_video::<B>(1, 1, CHANNELS, case.video.height, case.video.width, &device);
+    let previous =
+        deterministic_video::<B>(1, 1, CHANNELS, case.video.height, case.video.width, &device);
+    let points = case.fixations.points(case.model);
+    group.bench_with_input(
+        BenchmarkId::new(
+            format!(
+                "{backend}/{}/{}/{}/{}",
+                case.model.name,
+                case.visualization.name,
+                case.fixations.name(),
+                case.layout.name()
+            ),
+            case.video.name,
+        ),
+        &case.video,
+        |b, _| {
+            b.iter_batched(
+                || {
+                    let mut state = AutoGazeTensorVisualizationState::<B>::new(
+                        case.visualization.mode,
+                        if case.visualization.force_delta_frame {
+                            usize::MAX
+                        } else {
+                            KEYFRAME_DURATION
+                        },
+                    );
+                    if case.visualization.force_delta_frame {
+                        let _ = state
+                            .visualize_normalized_rgb_clip(
+                                previous.clone(),
+                                &points,
+                                AutoGazeTensorVisualizationOptions::new(
+                                    case.video.width,
+                                    case.video.height,
+                                    1.0,
+                                    BLEND_ALPHA,
+                                ),
+                                &device,
+                            )
+                            .expect("prime tensor interframe visualization state");
+                    }
+                    state
+                },
+                |mut state| {
+                    match case.layout {
+                        TensorVisualizationLayout::SideBySide => {
+                            let output = state
+                                .visualize_normalized_rgb_clip(
+                                    current.clone(),
+                                    &points,
+                                    AutoGazeTensorVisualizationOptions::new(
+                                        case.video.width,
+                                        case.video.height,
+                                        1.0,
+                                        BLEND_ALPHA,
+                                    ),
+                                    &device,
+                                )
+                                .expect("visualize tensor autogaze mask");
+                            black_box(output.mask_ratio());
+                            black_box(output.update_ratio());
+                            black_box(state.last_interframe_path().map(|path| path.as_str()));
+                            black_box(output.side_by_side_rgba.shape());
+                        }
+                        TensorVisualizationLayout::Panels => {
+                            let output = state
+                                .visualize_normalized_rgb_clip_panels(
+                                    current.clone(),
+                                    &points,
+                                    AutoGazeTensorVisualizationOptions::new(
+                                        case.video.width,
+                                        case.video.height,
+                                        1.0,
+                                        BLEND_ALPHA,
+                                    ),
+                                    &device,
+                                )
+                                .expect("visualize tensor autogaze panel mask");
+                            black_box(output.mask_ratio());
+                            black_box(output.update_ratio());
+                            black_box(state.last_interframe_path().map(|path| path.as_str()));
+                            black_box(output.output_rgba.shape());
+                        }
+                    }
+                    B::sync(&device).expect("backend sync");
                 },
                 BatchSize::SmallInput,
             );
@@ -1551,6 +1993,10 @@ fn real_video_path() -> Option<PathBuf> {
     default.exists().then_some(default)
 }
 
+fn should_skip_long_context_case(backend: &str, frames: usize) -> bool {
+    backend == "webgpu" && frames > 2 && env::var_os("AUTOGAZE_BENCH_LONG_CONTEXT").is_none()
+}
+
 fn decode_video_rgba(path: &Path, width: usize, height: usize, frames: usize) -> Option<Vec<u8>> {
     let expected = frames
         .checked_mul(width)?
@@ -1608,6 +2054,8 @@ criterion_group!(
     bench_real_video_file,
     bench_rgba_e2e_video,
     bench_visualization,
+    bench_tensor_visualization,
+    bench_sparse_readout_adapter,
     bench_tile_batch_size,
     bench_real_tile_batch_size,
     bench_real_kv_cache

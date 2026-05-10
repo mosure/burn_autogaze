@@ -1,5 +1,10 @@
 /target/
 /crates/bevy_burn_autogaze/target/
+/crates/bevy_burn_autogaze/node_modules/
+/crates/bevy_burn_autogaze/test-results/
+/crates/bevy_burn_autogaze/playwright-report/
 /crates/bevy_burn_autogaze/www/out/
 /web/bevy_wgpu_anchor/target/
 /web/pkg/
+__pycache__/
+*.pyc

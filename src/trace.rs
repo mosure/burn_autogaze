@@ -115,6 +115,20 @@ impl FixationSet {
         }
     }
 
+    pub fn with_min_len(
+        mut points: Vec<FixationPoint>,
+        stop_probability: f32,
+        min_len: usize,
+    ) -> Self {
+        while points.len() < min_len.max(1) {
+            points.push(FixationPoint::new(0.5, 0.5, 0.25, 0.0));
+        }
+        Self {
+            points,
+            stop_probability: stop_probability.clamp(0.0, 1.0),
+        }
+    }
+
     pub fn top_point(&self) -> FixationPoint {
         self.points
             .first()

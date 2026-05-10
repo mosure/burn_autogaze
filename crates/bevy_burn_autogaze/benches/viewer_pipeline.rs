@@ -20,6 +20,41 @@ struct VisualizationCase {
     name: &'static str,
     mode: AutoGazeVisualizationMode,
     prime_interframe: bool,
+    split_panels: bool,
+}
+
+#[derive(Clone, Copy)]
+enum FixationCase {
+    Multiscale,
+    TinySparse,
+    CoarseDense,
+}
+
+impl FixationCase {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Multiscale => "multiscale",
+            Self::TinySparse => "tiny-sparse",
+            Self::CoarseDense => "coarse-dense",
+        }
+    }
+
+    fn points(self) -> Vec<FixationPoint> {
+        match self {
+            Self::Multiscale => multiscale_fixations(),
+            Self::TinySparse => vec![FixationPoint::with_grid_extent(
+                0.5 / 64.0,
+                0.5 / 64.0,
+                1.0 / 64.0,
+                1.0 / 64.0,
+                1.0,
+                64,
+            )],
+            Self::CoarseDense => vec![FixationPoint::with_grid_extent(
+                0.25, 0.25, 0.5, 0.5, 1.0, 2,
+            )],
+        }
+    }
 }
 
 const VIDEO_CASES: &[VideoCase] = &[
@@ -36,15 +71,34 @@ const VIDEO_CASES: &[VideoCase] = &[
 ];
 const VISUALIZATION_CASES: &[VisualizationCase] = &[
     VisualizationCase {
-        name: "full-blend",
+        name: "full-blend-side-by-side",
         mode: AutoGazeVisualizationMode::FullBlend,
         prime_interframe: false,
+        split_panels: false,
     },
     VisualizationCase {
-        name: "interframe-delta",
+        name: "interframe-delta-side-by-side",
         mode: AutoGazeVisualizationMode::Interframe,
         prime_interframe: true,
+        split_panels: false,
     },
+    VisualizationCase {
+        name: "full-blend-panels",
+        mode: AutoGazeVisualizationMode::FullBlend,
+        prime_interframe: false,
+        split_panels: true,
+    },
+    VisualizationCase {
+        name: "interframe-delta-panels",
+        mode: AutoGazeVisualizationMode::Interframe,
+        prime_interframe: true,
+        split_panels: true,
+    },
+];
+const FIXATION_CASES: &[FixationCase] = &[
+    FixationCase::Multiscale,
+    FixationCase::TinySparse,
+    FixationCase::CoarseDense,
 ];
 const BLEND_ALPHA: f32 = 0.72;
 const KEYFRAME_DURATION: usize = 30;
@@ -56,7 +110,9 @@ fn bench_viewer_pipeline(c: &mut Criterion) {
     for &case in VIDEO_CASES {
         group.throughput(Throughput::Bytes((case.width * case.height * 4 * 3) as u64));
         for &visualization in VISUALIZATION_CASES {
-            bench_viewer_case(&mut group, case, visualization);
+            for &fixations in FIXATION_CASES {
+                bench_viewer_case(&mut group, case, visualization, fixations);
+            }
         }
     }
 
@@ -67,12 +123,16 @@ fn bench_viewer_case(
     group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
     case: VideoCase,
     visualization: VisualizationCase,
+    fixations: FixationCase,
 ) {
     let current = deterministic_rgba_frame(case.height, case.width, 11);
     let previous = deterministic_rgba_frame(case.height, case.width, 7);
-    let points = multiscale_fixations();
+    let points = fixations.points();
     group.bench_with_input(
-        BenchmarkId::new(visualization.name, case.name),
+        BenchmarkId::new(
+            format!("{}/{}", visualization.name, fixations.name()),
+            case.name,
+        ),
         &case,
         |b, _| {
             b.iter_batched(
@@ -92,28 +152,69 @@ fn bench_viewer_case(
                             .expect("prime interframe state");
                     }
                     let mut images = Assets::<Image>::default();
-                    let handle = images.add(empty_side_by_side_image(case));
-                    (state, images, handle)
+                    let handles = if visualization.split_panels {
+                        BenchImages::Panels {
+                            input: images.add(empty_panel_image(case)),
+                            mask: images.add(empty_panel_image(case)),
+                            output: images.add(empty_panel_image(case)),
+                        }
+                    } else {
+                        BenchImages::SideBySide {
+                            handle: images.add(empty_side_by_side_image(case)),
+                        }
+                    };
+                    (state, images, handles)
                 },
-                |(mut state, mut images, handle)| {
-                    let output = state
-                        .visualize_rgba(
-                            &current,
-                            case.width,
-                            case.height,
-                            &points,
-                            1.0,
-                            BLEND_ALPHA,
-                        )
-                        .expect("visualize autogaze frame");
-                    write_side_by_side_image(
-                        &handle,
-                        &mut images,
-                        output.side_by_side_width as u32,
-                        output.height as u32,
-                        output.side_by_side_rgba,
-                    );
-                    black_box(images.get(&handle).and_then(|image| image.data.as_ref()));
+                |(mut state, mut images, handles)| match handles {
+                    BenchImages::SideBySide { handle } => {
+                        let output = state
+                            .visualize_rgba(
+                                &current,
+                                case.width,
+                                case.height,
+                                &points,
+                                1.0,
+                                BLEND_ALPHA,
+                            )
+                            .expect("visualize autogaze frame");
+                        write_side_by_side_image(
+                            &handle,
+                            &mut images,
+                            output.side_by_side_width as u32,
+                            output.height as u32,
+                            output.side_by_side_rgba,
+                        );
+                        black_box(images.get(&handle).and_then(|image| image.data.as_ref()));
+                    }
+                    BenchImages::Panels {
+                        input,
+                        mask,
+                        output,
+                    } => {
+                        let panels = state
+                            .visualize_rgba_panels(
+                                &current,
+                                case.width,
+                                case.height,
+                                &points,
+                                1.0,
+                                BLEND_ALPHA,
+                            )
+                            .expect("visualize autogaze panels");
+                        write_panel_images(
+                            PanelHandles {
+                                input: &input,
+                                mask: &mask,
+                                output: &output,
+                            },
+                            &mut images,
+                            case,
+                            current.clone(),
+                            panels.mask_rgba,
+                            panels.blend_rgba,
+                        );
+                        black_box(images.get(&output).and_then(|image| image.data.as_ref()));
+                    }
                 },
                 BatchSize::LargeInput,
             );
@@ -121,9 +222,34 @@ fn bench_viewer_case(
     );
 }
 
+enum BenchImages {
+    SideBySide {
+        handle: Handle<Image>,
+    },
+    Panels {
+        input: Handle<Image>,
+        mask: Handle<Image>,
+        output: Handle<Image>,
+    },
+}
+
+struct PanelHandles<'a> {
+    input: &'a Handle<Image>,
+    mask: &'a Handle<Image>,
+    output: &'a Handle<Image>,
+}
+
 fn empty_side_by_side_image(case: VideoCase) -> Image {
     let width = (case.width * 3) as u32;
     let height = case.height as u32;
+    empty_image(width, height)
+}
+
+fn empty_panel_image(case: VideoCase) -> Image {
+    empty_image(case.width as u32, case.height as u32)
+}
+
+fn empty_image(width: u32, height: u32) -> Image {
     let mut image = Image::new_fill(
         Extent3d {
             width,
@@ -137,6 +263,53 @@ fn empty_side_by_side_image(case: VideoCase) -> Image {
     );
     image.sampler = ImageSampler::nearest();
     image
+}
+
+fn write_panel_images(
+    handles: PanelHandles<'_>,
+    images: &mut Assets<Image>,
+    case: VideoCase,
+    input_rgba: Vec<u8>,
+    mask_rgba: Vec<u8>,
+    output_rgba: Vec<u8>,
+) {
+    let width = case.width as u32;
+    let height = case.height as u32;
+    write_panel_image(handles.input, images, width, height, input_rgba);
+    write_panel_image(handles.mask, images, width, height, mask_rgba);
+    write_panel_image(handles.output, images, width, height, output_rgba);
+}
+
+fn write_panel_image(
+    handle: &Handle<Image>,
+    images: &mut Assets<Image>,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+) {
+    if let Some(mut image) = images.get_mut(handle)
+        && image.width() == width
+        && image.height() == height
+        && image.texture_descriptor.format == TextureFormat::Rgba8UnormSrgb
+    {
+        image.data = Some(rgba);
+        image.sampler = ImageSampler::nearest();
+        return;
+    }
+
+    let mut image = Image::new(
+        Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        rgba,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    image.sampler = ImageSampler::nearest();
+    let _ = images.insert(handle.id(), image);
 }
 
 fn write_side_by_side_image(

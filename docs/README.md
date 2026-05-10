@@ -30,3 +30,8 @@ cargo run --example render_readme_assets --features webgpu --no-default-features
   --tile-batch-size 4 \
   --out-dir docs
 ```
+
+See [`sparse-readout-integration.md`](./sparse-readout-integration.md) for the
+AutoGaze geometry to downstream sparse-token boundary, and
+[`completion-audit.md`](./completion-audit.md) for validation coverage and
+remaining hardware/browser checks.

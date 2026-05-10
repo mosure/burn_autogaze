@@ -1,17 +1,21 @@
+use crate::model::generated_to_frame_points;
 use crate::{
-    AutoGazeConfig, AutoGazeGenerateOutput, AutoGazeLoadOptions, FixationPoint, FixationSet,
-    FrameFixationTrace, NativeAutoGazeModel,
+    AutoGazeConfig, AutoGazeGenerateOutput, AutoGazeLoadOptions, AutoGazeStreamingCache,
+    DEFAULT_TILED_TILE_BATCH_SIZE, FixationPoint, FixationSet, FrameFixationTrace,
+    NativeAutoGazeModel,
 };
 use anyhow::{Result, anyhow, ensure};
 use burn::tensor::backend::{Backend, ExecutionError};
 use burn::tensor::module::interpolate;
 use burn::tensor::ops::{InterpolateMode, InterpolateOptions, PadMode};
 use burn::tensor::{Tensor, TensorData};
+use image::{RgbaImage, imageops::FilterType};
 use std::path::Path;
 
 pub const AUTO_GAZE_IMAGE_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 pub const AUTO_GAZE_IMAGE_STD: [f32; 3] = [0.229, 0.224, 0.225];
 pub const AUTO_GAZE_RESCALE_FACTOR: f32 = 1.0 / 127.5;
+pub const AUTO_GAZE_PROCESSOR_SHORT_EDGE: usize = 224;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum AutoGazeInferenceMode {
@@ -44,7 +48,7 @@ impl AutoGazeInferenceMode {
         Self::TiledResizeToGrid { tile_size }
     }
 
-    fn normalized(self) -> Self {
+    pub fn normalized(self) -> Self {
         match self {
             Self::ResizeToModelInput => Self::ResizeToModelInput,
             Self::TiledResizeToGrid { tile_size } => Self::TiledResizeToGrid {
@@ -118,6 +122,30 @@ impl AutoGazeRgbaClipShape {
             width,
         }
     }
+}
+
+pub struct AutoGazePreparedRun<B: Backend> {
+    pub video: Tensor<B, 5>,
+    pub mode: AutoGazeInferenceMode,
+    pub frame_index: usize,
+    pub model_frames: usize,
+}
+
+pub struct AutoGazeTraceRunOutput {
+    pub traces: Vec<FrameFixationTrace>,
+    pub frame_index: usize,
+    pub model_frames: usize,
+}
+
+/// Selected fixation points from a prepared AutoGaze run.
+///
+/// This is the lower-allocation counterpart to `AutoGazeTraceRunOutput` for
+/// realtime consumers that only need the currently selected points. The shape is
+/// `[batch][frame][point]`.
+pub struct AutoGazeReadoutRunOutput {
+    pub points: Vec<Vec<Vec<FixationPoint>>>,
+    pub frame_index: usize,
+    pub model_frames: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -277,9 +305,311 @@ pub fn rgba_clip_to_tensor<B: Backend>(
     ))
 }
 
+pub fn rgba_clip_to_processor_tensor<B: Backend>(
+    rgba: &[u8],
+    shape: AutoGazeRgbaClipShape,
+    device: &B::Device,
+) -> Result<Tensor<B, 5>> {
+    let (target_height, target_width) =
+        processor_resize_dimensions(shape.height, shape.width, AUTO_GAZE_PROCESSOR_SHORT_EDGE);
+    if target_height == shape.height && target_width == shape.width {
+        return rgba_clip_to_tensor::<B>(rgba, shape, device);
+    }
+
+    let pixels_per_frame = shape
+        .width
+        .checked_mul(shape.height)
+        .ok_or_else(|| anyhow!("RGBA clip dimensions overflow"))?;
+    let bytes_per_frame = pixels_per_frame
+        .checked_mul(4)
+        .ok_or_else(|| anyhow!("RGBA frame byte length overflow"))?;
+    ensure!(
+        rgba.len() == bytes_per_frame * shape.clip_len,
+        "expected {} RGBA bytes for {} frame(s) at {}x{}, got {}",
+        bytes_per_frame * shape.clip_len,
+        shape.clip_len,
+        shape.width,
+        shape.height,
+        rgba.len()
+    );
+
+    let target_bytes_per_frame = target_width
+        .checked_mul(target_height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| anyhow!("resized RGBA frame byte length overflow"))?;
+    let mut resized_rgba = Vec::with_capacity(target_bytes_per_frame * shape.clip_len);
+    for frame in 0..shape.clip_len {
+        let start = frame * bytes_per_frame;
+        let end = start + bytes_per_frame;
+        let image = RgbaImage::from_raw(
+            shape.width as u32,
+            shape.height as u32,
+            rgba[start..end].to_vec(),
+        )
+        .ok_or_else(|| anyhow!("failed to build RGBA frame for AutoGaze preprocessing"))?;
+        let resized = image::imageops::resize(
+            &image,
+            target_width as u32,
+            target_height as u32,
+            FilterType::Triangle,
+        );
+        resized_rgba.extend_from_slice(resized.as_raw());
+    }
+
+    rgba_clip_to_tensor::<B>(
+        &resized_rgba,
+        AutoGazeRgbaClipShape::new(shape.clip_len, target_height, target_width),
+        device,
+    )
+}
+
+pub fn rgba_clip_to_inference_tensor<B: Backend>(
+    rgba: &[u8],
+    shape: AutoGazeRgbaClipShape,
+    mode: AutoGazeInferenceMode,
+    device: &B::Device,
+) -> Result<Tensor<B, 5>> {
+    match mode.normalized() {
+        AutoGazeInferenceMode::ResizeToModelInput => {
+            rgba_clip_to_processor_tensor::<B>(rgba, shape, device)
+        }
+        AutoGazeInferenceMode::TiledResizeToGrid { .. }
+        | AutoGazeInferenceMode::TiledFullResolution { .. } => {
+            rgba_clip_to_tensor::<B>(rgba, shape, device)
+        }
+    }
+}
+
+pub fn prepare_rgba_clip_for_trace<B: Backend>(
+    rgba: &[u8],
+    shape: AutoGazeRgbaClipShape,
+    mode: AutoGazeInferenceMode,
+    streaming_cache: bool,
+    device: &B::Device,
+) -> Result<AutoGazePreparedRun<B>> {
+    if streaming_cache {
+        let frame = last_rgba_frame(rgba, shape)?;
+        let shape = AutoGazeRgbaClipShape::new(1, shape.height, shape.width);
+        let video = rgba_clip_to_inference_tensor::<B>(frame, shape, mode, device)?;
+        return Ok(AutoGazePreparedRun {
+            video,
+            mode,
+            frame_index: 0,
+            model_frames: 1,
+        });
+    }
+
+    let video = rgba_clip_to_inference_tensor::<B>(rgba, shape, mode, device)?;
+    Ok(AutoGazePreparedRun {
+        video,
+        mode,
+        frame_index: shape.clip_len.saturating_sub(1),
+        model_frames: shape.clip_len,
+    })
+}
+
+pub fn last_rgba_frame(rgba: &[u8], shape: AutoGazeRgbaClipShape) -> Result<&[u8]> {
+    ensure!(
+        shape.width > 0 && shape.height > 0 && shape.clip_len > 0,
+        "RGBA clip dimensions must be nonzero"
+    );
+    let frame_bytes = shape
+        .width
+        .checked_mul(shape.height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| anyhow!("RGBA frame byte length overflow"))?;
+    let expected_len = frame_bytes
+        .checked_mul(shape.clip_len)
+        .ok_or_else(|| anyhow!("RGBA clip byte length overflow"))?;
+    ensure!(
+        rgba.len() == expected_len,
+        "expected {expected_len} RGBA bytes for {} frame(s) at {}x{}, got {}",
+        shape.clip_len,
+        shape.width,
+        shape.height,
+        rgba.len()
+    );
+    let start = frame_bytes
+        .checked_mul(shape.clip_len.saturating_sub(1))
+        .ok_or_else(|| anyhow!("RGBA last frame offset overflow"))?;
+    let end = start
+        .checked_add(frame_bytes)
+        .ok_or_else(|| anyhow!("RGBA last frame end overflow"))?;
+    Ok(&rgba[start..end])
+}
+
+pub fn resize_rgba_frame_to_dimensions(
+    frame: RgbaImage,
+    target_width: Option<u32>,
+    target_height: Option<u32>,
+) -> RgbaImage {
+    let (width, height) = frame.dimensions();
+    let (target_width, target_height) =
+        resize_dimensions_preserving_aspect(width, height, target_width, target_height);
+    if target_width == width && target_height == height {
+        return frame;
+    }
+
+    image::imageops::resize(&frame, target_width, target_height, FilterType::Triangle)
+}
+
+pub fn resize_dimensions_preserving_aspect(
+    width: u32,
+    height: u32,
+    target_width: Option<u32>,
+    target_height: Option<u32>,
+) -> (u32, u32) {
+    let width = width.max(1);
+    let height = height.max(1);
+    match (target_width, target_height) {
+        (Some(target_width), Some(target_height)) => (target_width.max(1), target_height.max(1)),
+        (Some(target_width), None) => {
+            let target_width = target_width.max(1);
+            let target_height =
+                ((height as f64 * target_width as f64 / width as f64).round() as u32).max(1);
+            (target_width, target_height)
+        }
+        (None, Some(target_height)) => {
+            let target_height = target_height.max(1);
+            let target_width =
+                ((width as f64 * target_height as f64 / height as f64).round() as u32).max(1);
+            (target_width, target_height)
+        }
+        (None, None) => (width, height),
+    }
+}
+
+pub fn resize_video_shortest_edge<B: Backend>(
+    video: Tensor<B, 5>,
+    shortest_edge: usize,
+) -> Tensor<B, 5> {
+    let [batch, time, channels, height, width] = video.shape().dims::<5>();
+    let (target_height, target_width) = processor_resize_dimensions(height, width, shortest_edge);
+    if target_height == height && target_width == width {
+        return video;
+    }
+
+    let video = video.reshape([batch * time, channels, height, width]);
+    let video = interpolate(
+        video,
+        [target_height, target_width],
+        InterpolateOptions::new(InterpolateMode::Bilinear).with_align_corners(false),
+    );
+    video.reshape([batch, time, channels, target_height, target_width])
+}
+
+fn processor_resize_dimensions(
+    height: usize,
+    width: usize,
+    shortest_edge: usize,
+) -> (usize, usize) {
+    let height = height.max(1);
+    let width = width.max(1);
+    let shortest_edge = shortest_edge.max(1);
+    let min_edge = height.min(width);
+    if min_edge == shortest_edge {
+        return (height, width);
+    }
+
+    let scale = shortest_edge as f64 / min_edge as f64;
+    (
+        ((height as f64 * scale).round() as usize).max(1),
+        ((width as f64 * scale).round() as usize).max(1),
+    )
+}
+
+pub fn video_frame_tensor<B: Backend>(
+    video: Tensor<B, 5>,
+    frame_index: usize,
+) -> Result<Tensor<B, 5>> {
+    let [batch, time, channels, height, width] = video.shape().dims::<5>();
+    ensure!(
+        frame_index < time,
+        "frame index {frame_index} is out of bounds for {time} frame(s)"
+    );
+
+    Ok(video.slice([
+        0..batch,
+        frame_index..frame_index + 1,
+        0..channels,
+        0..height,
+        0..width,
+    ]))
+}
+
 fn autogaze_processor_value(value: u8, channel: usize) -> f32 {
     let rescaled = value as f32 * AUTO_GAZE_RESCALE_FACTOR - 1.0;
     (rescaled - AUTO_GAZE_IMAGE_MEAN[channel]) / AUTO_GAZE_IMAGE_STD[channel]
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AutoGazePipelineOptions {
+    max_gaze_tokens_each_frame: Option<usize>,
+    task_loss_requirement: AutoGazeTaskLossOption,
+    tile_batch_size: Option<usize>,
+}
+
+impl AutoGazePipelineOptions {
+    pub const fn new() -> Self {
+        Self {
+            max_gaze_tokens_each_frame: None,
+            task_loss_requirement: AutoGazeTaskLossOption::ModelDefault,
+            tile_batch_size: None,
+        }
+    }
+
+    pub const fn max_gaze_tokens_each_frame(&self) -> Option<usize> {
+        self.max_gaze_tokens_each_frame
+    }
+
+    pub const fn task_loss_requirement(&self) -> AutoGazeTaskLossOption {
+        self.task_loss_requirement
+    }
+
+    pub const fn tile_batch_size(&self) -> Option<usize> {
+        self.tile_batch_size
+    }
+
+    pub const fn with_max_gaze_tokens_each_frame(
+        mut self,
+        max_gaze_tokens_each_frame: usize,
+    ) -> Self {
+        self.max_gaze_tokens_each_frame = Some(max_gaze_tokens_each_frame);
+        self
+    }
+
+    pub const fn with_model_default_gaze_tokens(mut self) -> Self {
+        self.max_gaze_tokens_each_frame = None;
+        self
+    }
+
+    pub const fn with_task_loss_requirement(mut self, task_loss_requirement: f32) -> Self {
+        self.task_loss_requirement = AutoGazeTaskLossOption::Value(task_loss_requirement);
+        self
+    }
+
+    pub const fn without_task_loss_requirement(mut self) -> Self {
+        self.task_loss_requirement = AutoGazeTaskLossOption::Disabled;
+        self
+    }
+
+    pub const fn with_model_default_task_loss_requirement(mut self) -> Self {
+        self.task_loss_requirement = AutoGazeTaskLossOption::ModelDefault;
+        self
+    }
+
+    pub const fn with_tile_batch_size(mut self, tile_batch_size: usize) -> Self {
+        self.tile_batch_size = Some(tile_batch_size);
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum AutoGazeTaskLossOption {
+    #[default]
+    ModelDefault,
+    Disabled,
+    Value(f32),
 }
 
 #[derive(Clone, Debug)]
@@ -306,7 +636,7 @@ impl<B: Backend> AutoGazePipeline<B> {
             model,
             max_gaze_tokens_each_frame,
             task_loss_requirement,
-            tile_batch_size: 8,
+            tile_batch_size: DEFAULT_TILED_TILE_BATCH_SIZE,
         }
     }
 
@@ -344,6 +674,29 @@ impl<B: Backend> AutoGazePipeline<B> {
         self.tile_batch_size
     }
 
+    pub fn with_options(mut self, options: AutoGazePipelineOptions) -> Self {
+        self.apply_options(options);
+        self
+    }
+
+    pub fn apply_options(&mut self, options: AutoGazePipelineOptions) {
+        if let Some(max_gaze_tokens_each_frame) = options.max_gaze_tokens_each_frame {
+            self.set_max_gaze_tokens_each_frame(max_gaze_tokens_each_frame);
+        } else {
+            self.reset_max_gaze_tokens_each_frame();
+        }
+
+        match options.task_loss_requirement {
+            AutoGazeTaskLossOption::ModelDefault => self.reset_task_loss_requirement(),
+            AutoGazeTaskLossOption::Disabled => self.set_task_loss_requirement(None),
+            AutoGazeTaskLossOption::Value(value) => self.set_task_loss_requirement(Some(value)),
+        }
+
+        if let Some(tile_batch_size) = options.tile_batch_size {
+            self.set_tile_batch_size(tile_batch_size);
+        }
+    }
+
     pub fn with_max_gaze_tokens_each_frame(mut self, max_gaze_tokens_each_frame: usize) -> Self {
         self.max_gaze_tokens_each_frame = max_gaze_tokens_each_frame.max(1);
         self
@@ -369,6 +722,10 @@ impl<B: Backend> AutoGazePipeline<B> {
 
     pub fn set_task_loss_requirement(&mut self, task_loss_requirement: Option<f32>) {
         self.task_loss_requirement = task_loss_requirement.map(|value| value.max(0.0));
+    }
+
+    pub fn reset_task_loss_requirement(&mut self) {
+        self.task_loss_requirement = self.model.default_task_loss_requirement();
     }
 
     pub fn set_tile_batch_size(&mut self, tile_batch_size: usize) {
@@ -435,6 +792,20 @@ impl<B: Backend> AutoGazePipeline<B> {
     fn embed_video_resize(&self, video: Tensor<B, 5>) -> (Tensor<B, 4>, Vec<Tensor<B, 5>>) {
         let video = self.prepare_video(video);
         self.embed_model_input(video)
+    }
+
+    pub fn try_embed_model_input(
+        &self,
+        video: Tensor<B, 5>,
+    ) -> Result<(Tensor<B, 4>, Vec<Tensor<B, 5>>)> {
+        let [_batch, _time, _channels, height, width] = video.shape().dims::<5>();
+        let input_img_size = self.model.config.gaze_model_config.input_img_size.max(1);
+        ensure!(
+            height == input_img_size && width == input_img_size,
+            "AutoGaze model input frames must be square {input_img_size}x{input_img_size}, got {height}x{width}; \
+             call prepare_video/embed_video or use a tiled inference mode for full-resolution input",
+        );
+        Ok(self.model.gazing_model.embed_video(video, false, None))
     }
 
     pub fn embed_model_input(&self, video: Tensor<B, 5>) -> (Tensor<B, 4>, Vec<Tensor<B, 5>>) {
@@ -576,6 +947,197 @@ impl<B: Backend> AutoGazePipeline<B> {
         }
     }
 
+    pub fn readout_points_with_mode(
+        &self,
+        video: Tensor<B, 5>,
+        k: usize,
+        mode: AutoGazeInferenceMode,
+    ) -> Vec<Vec<Vec<FixationPoint>>> {
+        let [batch, time, _channels, height, width] = video.shape().dims::<5>();
+        match mode.normalized() {
+            AutoGazeInferenceMode::ResizeToModelInput => {
+                let generation_budget = self.max_gaze_tokens_each_frame.max(k.max(1));
+                let generated = self.generate_with_limit(video, generation_budget);
+                generated_to_frame_points(&generated, &self.model.config)
+            }
+            AutoGazeInferenceMode::TiledResizeToGrid { tile_size } => {
+                let layout = AutoGazeTileLayout::resized_grid(height, width, tile_size);
+                let video = resize_video_to_layout_grid(video, &layout);
+                self.tiled_readout_points(video, k, batch, time, &layout)
+            }
+            AutoGazeInferenceMode::TiledFullResolution { tile_size, stride } => {
+                let layout = AutoGazeTileLayout::tiled(height, width, tile_size, stride);
+                self.tiled_readout_points(video, k, batch, time, &layout)
+            }
+        }
+    }
+
+    pub async fn readout_points_with_mode_async(
+        &self,
+        video: Tensor<B, 5>,
+        k: usize,
+        mode: AutoGazeInferenceMode,
+    ) -> std::result::Result<Vec<Vec<Vec<FixationPoint>>>, ExecutionError> {
+        let [batch, time, _channels, height, width] = video.shape().dims::<5>();
+        match mode.normalized() {
+            AutoGazeInferenceMode::ResizeToModelInput => {
+                let generation_budget = self.max_gaze_tokens_each_frame.max(k.max(1));
+                let generated = self
+                    .generate_with_limit_async(video, generation_budget)
+                    .await?;
+                Ok(generated_to_frame_points(&generated, &self.model.config))
+            }
+            AutoGazeInferenceMode::TiledResizeToGrid { tile_size } => {
+                let layout = AutoGazeTileLayout::resized_grid(height, width, tile_size);
+                let video = resize_video_to_layout_grid(video, &layout);
+                self.tiled_readout_points_async(video, k, batch, time, &layout)
+                    .await
+            }
+            AutoGazeInferenceMode::TiledFullResolution { tile_size, stride } => {
+                let layout = AutoGazeTileLayout::tiled(height, width, tile_size, stride);
+                self.tiled_readout_points_async(video, k, batch, time, &layout)
+                    .await
+            }
+        }
+    }
+
+    pub fn trace_video_streaming(
+        &self,
+        video: Tensor<B, 5>,
+        k: usize,
+        cache: &mut AutoGazeStreamingCache<B>,
+    ) -> Vec<FrameFixationTrace> {
+        self.model.trace_streaming_with_task_loss_requirement(
+            video,
+            cache,
+            k,
+            self.max_gaze_tokens_each_frame.max(k.max(1)),
+            self.task_loss_requirement,
+        )
+    }
+
+    pub async fn trace_video_streaming_async(
+        &self,
+        video: Tensor<B, 5>,
+        k: usize,
+        cache: &mut AutoGazeStreamingCache<B>,
+    ) -> std::result::Result<Vec<FrameFixationTrace>, ExecutionError> {
+        self.model
+            .trace_streaming_with_task_loss_requirement_async(
+                video,
+                cache,
+                k,
+                self.max_gaze_tokens_each_frame.max(k.max(1)),
+                self.task_loss_requirement,
+            )
+            .await
+    }
+
+    pub fn trace_prepared_run(
+        &self,
+        prepared: AutoGazePreparedRun<B>,
+        k: usize,
+        cache: Option<&mut AutoGazeStreamingCache<B>>,
+    ) -> AutoGazeTraceRunOutput {
+        let AutoGazePreparedRun {
+            video,
+            mode,
+            frame_index,
+            model_frames,
+        } = prepared;
+        let traces = if let Some(cache) = cache {
+            self.trace_video_streaming(video, k, cache)
+        } else {
+            self.trace_video_with_mode(video, k, mode)
+        };
+        AutoGazeTraceRunOutput {
+            traces,
+            frame_index,
+            model_frames,
+        }
+    }
+
+    /// Run a prepared clip and return decoded fixation points without building
+    /// full traces when the selected mode allows it.
+    ///
+    /// When `cache` is present, this still routes through the streaming trace
+    /// implementation because KV-cache state is maintained there; the returned
+    /// value is then reduced to points for callers that do not need trace
+    /// metadata.
+    pub fn readout_prepared_run(
+        &self,
+        prepared: AutoGazePreparedRun<B>,
+        k: usize,
+        cache: Option<&mut AutoGazeStreamingCache<B>>,
+    ) -> AutoGazeReadoutRunOutput {
+        let AutoGazePreparedRun {
+            video,
+            mode,
+            frame_index,
+            model_frames,
+        } = prepared;
+        let points = if let Some(cache) = cache {
+            traces_to_frame_points(self.trace_video_streaming(video, k, cache))
+        } else {
+            self.readout_points_with_mode(video, k, mode)
+        };
+        AutoGazeReadoutRunOutput {
+            points,
+            frame_index,
+            model_frames,
+        }
+    }
+
+    pub async fn trace_prepared_run_async(
+        &self,
+        prepared: AutoGazePreparedRun<B>,
+        k: usize,
+        cache: Option<&mut AutoGazeStreamingCache<B>>,
+    ) -> std::result::Result<AutoGazeTraceRunOutput, ExecutionError> {
+        let AutoGazePreparedRun {
+            video,
+            mode,
+            frame_index,
+            model_frames,
+        } = prepared;
+        let traces = if let Some(cache) = cache {
+            self.trace_video_streaming_async(video, k, cache).await?
+        } else {
+            self.trace_video_with_mode_async(video, k, mode).await?
+        };
+        Ok(AutoGazeTraceRunOutput {
+            traces,
+            frame_index,
+            model_frames,
+        })
+    }
+
+    /// Async version of `readout_prepared_run` for wasm/WebGPU callers that
+    /// cannot block on tensor data readback.
+    pub async fn readout_prepared_run_async(
+        &self,
+        prepared: AutoGazePreparedRun<B>,
+        k: usize,
+        cache: Option<&mut AutoGazeStreamingCache<B>>,
+    ) -> std::result::Result<AutoGazeReadoutRunOutput, ExecutionError> {
+        let AutoGazePreparedRun {
+            video,
+            mode,
+            frame_index,
+            model_frames,
+        } = prepared;
+        let points = if let Some(cache) = cache {
+            traces_to_frame_points(self.trace_video_streaming_async(video, k, cache).await?)
+        } else {
+            self.readout_points_with_mode_async(video, k, mode).await?
+        };
+        Ok(AutoGazeReadoutRunOutput {
+            points,
+            frame_index,
+            model_frames,
+        })
+    }
+
     fn embed_tiled_video(
         &self,
         video: Tensor<B, 5>,
@@ -630,9 +1192,7 @@ impl<B: Backend> AutoGazePipeline<B> {
             .max_gaze_tokens_each_frame
             .max(k.max(1))
             .saturating_mul(layout.tile_count().max(1));
-        let mut frame_points = (0..batch)
-            .map(|_| (0..time).map(|_| Vec::<FixationPoint>::new()).collect())
-            .collect::<Vec<Vec<Vec<FixationPoint>>>>();
+        let mut frame_points = empty_batch_frame_points(batch, time);
         let mut stop_probabilities = vec![vec![0.0f32; time]; batch];
         self.collect_tiled_trace_points(
             video,
@@ -656,9 +1216,7 @@ impl<B: Backend> AutoGazePipeline<B> {
             .max_gaze_tokens_each_frame
             .max(k.max(1))
             .saturating_mul(layout.tile_count().max(1));
-        let mut frame_points = (0..batch)
-            .map(|_| (0..time).map(|_| Vec::<FixationPoint>::new()).collect())
-            .collect::<Vec<Vec<Vec<FixationPoint>>>>();
+        let mut frame_points = empty_batch_frame_points(batch, time);
         let mut stop_probabilities = vec![vec![0.0f32; time]; batch];
         self.collect_tiled_trace_points_async(
             video,
@@ -856,6 +1414,49 @@ impl<B: Backend> AutoGazePipeline<B> {
         Ok(())
     }
 
+    fn tiled_readout_points(
+        &self,
+        video: Tensor<B, 5>,
+        k: usize,
+        batch: usize,
+        time: usize,
+        layout: &AutoGazeTileLayout,
+    ) -> Vec<Vec<Vec<FixationPoint>>> {
+        let mut frame_points = empty_batch_frame_points(batch, time);
+        let mut stop_probabilities = vec![vec![0.0f32; time]; batch];
+        self.collect_tiled_trace_points(
+            video,
+            k,
+            layout,
+            &mut frame_points,
+            &mut stop_probabilities,
+        );
+        sort_batch_frame_points_by_confidence(&mut frame_points);
+        frame_points
+    }
+
+    async fn tiled_readout_points_async(
+        &self,
+        video: Tensor<B, 5>,
+        k: usize,
+        batch: usize,
+        time: usize,
+        layout: &AutoGazeTileLayout,
+    ) -> std::result::Result<Vec<Vec<Vec<FixationPoint>>>, ExecutionError> {
+        let mut frame_points = empty_batch_frame_points(batch, time);
+        let mut stop_probabilities = vec![vec![0.0f32; time]; batch];
+        self.collect_tiled_trace_points_async(
+            video,
+            k,
+            layout,
+            &mut frame_points,
+            &mut stop_probabilities,
+        )
+        .await?;
+        sort_batch_frame_points_by_confidence(&mut frame_points);
+        Ok(frame_points)
+    }
+
     pub fn trace_clip_from_frames(
         &self,
         frames: &[f32],
@@ -975,7 +1576,7 @@ impl<B: Backend> AutoGazePipeline<B> {
         mode: AutoGazeInferenceMode,
         device: &B::Device,
     ) -> Result<Vec<FrameFixationTrace>> {
-        let video = rgba_clip_to_tensor::<B>(rgba, shape, device)?;
+        let video = rgba_clip_to_inference_tensor::<B>(rgba, shape, mode, device)?;
         Ok(self.trace_video_with_mode(video, k, mode))
     }
 
@@ -987,7 +1588,7 @@ impl<B: Backend> AutoGazePipeline<B> {
         mode: AutoGazeInferenceMode,
         device: &B::Device,
     ) -> Result<Vec<FrameFixationTrace>> {
-        let video = rgba_clip_to_tensor::<B>(rgba, shape, device)?;
+        let video = rgba_clip_to_inference_tensor::<B>(rgba, shape, mode, device)?;
         self.trace_video_with_mode_async(video, k, mode)
             .await
             .map_err(|err| anyhow!("failed to read AutoGaze tensor data asynchronously: {err:?}"))
@@ -1136,13 +1737,38 @@ fn build_tiled_traces(
                 .into_iter()
                 .zip(batch_stop_probabilities)
                 .map(|(mut points, stop_probability)| {
-                    points.sort_by(|left, right| right.confidence.total_cmp(&left.confidence));
+                    sort_points_by_confidence(&mut points);
                     FixationSet::new(points, stop_probability, frame_budget)
                 })
                 .collect();
             FrameFixationTrace::new(frames)
         })
         .collect()
+}
+
+fn traces_to_frame_points(traces: Vec<FrameFixationTrace>) -> Vec<Vec<Vec<FixationPoint>>> {
+    traces
+        .into_iter()
+        .map(|trace| trace.frames.into_iter().map(|frame| frame.points).collect())
+        .collect()
+}
+
+fn empty_batch_frame_points(batch: usize, time: usize) -> Vec<Vec<Vec<FixationPoint>>> {
+    (0..batch)
+        .map(|_| (0..time).map(|_| Vec::<FixationPoint>::new()).collect())
+        .collect()
+}
+
+fn sort_batch_frame_points_by_confidence(frame_points: &mut [Vec<Vec<FixationPoint>>]) {
+    for batch_frames in frame_points {
+        for points in batch_frames {
+            sort_points_by_confidence(points);
+        }
+    }
+}
+
+fn sort_points_by_confidence(points: &mut [FixationPoint]) {
+    points.sort_by(|left, right| right.confidence.total_cmp(&left.confidence));
 }
 
 fn collect_tile_trace_points(
@@ -1261,6 +1887,8 @@ fn local_cell_index(position: f32, grid: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
+    use std::task::{Context, Poll};
 
     #[cfg(feature = "ndarray")]
     #[test]
@@ -1287,6 +1915,22 @@ mod tests {
 
     #[cfg(feature = "ndarray")]
     #[test]
+    fn rgba_clip_to_processor_tensor_preserves_aspect_before_model_square_resize() {
+        let device = Default::default();
+        let rgba = vec![128u8; 2 * 4 * 4];
+        let shape = AutoGazeRgbaClipShape::new(1, 2, 4);
+        let tensor =
+            rgba_clip_to_processor_tensor::<burn::backend::NdArray<f32>>(&rgba, shape, &device)
+                .expect("processor tensor");
+
+        assert_eq!(
+            tensor.shape().dims::<5>(),
+            [1, 1, 3, AUTO_GAZE_PROCESSOR_SHORT_EDGE, 448]
+        );
+    }
+
+    #[cfg(feature = "ndarray")]
+    #[test]
     fn rgba_clip_to_tensor_preserves_clip_channel_order_and_ignores_alpha() {
         let device = Default::default();
         let rgba = [1, 2, 3, 4, 10, 20, 30, 250];
@@ -1306,6 +1950,312 @@ mod tests {
         assert_eq!(values.len(), expected.len());
         for (actual, expected) in values.iter().zip(expected) {
             assert!((actual - expected).abs() < 1.0e-6);
+        }
+    }
+
+    #[cfg(feature = "ndarray")]
+    #[test]
+    fn video_frame_tensor_slices_requested_frame_without_reordering() {
+        let device = Default::default();
+        let video = Tensor::<burn::backend::NdArray<f32>, 5>::from_data(
+            TensorData::new(vec![1.0, 2.0, 3.0, 10.0, 20.0, 30.0], [1, 2, 3, 1, 1]),
+            &device,
+        );
+
+        let frame = video_frame_tensor(video, 1)
+            .expect("frame tensor")
+            .into_data()
+            .to_vec::<f32>()
+            .expect("frame values");
+
+        assert_eq!(frame, vec![10.0, 20.0, 30.0]);
+    }
+
+    #[cfg(feature = "ndarray")]
+    #[test]
+    fn rgba_clip_display_frame_comes_from_same_model_input_tensor() {
+        let device = Default::default();
+        let rgba = [1, 2, 3, 255, 10, 20, 30, 128];
+        let shape = AutoGazeRgbaClipShape::new(2, 1, 1);
+        let video = rgba_clip_to_tensor::<burn::backend::NdArray<f32>>(&rgba, shape, &device)
+            .expect("rgba tensor");
+        let frame = video_frame_tensor(video, 1)
+            .expect("frame tensor")
+            .into_data()
+            .to_vec::<f32>()
+            .expect("frame values");
+
+        let expected = [
+            autogaze_processor_value(10, 0),
+            autogaze_processor_value(20, 1),
+            autogaze_processor_value(30, 2),
+        ];
+        assert_eq!(frame.len(), expected.len());
+        for (actual, expected) in frame.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1.0e-6);
+        }
+    }
+
+    #[cfg(feature = "ndarray")]
+    #[test]
+    fn prepared_rgba_trace_run_uses_full_clip_without_streaming_cache() {
+        let device = Default::default();
+        let rgba = [1, 2, 3, 255, 10, 20, 30, 128];
+        let shape = AutoGazeRgbaClipShape::new(2, 1, 1);
+
+        let prepared = prepare_rgba_clip_for_trace::<burn::backend::NdArray<f32>>(
+            &rgba,
+            shape,
+            AutoGazeInferenceMode::TiledResizeToGrid { tile_size: 224 },
+            false,
+            &device,
+        )
+        .expect("prepared run");
+
+        assert_eq!(prepared.frame_index, 1);
+        assert_eq!(prepared.model_frames, 2);
+        assert_eq!(prepared.video.shape().dims::<5>(), [1, 2, 3, 1, 1]);
+    }
+
+    #[cfg(feature = "ndarray")]
+    #[test]
+    fn prepared_rgba_trace_run_uses_latest_frame_with_streaming_cache() {
+        let device = Default::default();
+        let rgba = [1, 2, 3, 255, 10, 20, 30, 128];
+        let shape = AutoGazeRgbaClipShape::new(2, 1, 1);
+
+        let prepared = prepare_rgba_clip_for_trace::<burn::backend::NdArray<f32>>(
+            &rgba,
+            shape,
+            AutoGazeInferenceMode::TiledResizeToGrid { tile_size: 224 },
+            true,
+            &device,
+        )
+        .expect("prepared run");
+        let values = prepared
+            .video
+            .into_data()
+            .to_vec::<f32>()
+            .expect("prepared tensor values");
+
+        let expected = [
+            autogaze_processor_value(10, 0),
+            autogaze_processor_value(20, 1),
+            autogaze_processor_value(30, 2),
+        ];
+        assert_eq!(prepared.frame_index, 0);
+        assert_eq!(prepared.model_frames, 1);
+        assert_eq!(values.len(), expected.len());
+        for (actual, expected) in values.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1.0e-6);
+        }
+    }
+
+    #[test]
+    fn last_rgba_frame_rejects_mismatched_clip_lengths() {
+        let rgba = [1, 2, 3, 255];
+        let shape = AutoGazeRgbaClipShape::new(2, 1, 1);
+
+        let err = last_rgba_frame(&rgba, shape).expect_err("expected length mismatch");
+
+        assert!(
+            err.to_string().contains("expected 8 RGBA bytes"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[cfg(feature = "ndarray")]
+    #[test]
+    fn trace_prepared_run_preserves_metadata() {
+        let device = Default::default();
+        let pipeline = AutoGazePipeline::<burn::backend::NdArray<f32>>::from_config(
+            &tiny_pipeline_config(),
+            &device,
+        )
+        .with_max_gaze_tokens_each_frame(1);
+        let prepared = AutoGazePreparedRun {
+            video: Tensor::zeros([1, 1, 3, 16, 16], &device),
+            mode: AutoGazeInferenceMode::ResizeToModelInput,
+            frame_index: 0,
+            model_frames: 1,
+        };
+
+        let output = pipeline.trace_prepared_run(prepared, 1, None);
+
+        assert_eq!(output.frame_index, 0);
+        assert_eq!(output.model_frames, 1);
+        assert_eq!(output.traces.len(), 1);
+        assert_eq!(output.traces[0].frames.len(), 1);
+    }
+
+    #[cfg(feature = "ndarray")]
+    #[test]
+    fn try_embed_model_input_rejects_non_square_model_input_without_panic() {
+        let device = Default::default();
+        let pipeline = AutoGazePipeline::<burn::backend::NdArray<f32>>::from_config(
+            &tiny_pipeline_config(),
+            &device,
+        );
+        let video = Tensor::zeros([1, 1, 3, 16, 8], &device);
+
+        let err = match pipeline.try_embed_model_input(video) {
+            Ok(_) => panic!("expected non-square model input to be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("must be square"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[cfg(feature = "ndarray")]
+    #[test]
+    fn embed_model_input_prepares_non_model_sized_inputs_without_panic() {
+        let device = Default::default();
+        let pipeline = AutoGazePipeline::<burn::backend::NdArray<f32>>::from_config(
+            &tiny_pipeline_config(),
+            &device,
+        );
+        let video = Tensor::zeros([1, 1, 1, 16, 8], &device);
+
+        let (embeddings, _past) = pipeline.embed_model_input(video);
+        let [batch, frames, tokens, dim] = embeddings.shape().dims::<4>();
+
+        assert_eq!(batch, 1);
+        assert_eq!(frames, 1);
+        assert_eq!(tokens, 1);
+        assert_eq!(dim, 4);
+    }
+
+    #[cfg(feature = "ndarray")]
+    #[test]
+    fn readout_prepared_run_preserves_metadata_and_matches_trace_points() {
+        let device = Default::default();
+        let pipeline = AutoGazePipeline::<burn::backend::NdArray<f32>>::from_config(
+            &tiny_pipeline_config(),
+            &device,
+        )
+        .with_max_gaze_tokens_each_frame(1);
+        let modes = [
+            AutoGazeInferenceMode::ResizeToModelInput,
+            AutoGazeInferenceMode::TiledResizeToGrid { tile_size: 16 },
+        ];
+
+        for mode in modes {
+            let video = Tensor::zeros([1, 1, 3, 16, 16], &device);
+            let trace_output = pipeline.trace_prepared_run(
+                AutoGazePreparedRun {
+                    video: video.clone(),
+                    mode,
+                    frame_index: 0,
+                    model_frames: 1,
+                },
+                1,
+                None,
+            );
+            let readout_output = pipeline.readout_prepared_run(
+                AutoGazePreparedRun {
+                    video,
+                    mode,
+                    frame_index: 0,
+                    model_frames: 1,
+                },
+                1,
+                None,
+            );
+
+            assert_eq!(readout_output.frame_index, trace_output.frame_index);
+            assert_eq!(readout_output.model_frames, trace_output.model_frames);
+            assert_eq!(
+                readout_output.points,
+                positive_trace_points(&trace_output.traces),
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "ndarray")]
+    #[test]
+    fn async_readout_prepared_run_matches_sync() {
+        let device = Default::default();
+        let pipeline = AutoGazePipeline::<burn::backend::NdArray<f32>>::from_config(
+            &tiny_pipeline_config(),
+            &device,
+        )
+        .with_max_gaze_tokens_each_frame(1);
+        let video = Tensor::zeros([1, 1, 3, 16, 16], &device);
+        let expected = pipeline.readout_prepared_run(
+            AutoGazePreparedRun {
+                video: video.clone(),
+                mode: AutoGazeInferenceMode::TiledResizeToGrid { tile_size: 16 },
+                frame_index: 0,
+                model_frames: 1,
+            },
+            1,
+            None,
+        );
+        let actual = block_on_ready(pipeline.readout_prepared_run_async(
+            AutoGazePreparedRun {
+                video,
+                mode: AutoGazeInferenceMode::TiledResizeToGrid { tile_size: 16 },
+                frame_index: 0,
+                model_frames: 1,
+            },
+            1,
+            None,
+        ))
+        .expect("async readout prepared run");
+
+        assert_eq!(actual.frame_index, expected.frame_index);
+        assert_eq!(actual.model_frames, expected.model_frames);
+        assert_eq!(actual.points, expected.points);
+    }
+
+    #[cfg(feature = "ndarray")]
+    #[test]
+    fn readout_points_match_trace_points_for_resize_and_tiled_modes() {
+        let device = Default::default();
+        let pipeline = AutoGazePipeline::<burn::backend::NdArray<f32>>::from_config(
+            &tiny_pipeline_config(),
+            &device,
+        )
+        .with_max_gaze_tokens_each_frame(1);
+        let modes = [
+            AutoGazeInferenceMode::ResizeToModelInput,
+            AutoGazeInferenceMode::TiledResizeToGrid { tile_size: 16 },
+        ];
+
+        for mode in modes {
+            let video = Tensor::zeros([1, 1, 3, 16, 16], &device);
+            let traces = pipeline.trace_video_with_mode(video.clone(), 1, mode);
+            let readout_points = pipeline.readout_points_with_mode(video, 1, mode);
+
+            assert_eq!(readout_points, positive_trace_points(&traces), "{mode:?}");
+        }
+    }
+
+    #[cfg(feature = "ndarray")]
+    #[test]
+    fn async_readout_points_match_sync_for_resize_and_tiled_modes() {
+        let device = Default::default();
+        let pipeline = AutoGazePipeline::<burn::backend::NdArray<f32>>::from_config(
+            &tiny_pipeline_config(),
+            &device,
+        )
+        .with_max_gaze_tokens_each_frame(1);
+        let modes = [
+            AutoGazeInferenceMode::ResizeToModelInput,
+            AutoGazeInferenceMode::TiledResizeToGrid { tile_size: 16 },
+        ];
+
+        for mode in modes {
+            let video = Tensor::zeros([1, 1, 3, 16, 16], &device);
+            let expected = pipeline.readout_points_with_mode(video.clone(), 1, mode);
+            let actual = block_on_ready(pipeline.readout_points_with_mode_async(video, 1, mode))
+                .expect("async readout");
+
+            assert_eq!(actual, expected, "{mode:?}");
         }
     }
 
@@ -1611,5 +2561,142 @@ mod tests {
 
         assert_eq!(layout.tile_count(), 6);
         assert_eq!(mode.fixation_budget(2, 31, 47), 12);
+    }
+
+    #[test]
+    #[cfg(feature = "ndarray")]
+    fn pipeline_default_tile_batch_size_uses_shared_realtime_default() {
+        let device =
+            <burn::backend::NdArray<f32> as burn::tensor::backend::BackendTypes>::Device::default();
+        let pipeline = AutoGazePipeline::<burn::backend::NdArray<f32>>::from_config(
+            &tiny_pipeline_config(),
+            &device,
+        );
+
+        assert_eq!(pipeline.tile_batch_size(), DEFAULT_TILED_TILE_BATCH_SIZE);
+    }
+
+    #[test]
+    #[cfg(feature = "ndarray")]
+    fn pipeline_options_apply_wrapper_runtime_overrides() {
+        let device =
+            <burn::backend::NdArray<f32> as burn::tensor::backend::BackendTypes>::Device::default();
+        let pipeline = AutoGazePipeline::<burn::backend::NdArray<f32>>::from_config(
+            &tiny_pipeline_config(),
+            &device,
+        )
+        .with_options(
+            AutoGazePipelineOptions::default()
+                .with_max_gaze_tokens_each_frame(7)
+                .without_task_loss_requirement()
+                .with_tile_batch_size(3),
+        );
+
+        assert_eq!(pipeline.max_gaze_tokens_each_frame(), 7);
+        assert_eq!(pipeline.task_loss_requirement(), None);
+        assert_eq!(pipeline.tile_batch_size(), 3);
+    }
+
+    #[test]
+    #[cfg(feature = "ndarray")]
+    fn pipeline_options_reset_to_model_defaults() {
+        let device =
+            <burn::backend::NdArray<f32> as burn::tensor::backend::BackendTypes>::Device::default();
+        let mut pipeline = AutoGazePipeline::<burn::backend::NdArray<f32>>::from_config(
+            &tiny_pipeline_config(),
+            &device,
+        )
+        .with_max_gaze_tokens_each_frame(7)
+        .with_task_loss_requirement(None)
+        .with_tile_batch_size(3);
+
+        pipeline.apply_options(AutoGazePipelineOptions::default());
+
+        assert_eq!(
+            pipeline.max_gaze_tokens_each_frame(),
+            pipeline.model().default_max_gaze_tokens_each_frame()
+        );
+        assert_eq!(
+            pipeline.task_loss_requirement(),
+            pipeline.model().default_task_loss_requirement()
+        );
+        assert_eq!(pipeline.tile_batch_size(), 3);
+    }
+
+    #[cfg(feature = "ndarray")]
+    fn tiny_pipeline_config() -> AutoGazeConfig {
+        let hidden = 4;
+        AutoGazeConfig {
+            scales: "16".to_string(),
+            max_num_frames: 1,
+            num_vision_tokens_each_frame: 1,
+            gaze_model_config: crate::GazeModelConfig {
+                input_img_size: 16,
+                num_vision_tokens_each_frame: 1,
+                vision_model_config: crate::VisionModelConfig {
+                    hidden_dim: hidden,
+                    out_dim: hidden,
+                    depth: 1,
+                    kernel_size: 16,
+                    temporal_patch_size: 1,
+                    trunk_temporal_kernel_size: 1,
+                    trunk_spatial_kernel_size: 1,
+                },
+                connector_config: crate::ConnectorConfig {
+                    hidden_dim: hidden,
+                    num_tokens: 1,
+                },
+                gaze_decoder_config: crate::GazeDecoderConfig {
+                    vocab_size: 2,
+                    hidden_size: hidden,
+                    intermediate_size: hidden * 2,
+                    num_hidden_layers: 1,
+                    num_attention_heads: 1,
+                    num_key_value_heads: 1,
+                    max_position_embeddings: 8,
+                    bos_token_id: 0,
+                    eos_token_id: 1,
+                    head_dim: hidden,
+                    num_multi_token_pred: 1,
+                    ..crate::GazeDecoderConfig::default()
+                },
+                ..crate::GazeModelConfig::default()
+            },
+            ..AutoGazeConfig::default()
+        }
+    }
+
+    #[cfg(feature = "ndarray")]
+    fn positive_trace_points(traces: &[FrameFixationTrace]) -> Vec<Vec<Vec<FixationPoint>>> {
+        traces
+            .iter()
+            .map(|trace| {
+                trace
+                    .frames
+                    .iter()
+                    .map(|frame| {
+                        frame
+                            .points
+                            .iter()
+                            .copied()
+                            .filter(|point| point.confidence > 0.0)
+                            .collect()
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn block_on_ready<F: Future>(future: F) -> F::Output {
+        let waker = std::task::Waker::noop();
+        let mut context = Context::from_waker(waker);
+        let mut future = std::pin::pin!(future);
+        for _ in 0..1024 {
+            if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
+                return output;
+            }
+            std::thread::yield_now();
+        }
+        panic!("future did not complete without an external executor");
     }
 }

@@ -31,52 +31,12 @@ jobs:
       - name: cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: test
-        run: cargo test --workspace
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/bevy_burn_autogaze/package-lock.json
 
-      - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: package
-        run: cargo package -p burn_autogaze
-
-      - name: check wasm api
-        run: cargo check --target wasm32-unknown-unknown --no-default-features --features wasm
-
-      - name: check bevy wasm
-        run: cargo check -p bevy_burn_autogaze --target wasm32-unknown-unknown
-
-      - name: install wasm-bindgen-cli
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="$(awk '
-            $0 == "[[package]]" { in_package = 0 }
-            $0 == "name = \"wasm-bindgen\"" { in_package = 1 }
-            in_package && $1 == "version" {
-              gsub("\"", "", $3)
-              print $3
-              exit
-            }
-          ' Cargo.lock)"
-          if [[ -z "${version}" ]]; then
-            echo "failed to find wasm-bindgen version in Cargo.lock" >&2
-            exit 1
-          fi
-          cargo install wasm-bindgen-cli --version "${version}" --locked
-
-      - name: install bevy browser test dependencies
-        working-directory: crates/bevy_burn_autogaze
-        run: npm ci
-
-      - name: install playwright chromium
-        working-directory: crates/bevy_burn_autogaze
-        run: npx playwright install --with-deps chromium
-
-      - name: build bevy wasm artifacts
-        working-directory: crates/bevy_burn_autogaze
-        run: npm run build:wasm
-
-      - name: browser smoke static source
-        working-directory: crates/bevy_burn_autogaze
-        run: npm run test:browser
+      - name: release readiness gate
+        run: tools/check_release_readiness.sh --browser

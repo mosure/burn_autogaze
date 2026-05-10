@@ -1,0 +1,372 @@
+diff --git a/benches/autogaze_sparse_jepa_pipeline.rs b/benches/autogaze_sparse_jepa_pipeline.rs
+--- a/benches/autogaze_sparse_jepa_pipeline.rs
++++ b/benches/autogaze_sparse_jepa_pipeline.rs
+@@ -22,13 +22,14 @@ use burn::{
+ };
+ use burn_autogaze::{
+     AutoGazeConfig, AutoGazeGenerateOutput, AutoGazeInferenceMode, AutoGazePipeline,
+-    ConnectorConfig, GazeDecoderConfig, GazeModelConfig, NativeAutoGazeModel, VisionModelConfig,
++    ConnectorConfig, GazeDecoderConfig, GazeModelConfig, NativeAutoGazeModel, SparseReadoutGrid,
++    SparseReadoutOptions, SparseVideoReadoutGrid, SparseVideoReadoutOptions, VisionModelConfig,
++    generated_to_frame_readout_tokens, generated_to_video_readout_tokens,
+ };
+ use burn_jepa::{
+     SparseImageTokenGrid, SparsePatchifyPlan, SparsePredictorPlan, SparseTokenMask,
+     TemporalSparseJepaStream, TemporalSparseJepaStreamConfig, TokenGridShape, VJepa2_1Model,
+     VJepaConfig, VJepaEncoderConfig, VJepaModelVariant, VJepaPredictorConfig,
+-    sparse_mask_from_frame_token_indices,
+ };
+ 
+ type JepaBackend = burn_flex_gmm::wgpu::DefaultWgpuBackend;
+@@ -272,7 +273,8 @@ where
+     B: Backend,
+     B::Device: Clone,
+ {
+-    let autogaze = deterministic_autogaze_pipeline::<B>(&autogaze_device);
++    let autogaze_config = autogaze_config();
++    let autogaze = deterministic_autogaze_pipeline::<B>(&autogaze_config, &autogaze_device);
+     let jepa_device = <JepaBackend as BackendTypes>::Device::default();
+     let mut rows = Vec::new();
+ 
+@@ -348,9 +350,16 @@ where
+                 .max(autogaze_top_k.max(1));
+ 
+             let generated = autogaze.generate_with_limit(ag_video.clone(), autogaze_budget);
+-            let frame_tokens = generated_frame_tokens(&generated, FRAMES, autogaze_top_k);
+-            let context_mask = context_mask_from_autogaze_generated(
++            let frame_tokens = frame_tokens_from_autogaze_generated(
+                 &generated,
++                &autogaze_config,
++                FRAMES,
++                autogaze_top_k,
++            )
++            .expect("autogaze frame tokens");
++            let context_mask = context_mask_from_autogaze_readout(
++                &generated,
++                &autogaze_config,
+                 FRAMES,
+                 grid,
+                 target_context_tokens,
+@@ -397,8 +406,9 @@ where
+                 0.0
+             };
+             let sparse_project_plan_ms = measure_ms(warmups, reps, || {
+-                let context_mask = context_mask_from_autogaze_generated(
++                let context_mask = context_mask_from_autogaze_readout(
+                     &generated,
++                    &autogaze_config,
+                     FRAMES,
+                     grid,
+                     target_context_tokens,
+@@ -488,7 +498,7 @@ where
+             let stream_config = TemporalSparseJepaStreamConfig::new(
+                 target_context_tokens,
+                 TARGET_TOKENS.min(dense_tokens),
+-                autogaze_image_token_grid(),
++                autogaze_image_token_grid(&autogaze_config),
+             )
+             .with_keyframe_interval(16);
+             let mut temporal_stream = TemporalSparseJepaStream::<JepaBackend>::new(stream_config);
+@@ -526,12 +536,17 @@ where
+             let rolling_target_tokens = TARGET_TOKENS.min(rolling_dense_tokens);
+             let rolling_generated =
+                 autogaze.generate_with_limit(rolling_ag_video.clone(), autogaze_budget);
+-            let rolling_frame_tokens =
+-                generated_frame_tokens(&rolling_generated, TUBELET_SIZE, autogaze_top_k);
++            let rolling_frame_tokens = frame_tokens_from_autogaze_generated(
++                &rolling_generated,
++                &autogaze_config,
++                TUBELET_SIZE,
++                autogaze_top_k,
++            )
++            .expect("rolling autogaze frame tokens");
+             let rolling_stream_config = TemporalSparseJepaStreamConfig::new(
+                 rolling_context_tokens,
+                 rolling_target_tokens,
+-                autogaze_image_token_grid(),
++                autogaze_image_token_grid(&autogaze_config),
+             )
+             .with_keyframe_interval(16);
+             let mut rolling_temporal_stream =
+@@ -560,8 +575,9 @@ where
+             });
+             let e2e_pipeline_ms = measure_ms(warmups, reps, || {
+                 let generated = autogaze.generate_with_limit(ag_video.clone(), autogaze_budget);
+-                let context_mask = context_mask_from_autogaze_generated(
++                let context_mask = context_mask_from_autogaze_readout(
+                     &generated,
++                    &autogaze_config,
+                     FRAMES,
+                     grid,
+                     target_context_tokens,
+@@ -610,7 +626,13 @@ where
+             <JepaBackend as Backend>::sync(&jepa_device).expect("prime e2e temporal stream sync");
+             let temporal_e2e_pipeline_ms = measure_ms(warmups, reps, || {
+                 let generated = autogaze.generate_with_limit(ag_video.clone(), autogaze_budget);
+-                let frame_tokens = generated_frame_tokens(&generated, FRAMES, autogaze_top_k);
++                let frame_tokens = frame_tokens_from_autogaze_generated(
++                    &generated,
++                    &autogaze_config,
++                    FRAMES,
++                    autogaze_top_k,
++                )
++                .expect("temporal e2e frame tokens");
+                 let output = temporal_e2e_stream
+                     .forward_frame_tokens_sparse_patchify_wgpu(
+                         &jepa,
+@@ -638,7 +660,13 @@ where
+             let rolling_temporal_e2e_pipeline_ms = measure_ms(warmups, reps, || {
+                 let generated =
+                     autogaze.generate_with_limit(rolling_ag_video.clone(), autogaze_budget);
+-                let frame_tokens = generated_frame_tokens(&generated, TUBELET_SIZE, autogaze_top_k);
++                let frame_tokens = frame_tokens_from_autogaze_generated(
++                    &generated,
++                    &autogaze_config,
++                    TUBELET_SIZE,
++                    autogaze_top_k,
++                )
++                .expect("rolling temporal e2e frame tokens");
+                 let output = rolling_temporal_e2e_stream
+                     .forward_frame_tokens_sparse_patchify_wgpu(
+                         &jepa,
+@@ -745,81 +773,121 @@ fn density_top_k(grid: TokenGridShape, density: f32) -> usize {
+     ((per_tubelet as f32) * density).ceil().clamp(1.0, 32.0) as usize
+ }
+ 
+-fn context_mask_from_autogaze_generated(
++fn context_mask_from_autogaze_readout(
+     generated: &AutoGazeGenerateOutput,
++    config: &AutoGazeConfig,
+     frames: usize,
+     grid: TokenGridShape,
+     min_keep_tokens: usize,
+     top_k: usize,
+ ) -> anyhow::Result<SparseTokenMask> {
+     let target = min_keep_tokens.max(1).min(grid.len());
+-    let frame_tokens = generated_frame_tokens(generated, frames, top_k);
+-    sparse_mask_from_frame_token_indices(
+-        grid,
+-        TUBELET_SIZE,
+-        autogaze_image_token_grid(),
+-        &frame_tokens,
++    let tokens = generated_to_video_readout_tokens(
++        generated,
++        config,
+         0,
+-        target,
+-    )
++        autogaze_readout_grid(config),
++        SparseVideoReadoutGrid::new(grid.depth, grid.height, grid.width),
++        autogaze_readout_options(top_k),
++        SparseVideoReadoutOptions::default()
++            .with_tubelet_size(TUBELET_SIZE)
++            .with_exact_tokens(target),
++    )?;
++    let mut tokens = tokens;
++    if frames < generated.num_gazing_each_frame.len() {
++        let max_temporal_bin = frames.div_ceil(TUBELET_SIZE);
++        let tokens_per_bin = grid.tokens_per_frame();
++        tokens.retain(|token| *token / tokens_per_bin < max_temporal_bin);
++    }
++    SparseTokenMask::new(tokens, grid.len())
+ }
+ 
+-fn generated_frame_tokens(
++fn frame_tokens_from_autogaze_generated(
+     generated: &AutoGazeGenerateOutput,
++    config: &AutoGazeConfig,
+     frames: usize,
+     top_k: usize,
+-) -> Vec<Vec<usize>> {
+-    let tokens = generated.gazing_pos.first();
+-    let padded = generated.if_padded_gazing.first();
+-    let mut cursor = 0usize;
+-    (0..frames)
+-        .map(|frame_idx| {
+-            let frame_len = generated
+-                .num_gazing_each_frame
+-                .get(frame_idx)
+-                .copied()
+-                .unwrap_or(0);
+-            let frame_offset = (frame_idx * AUTOGAZE_CONNECTOR_TOKENS) as i64;
+-            let mut frame_tokens = Vec::with_capacity(top_k.min(frame_len));
+-            for local_idx in 0..frame_len {
+-                if frame_tokens.len() >= top_k {
+-                    break;
+-                }
+-                let token_index = cursor + local_idx;
+-                if padded
+-                    .and_then(|flags| flags.get(token_index))
+-                    .copied()
+-                    .unwrap_or(true)
+-                {
+-                    continue;
+-                }
+-                let Some(raw_token) = tokens.and_then(|tokens| tokens.get(token_index)).copied()
+-                else {
+-                    continue;
+-                };
+-                let token = raw_token - frame_offset;
+-                if token < 0 {
+-                    continue;
+-                }
+-                let token = token as usize;
+-                if token < AUTOGAZE_CONNECTOR_TOKENS {
+-                    frame_tokens.push(token);
+-                }
+-            }
+-            cursor += frame_len;
+-            frame_tokens
+-        })
+-        .collect()
++) -> anyhow::Result<Vec<Vec<usize>>> {
++    let mut frame_tokens = generated_to_frame_readout_tokens(
++        generated,
++        config,
++        0,
++        autogaze_readout_grid(config),
++        autogaze_readout_options(top_k),
++    )?;
++    frame_tokens.truncate(frames);
++    frame_tokens.resize_with(frames, Vec::new);
++    Ok(frame_tokens)
+ }
+ 
+-fn autogaze_image_token_grid() -> SparseImageTokenGrid {
+-    let grid = (AUTOGAZE_CONNECTOR_TOKENS as f32).sqrt() as usize;
+-    assert_eq!(
+-        grid * grid,
+-        AUTOGAZE_CONNECTOR_TOKENS,
+-        "benchmark AutoGaze connector token grid must be square"
+-    );
+-    SparseImageTokenGrid::new(grid, grid)
++fn autogaze_readout_options(top_k: usize) -> SparseReadoutOptions {
++    SparseReadoutOptions::default()
++        .with_max_fixations_per_frame(top_k)
++        .with_max_tokens_per_frame(top_k)
++}
++
++fn autogaze_readout_grid(config: &AutoGazeConfig) -> SparseReadoutGrid {
++    SparseReadoutGrid::square_from_token_count(config.num_vision_tokens_each_frame)
++        .expect("benchmark AutoGaze connector token grid must be square")
++}
++
++fn autogaze_image_token_grid(config: &AutoGazeConfig) -> SparseImageTokenGrid {
++    let grid = autogaze_readout_grid(config);
++    SparseImageTokenGrid::new(grid.height, grid.width)
++}
++
++fn deterministic_autogaze_pipeline<B: Backend>(
++    config: &AutoGazeConfig,
++    device: &B::Device,
++) -> AutoGazePipeline<B> {
++    let mut mapper = DeterministicParamMapper { cursor: 0 };
++    let model = NativeAutoGazeModel::new(config, device).map(&mut mapper);
++    AutoGazePipeline::new(model)
++        .with_max_gaze_tokens_each_frame(32)
++        .with_task_loss_requirement(None)
++}
++
++fn autogaze_config() -> AutoGazeConfig {
++    let hidden = 8;
++    let heads = 2;
++    AutoGazeConfig {
++        scales: "224".to_string(),
++        max_num_frames: FRAMES,
++        num_vision_tokens_each_frame: AUTOGAZE_CONNECTOR_TOKENS,
++        gaze_model_config: GazeModelConfig {
++            input_img_size: AUTOGAZE_MODEL_INPUT,
++            num_vision_tokens_each_frame: AUTOGAZE_CONNECTOR_TOKENS,
++            attn_mode: "sdpa".to_string(),
++            vision_model_config: VisionModelConfig {
++                hidden_dim: hidden,
++                out_dim: hidden,
++                depth: 1,
++                kernel_size: PATCH_SIZE,
++                temporal_patch_size: 1,
++                trunk_temporal_kernel_size: 3,
++                trunk_spatial_kernel_size: 1,
++            },
++            connector_config: ConnectorConfig {
++                hidden_dim: hidden,
++                num_tokens: AUTOGAZE_CONNECTOR_TOKENS,
++            },
++            gaze_decoder_config: GazeDecoderConfig {
++                vocab_size: AUTOGAZE_CONNECTOR_TOKENS + 1,
++                hidden_size: hidden,
++                intermediate_size: hidden * 2,
++                num_hidden_layers: 1,
++                num_attention_heads: heads,
++                num_key_value_heads: heads,
++                max_position_embeddings: 512,
++                bos_token_id: 0,
++                eos_token_id: AUTOGAZE_CONNECTOR_TOKENS as i64,
++                head_dim: hidden / heads,
++                num_multi_token_pred: 2,
++                ..GazeDecoderConfig::default()
++            },
++        },
++        ..AutoGazeConfig::default()
++    }
+ }
+ 
+ fn target_mask_for_context(context: &SparseTokenMask, target_keep: usize) -> SparseTokenMask {
+@@ -884,58 +952,6 @@ fn target_mask_for_context(context: &SparseTokenMask, target_keep: usize) -> Spa
+     Ok(tokens)
+ }
+ 
+-fn deterministic_autogaze_pipeline<B: Backend>(device: &B::Device) -> AutoGazePipeline<B> {
+-    let config = autogaze_config();
+-    let mut mapper = DeterministicParamMapper { cursor: 0 };
+-    let model = NativeAutoGazeModel::new(&config, device).map(&mut mapper);
+-    AutoGazePipeline::new(model)
+-        .with_max_gaze_tokens_each_frame(32)
+-        .with_task_loss_requirement(None)
+-}
+-
+-fn autogaze_config() -> AutoGazeConfig {
+-    let hidden = 8;
+-    let heads = 2;
+-    AutoGazeConfig {
+-        scales: "224".to_string(),
+-        max_num_frames: FRAMES,
+-        num_vision_tokens_each_frame: AUTOGAZE_CONNECTOR_TOKENS,
+-        gaze_model_config: GazeModelConfig {
+-            input_img_size: AUTOGAZE_MODEL_INPUT,
+-            num_vision_tokens_each_frame: AUTOGAZE_CONNECTOR_TOKENS,
+-            attn_mode: "sdpa".to_string(),
+-            vision_model_config: VisionModelConfig {
+-                hidden_dim: hidden,
+-                out_dim: hidden,
+-                depth: 1,
+-                kernel_size: PATCH_SIZE,
+-                temporal_patch_size: 1,
+-                trunk_temporal_kernel_size: 3,
+-                trunk_spatial_kernel_size: 1,
+-            },
+-            connector_config: ConnectorConfig {
+-                hidden_dim: hidden,
+-                num_tokens: AUTOGAZE_CONNECTOR_TOKENS,
+-            },
+-            gaze_decoder_config: GazeDecoderConfig {
+-                vocab_size: AUTOGAZE_CONNECTOR_TOKENS + 1,
+-                hidden_size: hidden,
+-                intermediate_size: hidden * 2,
+-                num_hidden_layers: 1,
+-                num_attention_heads: heads,
+-                num_key_value_heads: heads,
+-                max_position_embeddings: 512,
+-                bos_token_id: 0,
+-                eos_token_id: AUTOGAZE_CONNECTOR_TOKENS as i64,
+-                head_dim: hidden / heads,
+-                num_multi_token_pred: 2,
+-                ..GazeDecoderConfig::default()
+-            },
+-        },
+-        ..AutoGazeConfig::default()
+-    }
+-}
+-
+ fn jepa_config() -> VJepaConfig {
+     VJepaConfig {
+         model_type: "vjepa2_1_pipeline_bench".to_string(),

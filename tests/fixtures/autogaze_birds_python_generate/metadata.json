@@ -1,0 +1,42 @@
+{
+  "source": "/home/mosure/Videos/birds.mp4",
+  "frames": 2,
+  "raw_shape": [
+    2,
+    1080,
+    1920,
+    3
+  ],
+  "raw_rgba_frames": [
+    "raw_rgba_frame_00.png",
+    "raw_rgba_frame_01.png"
+  ],
+  "processed_shape": [
+    1,
+    2,
+    3,
+    224,
+    398
+  ],
+  "gazing_model_shape": [
+    1,
+    2,
+    3,
+    224,
+    224
+  ],
+  "video_embeds_shape": [
+    1,
+    2,
+    196,
+    192
+  ],
+  "streaming_video_embed_max_abs_diff": 9.1552734375e-05,
+  "gazing_ratio": 0.75,
+  "task_loss_requirement": 0.7,
+  "valid_tokens": 220,
+  "num_gazing_each_frame": [
+    198,
+    30
+  ]
+}

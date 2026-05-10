@@ -17,7 +17,12 @@ documentation = "https://docs.rs/burn_autogaze"
 readme = "README.md"
 categories = ["computer-vision", "science", "wasm"]
 keywords = ["autogaze", "burn", "gaze", "vision"]
-exclude = ["/.github/", "/crates/bevy_burn_autogaze/", "/web/"]
+exclude = [
+  "/.github/",
+  "/crates/bevy_burn_autogaze/",
+  "/tests/fixtures/autogaze_birds_python_generate/",
+  "/web/",
+]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -43,6 +48,7 @@ anyhow = "1"
 burn = { version = "0.21.0", default-features = false, features = ["fusion", "std"] }
 burn-store = { version = "0.21.0", default-features = false, features = ["pytorch", "safetensors", "std"] }
 half = "2"
+image = { version = "0.25", default-features = false }
 safetensors = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -63,6 +69,7 @@ features = [
 [dev-dependencies]
 criterion = "0.8.2"
 gif = "0.13"
+image = { version = "0.25", default-features = false, features = ["png"] }
 tempfile = "3"
 
 [[bench]]

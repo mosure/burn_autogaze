@@ -2,7 +2,7 @@
 pub mod camera {
     use std::sync::{
         Arc, Mutex,
-        mpsc::{self, Receiver, Sender, SyncSender, TryRecvError},
+        mpsc::{self, Receiver, Sender, SyncSender, TryRecvError, TrySendError},
     };
     use std::time::Duration;
 
@@ -113,8 +113,10 @@ pub mod camera {
                 Ok(buffer) => match buffer.decode_image::<RgbAFormat>() {
                     Ok(image) => {
                         error_count = 0;
-                        if let Some(sender) = SAMPLE_SENDER.get() {
-                            let _ = sender.try_send(image);
+                        if let (Some(sender), Some(receiver)) =
+                            (SAMPLE_SENDER.get(), SAMPLE_RECEIVER.get())
+                        {
+                            send_latest_sample(sender, receiver, image);
                         }
                     }
                     Err(err) => {
@@ -150,6 +152,23 @@ pub mod camera {
         }
 
         last_image
+    }
+
+    fn send_latest_sample(
+        sender: &SyncSender<RgbaImage>,
+        receiver: &Arc<Mutex<Receiver<RgbaImage>>>,
+        image: RgbaImage,
+    ) {
+        match sender.try_send(image) {
+            Ok(()) => {}
+            Err(TrySendError::Full(image)) => {
+                if let Ok(receiver) = receiver.lock() {
+                    while receiver.try_recv().is_ok() {}
+                }
+                let _ = sender.try_send(image);
+            }
+            Err(TrySendError::Disconnected(_)) => {}
+        }
     }
 
     fn open_first_camera(devices: &[CameraInfo], request: CameraRequest) -> Option<Camera> {
@@ -241,6 +260,30 @@ pub mod camera {
     fn log_capture_error(action: &str, err: impl std::fmt::Display, error_count: usize) {
         if error_count == 1 || error_count.is_multiple_of(120) {
             crate::log(&format!("failed to {action}: {err}"));
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn latest_sample_sender_overwrites_stale_buffered_frame() {
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let receiver = Arc::new(Mutex::new(receiver));
+            let stale = RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]));
+            let latest = RgbaImage::from_pixel(1, 1, image::Rgba([9, 8, 7, 255]));
+
+            send_latest_sample(&sender, &receiver, stale);
+            send_latest_sample(&sender, &receiver, latest);
+
+            let received = receiver
+                .lock()
+                .expect("receiver lock")
+                .try_recv()
+                .expect("latest frame");
+            assert_eq!(received.as_raw(), &[9, 8, 7, 255]);
+            assert!(receiver.lock().expect("receiver lock").try_recv().is_err());
         }
     }
 }

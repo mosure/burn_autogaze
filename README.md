@@ -120,22 +120,33 @@ The tile output recovery follows upstream's per-scale mask stitching: each
 full-frame grid for that scale. For `1920x1080`, the AnyRes canvas is
 `2016x1120`, yielding complete `18x10`, `36x20`, `63x35`, and `126x70`
 stitched grids. `AutoGazePipeline::set_tile_batch_size` controls how many tiles
-are generated in one backend batch; the default is `8`, which keeps the 45-tile
-1080p path away from large CUDA/WebGPU fusion graphs while preserving the same
-tile layout.
+are generated in one backend batch; the default is `64`, which batches a full
+45-tile 1080p AnyRes frame on capable backends. Lower it when a CUDA/WebGPU
+backend favors smaller autoregressive graphs; the stitched tile layout remains
+unchanged.
 
 ## tensor pipeline api
 
 The core crate exposes small, composable pipeline nodes for downstream video and
 codec integrations. `TensorClipInput` accepts already-normalized Burn video
 tensors in `[batch, time, channel, height, width]` layout. `RgbaClipInput`
-accepts packed RGBA clips and converts them through the same AutoGaze processor
-affine used by `trace_rgba_clip_with_mode`. Output nodes receive
-`AutoGazePipelinePacket`, which carries the source tensor clip, decoded traces,
-mode, and `top_k`; downstream crates can plug in `VecOutputNode`, `FnOutputNode`,
-or their own `AutoGazeOutputNode` for Bevy rendering, file writing, transport, or
-codec-side reconstruction. Packets also expose `frame_tensor`, `frame_mask`, and
-`frame_pyramid_tokens` helpers so output nodes can stay tensor-native.
+accepts packed RGBA clips and converts them through the same mode-aware RGBA
+preparation as `trace_rgba_clip_with_mode`: realtime resize mode applies the
+upstream-style shortest-edge processor resize before the model, while tiled modes
+preserve the configured source tensor. Use `RgbaClipInput::with_inference_mode`
+when the graph mode is not the default realtime path. Output nodes receive
+`AutoGazePipelinePacket`, which carries the source tensor clip, mode, `top_k`,
+and optionally decoded traces. Trace generation is disabled by default because it
+requires model generation and backend-to-host reads; set `emit_traces` only for
+consumers that need fixation points or masks. Downstream crates can plug in
+`VecOutputNode`, `FnOutputNode`, or their own `AutoGazeOutputNode` for Bevy
+rendering, file writing, transport, or codec-side reconstruction. Packets also
+expose `frame_tensor`, `frame_mask`, and `frame_pyramid_tokens` helpers so output
+nodes can stay tensor-native when traces are enabled.
+For live RGBA sources, `AutoGazeRgbaFrameQueue` keeps a fixed-length frame
+window and recycles clip buffers, so Bevy, file, and camera frontends can share
+the same clip packing path instead of each carrying their own rolling buffer
+logic.
 
 ```rust,no_run
 use burn::backend::NdArray;
@@ -152,12 +163,11 @@ let shape = AutoGazeRgbaClipShape::new(2, 720, 1280);
 let rgba = vec![0_u8; shape.clip_len * shape.height * shape.width * 4];
 let input = RgbaClipInput::new().with_clip(AutoGazeRgbaClip::new(rgba, shape)?);
 let output = VecOutputNode::new();
-let mut graph = AutoGazeTensorPipeline::new(pipeline, input, output).with_config(
-    AutoGazeTensorPipelineConfig {
-        mode: AutoGazeInferenceMode::ResizeToModelInput,
-        top_k: 10,
-    },
-);
+let config = AutoGazeTensorPipelineConfig::default()
+    .with_mode(AutoGazeInferenceMode::ResizeToModelInput)
+    .with_top_k(10)
+    .with_emit_traces(true);
+let mut graph = AutoGazeTensorPipeline::new(pipeline, input, output).with_config(config);
 graph.run_next(&device)?;
 
 # Ok::<(), anyhow::Error>(())
@@ -171,11 +181,116 @@ fills image regions without leaving the backend, and
 mask-density tokens with backend `topk`, avoiding synchronous host readback on
 wasm/WebGPU.
 
+When the downstream model already has its own patchifier, use the sparse
+readout helpers instead of reinterpreting AutoGaze token ids directly.
+`fixation_points_to_readout_rects` and `trace_to_frame_readout_rects` preserve
+the decoded multi-scale cell geometry, while
+`fixation_points_to_readout_tokens` and `trace_frame_readout_tokens` project
+that geometry onto an arbitrary image-token grid with optional dilation and
+per-frame token caps. `generated_to_frame_readout_tokens` provides the same
+projection directly from `AutoGazeGenerateOutput` for hot paths that do not need
+to allocate full decoded traces. `frame_readout_tokens_to_video_tokens` and
+`frame_readout_rects_to_video_tokens` then map the per-frame image readout onto
+generic `[temporal, row, col]` video-token grids for downstream sparse-video
+models, while `generated_to_video_readout_tokens` and
+`trace_to_video_readout_tokens` provide the same path as one-call adapters.
+`video_readout_tokens_to_coords` and
+`batched_video_readout_tokens_to_coords` then adapt those indices to
+`[batch, temporal, row, col]` coordinate rows for downstream sparse patchifiers
+such as `burn_flex_gmm`. `SparseVideoPatchGeometry` derives the video-token
+grid from the downstream patchifier's frame, tubelet, and patch dimensions, so
+consumers do not need to duplicate V-JEPA-style video-grid shape checks before
+asking for coordinate tensors.
+This keeps AutoGaze's model-specific scale layout in `burn_autogaze`,
+leaving crates such as `burn_jepa` to wrap the resulting indices in their own
+mask types and to use sparse patchification backends such as `burn_flex_gmm` for
+the actual selected-token readout.
+For tensor-node pipelines, set
+`AutoGazeTensorPipelineConfig::emit_readout_points` when output nodes need
+sparse readout without full trace allocation. Realtime resize mode decodes
+generated output directly; tiled modes store remapped source-frame fixation
+points so callers can still apply their own readout thresholds, dilation, and
+token caps. `AutoGazePipelinePacket::video_readout_tokens` exposes the same
+generic sparse-video projection directly to output nodes regardless of whether
+the packet contains traces, readout points, or realtime generated output. Async
+consumers can use
+`AutoGazePipeline::readout_points_with_mode_async` for the same no-trace
+readout path without falling back to full trace allocation on wasm/WebGPU.
+See [docs/sparse-readout-integration.md](./docs/sparse-readout-integration.md)
+for the ownership boundary between decoded AutoGaze geometry, V-JEPA tubelet
+projection, and sparse patchify kernels.
+
+```rust,no_run
+use burn_autogaze::{
+    AutoGazeConfig, AutoGazeGenerateOutput, SparseReadoutGrid, SparseReadoutOptions,
+    SparseVideoPatchGeometry, SparseVideoReadoutOptions, SparseVideoReadoutProjection,
+    generated_to_video_readout_tokens,
+};
+
+# let config = AutoGazeConfig::default();
+# let generated = AutoGazeGenerateOutput {
+#     gazing_pos: vec![Vec::new()],
+#     num_gazing_each_frame: Vec::new(),
+#     if_padded_gazing: vec![Vec::new()],
+#     confidences: vec![Vec::new()],
+# };
+let grid = SparseReadoutGrid::square_from_token_count(config.num_vision_tokens_each_frame)?;
+let options = SparseReadoutOptions::default()
+    .with_max_fixations_per_frame(10)
+    .with_dilation(1)
+    .with_max_tokens_per_frame(32);
+let _video_tokens = generated_to_video_readout_tokens(
+    &generated,
+    &config,
+    0,
+    grid,
+    SparseVideoPatchGeometry::square_patch(2, 224, 224, 2, 16).readout_grid()?,
+    options,
+    SparseVideoReadoutOptions::default()
+        .with_tubelet_size(2)
+        .with_exact_tokens(32),
+)?;
+let _coord_projection = SparseVideoReadoutProjection::from_patch_geometry(
+    grid,
+    SparseVideoPatchGeometry::square_patch(2, 224, 224, 2, 16),
+)?;
+
+# Ok::<(), anyhow::Error>(())
+```
+
+For sparse video or renderer outputs, `fixation_sparse_update_plan` exposes the
+same native multi-scale pixel rectangles used by the interframe visualization.
+Use `copy_sparse_update_rgba` for CPU-side sparse accumulation,
+`copy_sparse_update_tensor` for backend tensor-side accumulation, or pass the
+plan's `FixationPixelRect`s to a renderer-specific GPU compositor. Use
+`fixation_effective_sparse_update_plan` only when the consumer explicitly wants a
+finest-active-grid footprint instead of the upstream-style native scale cells.
+Runtime metric helpers such as `AutoGazeGazeRatioStats`, `AutoGazePsnrStats`,
+`fps_from_millis`, and `format_psnr_db` live in the core crate so apps report the
+same values without duplicating smoothing or formatting behavior.
+`AutoGazeTensorVisualizationState::last_interframe_path` reports whether the
+latest tensor-side interframe output used a keyframe, sparse rectangle update, or
+dense mask update, which keeps app and benchmark diagnostics aligned.
+`AutoGazeTensorVisualizationOptions::with_sparse_update_policy` and the
+`DEFAULT_TENSOR_SPARSE_UPDATE_MAX_*` constants expose the sparse-rectangle
+threshold used by tensor interframe composition so viewers can benchmark dense
+versus sparse update tradeoffs without forking visualization logic.
+`AutoGazeInferenceSequencer` provides the shared async stale-result gate used by
+camera frontends to drop late model results instead of rendering frames out of
+order.
+`AutoGazeRealtimePolicy` captures the default one-in-flight frame admission and
+preview behavior used by realtime wrappers; Bevy exposes this as
+`--max-in-flight` / `max-in-flight`. Realtime streaming-cache mode keeps the
+effective policy to one in-flight task so KV state advances in order; higher
+limits are for tiled or full-window non-streaming runs.
+`should_use_streaming_cache` centralizes the rule that streaming KV cache is only
+used for multi-frame resize-mode realtime inference.
+
 ## visualization
 
 | mode | output behavior | update ratio |
 |---|---|---|
-| `full-blend` | redraws the current input with a white alpha-blended mask | `100%` |
+| `full-blend` | redraws the current input with a white alpha-blended mask | selected effective mask pixels / full-frame pixels |
 | `interframe` | keeps prior output outside the current mask, updates masked cells to the current input, and redraws a full keyframe every `keyframe-duration` frames | masked-cell pixels / full-frame pixels, or `100%` on keyframes |
 
 AutoGaze emits multi-scale token positions. For the NVIDIA config, the Rust
@@ -227,7 +342,10 @@ npm run serve
 and returns binary token-cell mask, visualization output, and `input | mask |
 output` RGBA buffers (`output_rgba()` is the preferred accessor, with
 `blend_rgba()` kept for compatibility). outputs also expose mask/update pixel
-counts and ratios. use `set_visualization_mode("interframe")` and
+counts, ratios, and output PSNR in dB against the latest input frame. The
+low-level wasm defaults mirror the realtime viewer display defaults:
+`top_k=10`, model-config generation budget, `tile_batch_size=64`, and
+`blend_alpha=0.38`. use `set_visualization_mode("interframe")` and
 `set_keyframe_duration(n)` to enable stateful interframe output-stream updates.
 this is the low-level wasm-bindgen api demo.
 
@@ -252,19 +370,28 @@ Set `--show-fps=false` or `--show-gaze-ratio=false` to hide the default text
 overlays, or `--show-psnr=true` to enable output PSNR. Set
 `--log-pipeline-timing` to print source capture, resize/prep, pack, input
 upload/preprocess, model, visualization, display, and total timing. The native CLI
-defaults to the model generation budget (`--max-gaze-tokens-each-frame 0`) and a
-640px-wide aspect-preserving source resize for realtime use. `--mode tiled`
+defaults to `--top-k 10`, `--max-gaze-tokens-each-frame 0`,
+`--frames-per-clip 2`, and a 640px-wide
+aspect-preserving source resize for realtime use. `--mode tiled`
 defaults to a 1280px-wide source frame, `--top-k 2`,
-`--max-gaze-tokens-each-frame 0`, `--frames-per-clip 2`, and
-`--tile-batch-size 64`; set `--frames-per-clip 16` explicitly when you want the
-upstream long-context clip length. The
-viewer keeps prepared frame tensors rolling so multi-frame clips only
-upload/preprocess the newest frame. Pass an explicit nonzero
-`--max-gaze-tokens-each-frame` to cap generation for performance, or pass
-explicit `--top-k`, `--tile-batch-size`, `--inference-width`, and
+`--max-gaze-tokens-each-frame 24`, `--frames-per-clip 2`, and
+`--tile-batch-size 64`. In realtime mode `--streaming-cache=true`
+keeps decoder KV state across frames and advances one new frame per inference.
+Pass `--streaming-cache=false` for direct full-window comparison. The realtime
+default uses the upstream model budget so the mask does not collapse to only
+coarse multi-scale cells. Pass explicit `--max-gaze-tokens-each-frame`,
+`--top-k`, `--tile-batch-size`, `--inference-width`, and
 `--inference-height` values for fixed full-resolution inspection. Native
 `realtime` requests a 640x360 camera stream when height is omitted so camera
 decode does not dominate the realtime path.
+`--display-transfer gpu` enables the Bevy/Burn shared-device texture bridge;
+the default CPU transfer is currently faster in the measured viewer path.
+For GPU display-transfer interframe runs, `--tensor-sparse-update-max-rects`
+and `--tensor-sparse-update-max-ratio` control when the tensor compositor uses a
+sparse rectangle copy instead of the dense mask path; pass `0` rects to force
+dense tensor updates.
+Use `--require-hardware-adapter=true` for throughput runs that should fail fast
+instead of reporting CPU/software render-adapter numbers.
 The output panel uses a subtle `--blend-alpha` default, and processed inference
 frames are not overwritten by raw camera previews while a model task is in
 flight; this keeps wasm output monotonic and makes interframe accumulation
@@ -272,7 +399,12 @@ easier to inspect.
 Use `--perf-summary-frames N` (or `perf-summary-frames=N` on wasm) for a
 deterministic static-source perf run: native prints a JSON summary and exits,
 while wasm exposes live samples on `window.__autogazePerf` and the final summary
-on `window.__autogazePerfSummary`.
+on `window.__autogazePerfSummary`. Both include the latest frame dimensions,
+FPS, gaze ratio, PSNR fields when enabled, frame counts, tensor interframe path,
+render adapter metadata, and the configured/effective realtime admission
+policy, including the tensor sparse-update policy. Native runs can also pass
+`--perf-summary-path target/perf.json` to write the same summary directly as a
+JSON artifact for hardware throughput reports.
 Run `cargo run -p bevy_burn_autogaze -- --help` for accepted
 values, aliases, and value ranges.
 
@@ -314,8 +446,10 @@ real-model group when the autogaze hugging face snapshot is available. synthetic
 backend benches run the full matrix across `single-scale-224` and
 `multiscale-32-64-112-224` model layouts, so tiled high-resolution runs are
 measured with the same AnyRes tile layout and multi-scale gaze-token layout used
-by the NVIDIA config. real-model tile and KV-cache groups include 720p/1080p
-two-frame cases plus 16-frame long-context cases. the real task-loss group
+by the NVIDIA config. real-model tile and KV-cache groups include the realtime
+640x360 default plus 720p/1080p two-frame cases. 16-frame long-context stress
+cases are included for CUDA and can be enabled for WebGPU by setting
+`AUTOGAZE_BENCH_LONG_CONTEXT=1`. the real task-loss group
 compares model-default stopping, disabled stopping, and an explicit `0.7`
 threshold for resize and tiled modes. the real video-file group decodes a short
 RGBA clip with `ffmpeg` from `AUTOGAZE_VIDEO` (falling back to
@@ -327,9 +461,15 @@ batch that still fits the target backend and model. the RGBA e2e group measures
 source RGBA conversion, trace generation, and crisp visualization together. the
 visualization group also
 measures `full-blend`, `interframe-keyframe`, and `interframe-delta` output
-paths for single-scale and multi-scale crisp masks. the Bevy viewer bench
-measures side-by-side visualization plus persistent image asset updates at 720p
-and 1080p.
+paths for single-scale and multi-scale crisp masks. the tensor visualization
+group measures Burn-side side-by-side and split-panel tensor compositing on each
+enabled backend, with `model-fixations`, `tiny-sparse`, and `coarse-dense`
+fixation cases to make sparse rectangle updates and dense mask updates visible
+as separate measurements; this is the lane to use when checking whether the Bevy
+GPU display-transfer path is dominated by tensor composition or texture handoff.
+the Bevy viewer bench measures side-by-side and split-panel CPU
+visualization plus persistent image asset updates at 720p and 1080p, also split
+by `multiscale`, `tiny-sparse`, and `coarse-dense` fixation cases.
 
 useful filters:
 
@@ -339,18 +479,59 @@ cargo bench --bench backend_pipeline -- autogaze_tile_batch_size/webgpu
 AUTOGAZE_HF_DIR=/path/to/AutoGaze cargo bench --bench backend_pipeline --features webgpu -- autogaze_real_task_loss/webgpu
 cargo bench --bench backend_pipeline -- autogaze_rgba_e2e_video/webgpu/multiscale-32-64-112-224/resize-224/720p
 cargo bench --bench backend_pipeline -- autogaze_visualization/multiscale-32-64-112-224/interframe-delta
-cargo bench -p bevy_burn_autogaze --bench viewer_pipeline -- bevy_autogaze_viewer_pipeline/full-blend/1080p
+cargo bench --bench backend_pipeline --features webgpu -- autogaze_tensor_visualization/webgpu/multiscale-32-64-112-224/interframe-delta/tiny-sparse
+cargo bench --bench backend_pipeline --features webgpu -- autogaze_tensor_visualization/webgpu/multiscale-32-64-112-224/interframe-delta/coarse-dense
+cargo bench -p bevy_burn_autogaze --bench viewer_pipeline -- bevy_autogaze_viewer_pipeline/interframe-delta-panels/coarse-dense/1080p
 ```
 
 ## validation
 
 ```sh
+tools/check_release_readiness.sh
 cargo test
 cargo test --features cuda --test backend_pipeline -- --nocapture
 cargo clippy --all-targets --features cuda -- -D warnings
 cargo check --target wasm32-unknown-unknown --no-default-features --features wasm
+cargo clippy -p burn_autogaze --target wasm32-unknown-unknown --no-default-features --features wasm -- -D warnings
+cargo check -p bevy_burn_autogaze --target wasm32-unknown-unknown
+cargo clippy -p bevy_burn_autogaze --target wasm32-unknown-unknown -- -D warnings
 cargo package --allow-dirty
+cd crates/bevy_burn_autogaze && npm ci && npm run test:browser
+tools/run_bevy_perf_matrix.sh --dry-run --frames 2 --camera
 ```
+
+`tools/check_release_readiness.sh` runs the local non-hardware release gate:
+root and Bevy tests, native/wasm checks, clippy with warnings denied, benchmark
+compilation, package verification, and `git diff --check`. Pass `--browser` on
+a host with a normal Node/Playwright setup to include the static-source browser
+smoke, or `--real-model-browser` after staging local wasm model assets.
+`tools/check_bevy_wasm_demo.sh --browser` is the narrower Pages/demo gate used
+by the deploy workflow; it checks the Bevy wasm target, installs the matching
+`wasm-bindgen-cli`, installs npm dependencies, builds `www/out`, and runs the
+static-source browser smoke. If the system `node`/`npm`/`npx` are Snap-provided
+or otherwise unusable, pass `--node-bin-dir /path/to/node/bin` or set
+`AUTOGAZE_NODE_BIN_DIR=/path/to/node/bin`. In sandboxed environments where
+Playwright cannot use `sudo` for OS dependency installation, pass
+`--no-browser-deps` and provide a browser cache such as
+`PLAYWRIGHT_BROWSERS_PATH=/tmp/ms-playwright`.
 
 cuda/webgpu backend tests and benches skip cleanly when the requested
 accelerator is not available on the host.
+See [docs/completion-audit.md](./docs/completion-audit.md) for the current
+coverage checklist, browser-test blocker notes, and hardware FPS runbook. Run
+`tools/run_bevy_perf_matrix.sh --frames 120 --camera` on a real GPU host to
+capture native Bevy throughput logs, per-case JSON summaries, and aggregate
+`summary.json` with CPU-adapter failures guarded by
+`--require-hardware-adapter=true`.
+
+The upstream parity fixtures are generated from the NVIDIA Python package with:
+
+```sh
+tools/generate_upstream_fixture.py \
+  --model-dir /path/to/AutoGaze \
+  --video /path/to/video.mp4 \
+  --out-dir tests/fixtures/autogaze_birds_python_generate
+```
+
+`tools/generate_upstream_fixture.py --help` is dependency-light, so the fixture
+command surface can be inspected without importing the Python model stack.
