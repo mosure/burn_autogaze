@@ -72,6 +72,36 @@ fn source_before_tests(source: &str) -> &str {
         .unwrap_or(source)
 }
 
+fn source_before_first_test_module(source: &str) -> String {
+    let lines = source.lines().collect::<Vec<_>>();
+    for (idx, line) in lines.iter().enumerate() {
+        if !line.trim_start().starts_with("mod tests") {
+            continue;
+        }
+
+        let is_test_cfg = |line: &str| {
+            let line = line.trim();
+            line.starts_with("#[cfg(") && line.contains("test")
+        };
+        let cfg_idx = if idx > 0 && is_test_cfg(lines[idx - 1]) {
+            Some(idx - 1)
+        } else if idx > 1
+            && lines[idx - 1].trim().is_empty()
+            && is_test_cfg(lines[idx - 2])
+        {
+            Some(idx - 2)
+        } else {
+            None
+        };
+
+        if let Some(cutoff) = cfg_idx {
+            return lines[..cutoff].join("\n");
+        }
+    }
+
+    source.to_string()
+}
+
 #[test]
 fn bevy_wasm_readout_uses_async_tensor_data_path() {
     let Some(source) = bevy_source() else {
@@ -143,6 +173,58 @@ fn model_async_greedy_selection_uses_async_readback_only() {
         !body.contains(".into_data()"),
         "async greedy selection must not synchronously read tensor data"
     );
+}
+
+#[test]
+fn production_pipeline_surfaces_avoid_unrecoverable_panics() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let checked_sources = [
+        manifest.join("src").join("config.rs"),
+        manifest.join("src").join("lib.rs"),
+        manifest.join("src").join("metrics.rs"),
+        manifest.join("src").join("model.rs"),
+        manifest.join("src").join("nodes.rs"),
+        manifest.join("src").join("pipeline.rs"),
+        manifest.join("src").join("pyramid.rs"),
+        manifest.join("src").join("readout.rs"),
+        manifest.join("src").join("runtime.rs"),
+        manifest.join("src").join("safetensors_io.rs"),
+        manifest.join("src").join("trace.rs"),
+        manifest.join("src").join("visualization.rs"),
+        manifest.join("src").join("wasm.rs"),
+        manifest
+            .join("crates")
+            .join("bevy_burn_autogaze")
+            .join("src")
+            .join("lib.rs"),
+        manifest
+            .join("crates")
+            .join("bevy_burn_autogaze")
+            .join("src")
+            .join("main.rs"),
+        manifest
+            .join("crates")
+            .join("bevy_burn_autogaze")
+            .join("src")
+            .join("platform.rs"),
+    ];
+
+    for path in checked_sources {
+        let Some(source) = optional_source(&path) else {
+            continue;
+        };
+        let production = source_before_first_test_module(&source);
+        for (line_no, line) in production.lines().enumerate() {
+            for forbidden in ["panic!", ".unwrap()", ".expect("] {
+                assert!(
+                    !line.contains(forbidden),
+                    "{}:{} production code should propagate errors or return fallbacks instead of {forbidden}",
+                    path.display(),
+                    line_no + 1
+                );
+            }
+        }
+    }
 }
 
 #[test]
