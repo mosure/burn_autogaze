@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 
 const DEFAULT_WASM_MODEL_DIR: &str = "/home/mosure/.cache/huggingface/hub/models--nvidia--AutoGaze/snapshots/5100fae739ec1bf3f875914fa1b703846a18943a";
 const BEVY_PERF_CASE_TIMEOUT_SECS: u64 = 600;
+const BEVY_PERF_MATRIX_MANIFEST: &str = "matrix.json";
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "burn_autogaze repository task runner")]
@@ -972,6 +973,10 @@ fn bevy_perf_matrix(root: PathBuf, args: BevyPerfMatrixArgs) -> Result<()> {
         ]);
     }
 
+    if !runner.dry_run {
+        write_perf_matrix_manifest(&args.out, &args, &cases)?;
+    }
+
     for (name, case_args, include_static) in cases {
         let mut app_args = Vec::<OsString>::new();
         if include_static {
@@ -1003,6 +1008,37 @@ fn bevy_perf_matrix(root: PathBuf, args: BevyPerfMatrixArgs) -> Result<()> {
         println!("\nwrote logs and JSON summaries to {}", args.out.display());
     }
     Ok(())
+}
+
+fn write_perf_matrix_manifest(
+    out_dir: &Path,
+    args: &BevyPerfMatrixArgs,
+    cases: &[(&str, Vec<&str>, bool)],
+) -> Result<()> {
+    fs::create_dir_all(out_dir)?;
+    let cases = cases
+        .iter()
+        .map(|(name, app_args, include_static)| {
+            json!({
+                "case": name,
+                "include_static_source": include_static,
+                "app_args": app_args,
+                "summary_path": out_dir.join(format!("{name}.json")).display().to_string(),
+                "log_path": out_dir.join(format!("{name}.log")).display().to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let manifest = json!({
+        "frames": args.frames,
+        "image": args.image.display().to_string(),
+        "camera": args.camera,
+        "xtask_build_profile": args.profile.as_str(),
+        "xtask_case_timeout_seconds": args.case_timeout_seconds,
+        "xtask_cache_dir": out_dir.join("cache").display().to_string(),
+        "require_hardware_adapter": true,
+        "cases": cases,
+    });
+    write_json(&out_dir.join(BEVY_PERF_MATRIX_MANIFEST), &manifest)
 }
 
 fn run_bevy_perf_case(
@@ -1117,9 +1153,7 @@ fn write_perf_aggregate(out_dir: &Path) -> Result<()> {
     for entry in fs::read_dir(out_dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension() != Some(OsStr::new("json"))
-            || path.file_name() == Some(OsStr::new("summary.json"))
-        {
+        if !is_perf_case_json_path(&path) {
             continue;
         }
         let mut row = load_json(&path)?;
@@ -1161,6 +1195,15 @@ fn write_perf_aggregate(out_dir: &Path) -> Result<()> {
     serde_json::to_writer_pretty(&mut file, &summary)?;
     writeln!(file)?;
     Ok(())
+}
+
+fn is_perf_case_json_path(path: &Path) -> bool {
+    path.extension() == Some(OsStr::new("json"))
+        && !matches!(
+            path.file_name(),
+            Some(name) if name == OsStr::new("summary.json")
+                || name == OsStr::new(BEVY_PERF_MATRIX_MANIFEST)
+        )
 }
 
 fn validate_bevy_perf_summary_cmd(root: PathBuf, args: ValidateBevyPerfSummaryArgs) -> Result<()> {
@@ -2129,6 +2172,55 @@ mod tests {
         assert_eq!(data["xtask_case_timeout_seconds"], 42);
         assert_eq!(data["xtask_cache_dir"], "target/autogaze-bevy-perf/cache");
         validate_summary(&data, true).expect("augmented summary should validate");
+    }
+
+    #[test]
+    fn perf_aggregate_excludes_manifest_and_summary_json() {
+        assert!(is_perf_case_json_path(Path::new(
+            "realtime-static-cpu.json"
+        )));
+        assert!(!is_perf_case_json_path(Path::new("summary.json")));
+        assert!(!is_perf_case_json_path(Path::new(
+            BEVY_PERF_MATRIX_MANIFEST
+        )));
+        assert!(!is_perf_case_json_path(Path::new(
+            "realtime-static-cpu.log"
+        )));
+    }
+
+    #[test]
+    fn perf_matrix_manifest_records_measurement_plan() {
+        let root = std::env::temp_dir().join(format!(
+            "burn-autogaze-xtask-manifest-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let args = BevyPerfMatrixArgs {
+            common: CommonArgs {
+                cargo: "cargo".to_owned(),
+                dry_run: false,
+            },
+            frames: 7,
+            image: PathBuf::from("fixture.png"),
+            out: root.clone(),
+            camera: true,
+            case_timeout_seconds: 42,
+            profile: BevyPerfBuildProfile::Release,
+        };
+        write_perf_matrix_manifest(
+            &root,
+            &args,
+            &[("case-a", vec!["--mode", "realtime"], true)],
+        )
+        .expect("manifest should write");
+        let manifest = load_json(&root.join(BEVY_PERF_MATRIX_MANIFEST)).expect("manifest json");
+
+        assert_eq!(manifest["frames"], 7);
+        assert_eq!(manifest["xtask_build_profile"], "release");
+        assert_eq!(manifest["xtask_case_timeout_seconds"], 42);
+        assert_eq!(manifest["cases"][0]["case"], "case-a");
+        assert_eq!(manifest["cases"][0]["include_static_source"], true);
+        let _ = fs::remove_dir_all(&root);
     }
 
     fn completion_audit_args(

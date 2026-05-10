@@ -877,8 +877,9 @@ cargo run -p xtask -- bevy-perf-matrix --frames 120 --camera
 The script passes `--perf-summary-path` so each case writes a JSON summary
 artifact directly under `target/autogaze-bevy-perf/`, keeps the matching logs,
 includes deterministic static-source cases and optional live-camera cases,
-writes aggregate `target/autogaze-bevy-perf/summary.json`, and keeps
-`--require-hardware-adapter=true` enabled for every run. It routes
+always writes `target/autogaze-bevy-perf/matrix.json` with the intended run
+plan, writes aggregate `target/autogaze-bevy-perf/summary.json` after all cases
+complete, and keeps `--require-hardware-adapter=true` enabled for every run. It routes
 `XDG_CACHE_HOME` to the perf artifact directory so shader/cache writes do not
 touch a read-only home directory. Each per-case JSON includes xtask measurement
 metadata (`case`, `xtask_build_profile`, `xtask_case_timeout_seconds`, and
