@@ -6,7 +6,9 @@ use std::io::Write as _;
 #[cfg(unix)]
 use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Args, Parser, Subcommand};
@@ -14,6 +16,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 const DEFAULT_WASM_MODEL_DIR: &str = "/home/mosure/.cache/huggingface/hub/models--nvidia--AutoGaze/snapshots/5100fae739ec1bf3f875914fa1b703846a18943a";
+const BEVY_PERF_CASE_TIMEOUT_SECS: u64 = 600;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "burn_autogaze repository task runner")]
@@ -226,6 +229,44 @@ impl Runner {
             .with_context(|| format!("run {}", command.display()))
     }
 
+    fn output_with_timeout(
+        &self,
+        command: &PreparedCommand,
+        timeout: Duration,
+    ) -> Result<TimedOutput> {
+        if self.dry_run {
+            bail!(
+                "cannot capture output in dry-run mode: {}",
+                command.display()
+            );
+        }
+        let mut child = self
+            .std_command(command)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("run {}", command.display()))?;
+        let started = Instant::now();
+        loop {
+            if child.try_wait()?.is_some() {
+                let output = child.wait_with_output()?;
+                return Ok(TimedOutput {
+                    output,
+                    timed_out: false,
+                });
+            }
+            if started.elapsed() >= timeout {
+                let _ = child.kill();
+                let output = child.wait_with_output()?;
+                return Ok(TimedOutput {
+                    output,
+                    timed_out: true,
+                });
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
+
     fn std_command(&self, command: &PreparedCommand) -> Command {
         let mut std_command = Command::new(&command.program);
         std_command.args(&command.args).current_dir(&command.cwd);
@@ -252,6 +293,11 @@ impl Runner {
         entries.extend(std::env::split_paths(&current));
         std::env::join_paths(entries).ok()
     }
+}
+
+struct TimedOutput {
+    output: Output,
+    timed_out: bool,
 }
 
 struct PreparedCommand {
@@ -565,8 +611,11 @@ fn completion_audit(root: PathBuf, args: CompletionAuditArgs) -> Result<()> {
     }
     validate_bevy_perf_summary_self_test()?;
 
-    if let Some(path) = args.burn_jepa {
-        check_burn_jepa_sparse_readout_integration(&path)?;
+    let mut evidence_errors = Vec::new();
+    if let Some(path) = &args.burn_jepa {
+        if let Err(error) = check_burn_jepa_sparse_readout_integration(path) {
+            evidence_errors.push(format!("burn_jepa migration audit failed:\n{error:#}"));
+        }
     } else {
         println!(
             "\nskipping burn_jepa migration audit; pass --burn-jepa PATH to enforce that the\nsibling checkout no longer duplicates AutoGaze generated-token decoding."
@@ -574,24 +623,27 @@ fn completion_audit(root: PathBuf, args: CompletionAuditArgs) -> Result<()> {
     }
 
     if args.hardware_perf {
-        bevy_perf_matrix(
+        let perf_result = bevy_perf_matrix(
             root,
             BevyPerfMatrixArgs {
-                common: args.common,
+                common: args.common.clone(),
                 frames: args.frames,
                 image: PathBuf::from(
                     "tests/fixtures/autogaze_birds_python_generate/raw_rgba_frame_00.png",
                 ),
-                out: args.out,
+                out: args.out.clone(),
                 camera: true,
             },
-        )?;
+        );
+        if let Err(error) = perf_result {
+            evidence_errors.push(format!("native hardware Bevy perf audit failed:\n{error:#}"));
+        }
     } else {
         println!(
             "\nskipping native hardware Bevy perf audit; pass --hardware-perf on a host with a\nreal GPU render adapter and camera to enforce end-to-end throughput evidence."
         );
     }
-    Ok(())
+    finish_completion_audit_evidence(evidence_errors)
 }
 
 fn validate_completion_audit_args(args: &CompletionAuditArgs) -> Result<()> {
@@ -607,6 +659,20 @@ fn validate_completion_audit_args(args: &CompletionAuditArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn finish_completion_audit_evidence(errors: Vec<String>) -> Result<()> {
+    if errors.is_empty() {
+        return Ok(());
+    }
+
+    let report = errors
+        .iter()
+        .enumerate()
+        .map(|(index, error)| format!("{}. {error}", index + 1))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    bail!("completion audit evidence failed:\n{report}")
 }
 
 fn check_bevy_wasm_demo(root: PathBuf, args: CheckBevyWasmDemoArgs) -> Result<()> {
@@ -908,12 +974,13 @@ fn run_bevy_perf_case(
         return Ok(());
     }
     fs::create_dir_all(out_dir)?;
-    let output = runner
-        .std_command(&command)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
+    let timed_output = runner
+        .output_with_timeout(
+            &command,
+            Duration::from_secs(BEVY_PERF_CASE_TIMEOUT_SECS),
+        )
         .with_context(|| format!("run case {name}"))?;
+    let output = timed_output.output;
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -921,6 +988,12 @@ fn run_bevy_perf_case(
     );
     print!("{combined}");
     fs::write(&log_path, &combined)?;
+    ensure!(
+        !timed_output.timed_out,
+        "case {name} timed out after {}s; see {}",
+        BEVY_PERF_CASE_TIMEOUT_SECS,
+        log_path.display()
+    );
     ensure!(
         output.status.success(),
         "case {name} failed with status {}; see {}",
@@ -1889,6 +1962,22 @@ mod tests {
         assert!(
             err.to_string().contains("--frames"),
             "error should name the invalid frames argument: {err:?}"
+        );
+    }
+
+    #[test]
+    fn completion_audit_evidence_report_preserves_multiple_failures() {
+        let err = finish_completion_audit_evidence(vec![
+            "burn_jepa migration audit failed".to_owned(),
+            "native hardware Bevy perf audit failed".to_owned(),
+        ])
+        .expect_err("evidence failures should fail the audit");
+        let message = err.to_string();
+
+        assert!(
+            message.contains("burn_jepa migration audit failed")
+                && message.contains("native hardware Bevy perf audit failed"),
+            "completion audit should report every requested evidence failure: {err:?}"
         );
     }
 

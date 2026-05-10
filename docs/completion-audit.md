@@ -882,14 +882,14 @@ writes aggregate `target/autogaze-bevy-perf/summary.json`, and keeps
 
 ## current remote and external-integration snapshot
 
-The latest pushed `main` commit checked on 2026-05-10 is:
+A successful pushed `main` snapshot checked on 2026-05-10 was:
 
 ```sh
 git ls-remote git@github.com:mosure/burn_autogaze.git refs/heads/main
 # 069bb4cc5f03d24f730dcdfb66a3cff0dbdb26bd refs/heads/main
 ```
 
-GitHub Actions passed for that commit:
+GitHub Actions passed for that snapshot:
 
 ```sh
 gh run view 25631070447 --repo mosure/burn_autogaze \
@@ -900,7 +900,7 @@ gh run view 25631070447 --repo mosure/burn_autogaze \
 # job: test, conclusion: success
 ```
 
-The matching Pages workflow also passed:
+The matching Pages workflow also passed for that snapshot:
 
 ```sh
 gh run list --repo mosure/burn_autogaze --limit 5 \
@@ -909,7 +909,7 @@ gh run list --repo mosure/burn_autogaze --limit 5 \
 # test: success at 069bb4cc5f03d24f730dcdfb66a3cff0dbdb26bd
 ```
 
-Focused in-repo checks after that push still pass:
+Focused in-repo checks after that snapshot still pass locally:
 
 ```sh
 cargo run -p xtask -- completion-audit
@@ -953,7 +953,9 @@ temporary copy of `../burn_jepa`; applying it to the sibling checkout requires
 write access outside this repository.
 
 The same completion-audit script can enforce the hardware-bound throughput lane
-on a target GPU/camera host:
+on a target GPU/camera host. Bevy perf cases are bounded by a per-case timeout,
+and strict audit reports every requested evidence-lane failure together instead
+of stopping after the first missing lane:
 
 ```sh
 cargo run -p xtask -- completion-audit --hardware-perf --frames 120
