@@ -923,6 +923,16 @@ cargo run -p xtask -- validate-bevy-perf-summary --self-test
 # passed
 ```
 
+For a true completion gate, use strict mode. It fails unless both external
+remaining-evidence lanes are explicitly requested:
+
+```sh
+cargo run -p xtask -- completion-audit --strict \
+  --burn-jepa ../burn_jepa \
+  --hardware-perf \
+  --frames 120
+```
+
 The live sibling `../burn_jepa` checkout is not yet migrated. The external
 audit correctly fails there because the benchmark still contains local
 AutoGaze generated-token decoding and image-to-video projection:

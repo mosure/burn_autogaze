@@ -79,6 +79,8 @@ struct CompletionAuditArgs {
     burn_jepa: Option<PathBuf>,
     #[arg(long)]
     hardware_perf: bool,
+    #[arg(long)]
+    strict: bool,
     #[arg(long, default_value_t = 120)]
     frames: u32,
     #[arg(long, default_value = "target/autogaze-bevy-perf-audit")]
@@ -387,6 +389,7 @@ fn release_readiness(root: PathBuf, args: ReleaseReadinessArgs) -> Result<()> {
             },
             burn_jepa: None,
             hardware_perf: false,
+            strict: false,
             frames: 120,
             out: PathBuf::from("target/autogaze-bevy-perf-audit"),
         },
@@ -521,6 +524,16 @@ fn release_readiness(root: PathBuf, args: ReleaseReadinessArgs) -> Result<()> {
 
 fn completion_audit(root: PathBuf, args: CompletionAuditArgs) -> Result<()> {
     ensure!(args.frames > 0, "--frames must be greater than zero");
+    if args.strict {
+        ensure!(
+            args.burn_jepa.is_some(),
+            "strict completion audit requires --burn-jepa PATH"
+        );
+        ensure!(
+            args.hardware_perf,
+            "strict completion audit requires --hardware-perf on a real GPU/camera host"
+        );
+    }
     let runner = Runner::new(root.clone(), &args.common, None);
     let cargo = runner.cargo.clone();
     for command in [
