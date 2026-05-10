@@ -81,7 +81,8 @@ autogaze_run "$autogaze_cargo_bin" clippy -p burn_autogaze --target wasm32-unkno
 autogaze_run "$autogaze_cargo_bin" check -p bevy_burn_autogaze --target wasm32-unknown-unknown
 autogaze_run "$autogaze_cargo_bin" clippy -p bevy_burn_autogaze --target wasm32-unknown-unknown -- -D warnings
 autogaze_run "$autogaze_cargo_bin" check --example sparse_video_readout_adapter --features ndarray
-autogaze_run bash -n tools/common.sh tools/check_bevy_wasm_demo.sh tools/check_burn_jepa_sparse_readout_integration.sh tools/check_release_readiness.sh tools/run_bevy_perf_matrix.sh
+autogaze_run bash -n tools/common.sh tools/check_bevy_wasm_demo.sh tools/check_burn_jepa_sparse_readout_integration.sh tools/check_completion_audit.sh tools/check_release_readiness.sh tools/run_bevy_perf_matrix.sh
+autogaze_run tools/check_completion_audit.sh --dry-run
 autogaze_run python3 -m py_compile tools/generate_upstream_fixture.py tools/validate_bevy_perf_summary.py
 autogaze_run python3 tools/validate_bevy_perf_summary.py --self-test
 autogaze_run tools/run_bevy_perf_matrix.sh --dry-run --frames 2 --camera

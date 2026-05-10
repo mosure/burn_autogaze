@@ -908,6 +908,8 @@ gh run list --repo mosure/burn_autogaze --limit 5 \
 Focused in-repo checks after that push still pass:
 
 ```sh
+tools/check_completion_audit.sh
+
 cargo test -p burn_autogaze --features ndarray --test source_hygiene -- --nocapture
 # 8 passed
 
@@ -923,7 +925,7 @@ audit correctly fails there because the benchmark still contains local
 AutoGaze generated-token decoding and image-to-video projection:
 
 ```sh
-tools/check_burn_jepa_sparse_readout_integration.sh ../burn_jepa
+tools/check_completion_audit.sh --burn-jepa ../burn_jepa
 # missing generated_to_frame_readout_tokens / generated_to_video_readout_tokens
 # missing SparseReadoutGrid / SparseVideoReadoutGrid / SparseVideoReadoutOptions
 # still present generated_frame_tokens / context_mask_from_autogaze_generated
@@ -935,3 +937,10 @@ in-repo blocker. The migration patch is checked in at
 `docs/burn-jepa-sparse-readout-migration.patch` and was validated in a
 temporary copy of `../burn_jepa`; applying it to the sibling checkout requires
 write access outside this repository.
+
+The same completion-audit script can enforce the hardware-bound throughput lane
+on a target GPU/camera host:
+
+```sh
+tools/check_completion_audit.sh --hardware-perf --frames 120
+```
