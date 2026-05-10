@@ -523,17 +523,7 @@ fn release_readiness(root: PathBuf, args: ReleaseReadinessArgs) -> Result<()> {
 }
 
 fn completion_audit(root: PathBuf, args: CompletionAuditArgs) -> Result<()> {
-    ensure!(args.frames > 0, "--frames must be greater than zero");
-    if args.strict {
-        ensure!(
-            args.burn_jepa.is_some(),
-            "strict completion audit requires --burn-jepa PATH"
-        );
-        ensure!(
-            args.hardware_perf,
-            "strict completion audit requires --hardware-perf on a real GPU/camera host"
-        );
-    }
+    validate_completion_audit_args(&args)?;
     let runner = Runner::new(root.clone(), &args.common, None);
     let cargo = runner.cargo.clone();
     for command in [
@@ -599,6 +589,21 @@ fn completion_audit(root: PathBuf, args: CompletionAuditArgs) -> Result<()> {
     } else {
         println!(
             "\nskipping native hardware Bevy perf audit; pass --hardware-perf on a host with a\nreal GPU render adapter and camera to enforce end-to-end throughput evidence."
+        );
+    }
+    Ok(())
+}
+
+fn validate_completion_audit_args(args: &CompletionAuditArgs) -> Result<()> {
+    ensure!(args.frames > 0, "--frames must be greater than zero");
+    if args.strict {
+        ensure!(
+            args.burn_jepa.is_some(),
+            "strict completion audit requires --burn-jepa PATH"
+        );
+        ensure!(
+            args.hardware_perf,
+            "strict completion audit requires --hardware-perf on a real GPU/camera host"
         );
     }
     Ok(())
@@ -1829,6 +1834,61 @@ mod tests {
             err.to_string().contains("case_count"),
             "error should name the missing aggregate field: {err:?}"
         );
+    }
+
+    #[test]
+    fn strict_completion_audit_requires_external_evidence_lanes() {
+        let args = completion_audit_args(true, None, false);
+
+        let err = validate_completion_audit_args(&args)
+            .expect_err("strict audit without burn_jepa should fail");
+
+        assert!(
+            err.to_string().contains("--burn-jepa"),
+            "error should name the missing external audit lane: {err:?}"
+        );
+
+        let args = completion_audit_args(true, Some(PathBuf::from("../burn_jepa")), false);
+        let err = validate_completion_audit_args(&args)
+            .expect_err("strict audit without hardware perf should fail");
+
+        assert!(
+            err.to_string().contains("--hardware-perf"),
+            "error should name the missing hardware audit lane: {err:?}"
+        );
+    }
+
+    #[test]
+    fn completion_audit_rejects_zero_frame_hardware_runs() {
+        let args = CompletionAuditArgs {
+            frames: 0,
+            ..completion_audit_args(false, None, false)
+        };
+
+        let err = validate_completion_audit_args(&args).expect_err("zero frames should fail");
+
+        assert!(
+            err.to_string().contains("--frames"),
+            "error should name the invalid frames argument: {err:?}"
+        );
+    }
+
+    fn completion_audit_args(
+        strict: bool,
+        burn_jepa: Option<PathBuf>,
+        hardware_perf: bool,
+    ) -> CompletionAuditArgs {
+        CompletionAuditArgs {
+            common: CommonArgs {
+                cargo: "cargo".to_owned(),
+                dry_run: true,
+            },
+            burn_jepa,
+            hardware_perf,
+            strict,
+            frames: 120,
+            out: PathBuf::from("target/autogaze-bevy-perf-audit"),
+        }
     }
 
     fn valid_perf_summary() -> Value {
