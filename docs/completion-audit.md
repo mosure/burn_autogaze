@@ -875,3 +875,63 @@ artifact directly under `target/autogaze-bevy-perf/`, keeps the matching logs,
 includes deterministic static-source cases and optional live-camera cases,
 writes aggregate `target/autogaze-bevy-perf/summary.json`, and keeps
 `--require-hardware-adapter=true` enabled for every run.
+
+## current remote and external-integration snapshot
+
+The latest pushed `main` commit checked on 2026-05-10 is:
+
+```sh
+git ls-remote git@github.com:mosure/burn_autogaze.git refs/heads/main
+# 069bb4cc5f03d24f730dcdfb66a3cff0dbdb26bd refs/heads/main
+```
+
+GitHub Actions passed for that commit:
+
+```sh
+gh run view 25631070447 --repo mosure/burn_autogaze \
+  --json status,conclusion,headSha,updatedAt,jobs
+# status: completed
+# conclusion: success
+# headSha: 069bb4cc5f03d24f730dcdfb66a3cff0dbdb26bd
+# job: test, conclusion: success
+```
+
+The matching Pages workflow also passed:
+
+```sh
+gh run list --repo mosure/burn_autogaze --limit 5 \
+  --json databaseId,workflowName,status,conclusion,headSha,updatedAt
+# deploy github pages: success at 069bb4cc5f03d24f730dcdfb66a3cff0dbdb26bd
+# test: success at 069bb4cc5f03d24f730dcdfb66a3cff0dbdb26bd
+```
+
+Focused in-repo checks after that push still pass:
+
+```sh
+cargo test -p burn_autogaze --features ndarray --test source_hygiene -- --nocapture
+# 8 passed
+
+cargo test -p burn_autogaze --features ndarray readout -- --nocapture
+# 31 passed, including readout, packet, sync/async, and tiled no-trace coverage
+
+python3 tools/validate_bevy_perf_summary.py --self-test
+# passed
+```
+
+The live sibling `../burn_jepa` checkout is not yet migrated. The external
+audit correctly fails there because the benchmark still contains local
+AutoGaze generated-token decoding and image-to-video projection:
+
+```sh
+tools/check_burn_jepa_sparse_readout_integration.sh ../burn_jepa
+# missing generated_to_frame_readout_tokens / generated_to_video_readout_tokens
+# missing SparseReadoutGrid / SparseVideoReadoutGrid / SparseVideoReadoutOptions
+# still present generated_frame_tokens / context_mask_from_autogaze_generated
+# still present raw_token - frame_offset / gazing_pos.first()
+```
+
+That is intentionally tracked as external remaining work rather than an
+in-repo blocker. The migration patch is checked in at
+`docs/burn-jepa-sparse-readout-migration.patch` and was validated in a
+temporary copy of `../burn_jepa`; applying it to the sibling checkout requires
+write access outside this repository.
