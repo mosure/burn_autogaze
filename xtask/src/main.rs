@@ -128,6 +128,13 @@ impl BevyPerfBuildProfile {
             Self::Dev => &[],
         }
     }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Release => "release",
+            Self::Dev => "dev",
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -1049,9 +1056,37 @@ fn run_bevy_perf_case(
         log_path.display()
     );
     normalize_perf_json(&log_path, &json_path)?;
-    let data = load_json(&json_path)?;
+    let mut data = load_json(&json_path)?;
+    augment_perf_case_metadata(&mut data, name, profile, timeout, &out_dir.join("cache"))?;
+    write_json(&json_path, &data)?;
     validate_summary_or_aggregate(&data, true)?;
     print_perf_summary(&data)?;
+    Ok(())
+}
+
+fn augment_perf_case_metadata(
+    data: &mut Value,
+    name: &str,
+    profile: BevyPerfBuildProfile,
+    timeout: Duration,
+    cache_dir: &Path,
+) -> Result<()> {
+    let object = data
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("perf summary must be a JSON object"))?;
+    object.insert("case".to_owned(), Value::String(name.to_owned()));
+    object.insert(
+        "xtask_build_profile".to_owned(),
+        Value::String(profile.as_str().to_owned()),
+    );
+    object.insert(
+        "xtask_case_timeout_seconds".to_owned(),
+        Value::from(timeout.as_secs()),
+    );
+    object.insert(
+        "xtask_cache_dir".to_owned(),
+        Value::String(cache_dir.display().to_string()),
+    );
     Ok(())
 }
 
@@ -1067,7 +1102,11 @@ fn normalize_perf_json(log_path: &Path, json_path: &Path) -> Result<()> {
             .ok_or_else(|| anyhow!("no AutoGaze perf summary found in {}", log_path.display()))?;
         serde_json::from_str(summary).context("parse perf summary from log")?
     };
-    let mut file = File::create(json_path)?;
+    write_json(json_path, &data)
+}
+
+fn write_json(path: &Path, data: &Value) -> Result<()> {
+    let mut file = File::create(path)?;
     serde_json::to_writer_pretty(&mut file, &data)?;
     writeln!(file)?;
     Ok(())
@@ -1216,6 +1255,9 @@ fn validate_summary(data: &Value, require_hardware_adapter: bool) -> Result<()> 
         false,
     )?;
     require_enum(data, "display_transfer", &["cpu", "gpu"], false)?;
+    require_enum(data, "xtask_build_profile", &["release", "dev"], false)?;
+    require_int(data, "xtask_case_timeout_seconds", 1, false)?;
+    require_string(data, "xtask_cache_dir", false)?;
     require_nullable_enum(
         data,
         "latest_tensor_interframe_path",
@@ -1354,6 +1396,9 @@ fn validate_bevy_perf_summary_self_test() -> Result<()> {
         "mode": "resize-224",
         "visualization_mode": "interframe",
         "display_transfer": "gpu",
+        "xtask_build_profile": "release",
+        "xtask_case_timeout_seconds": 600,
+        "xtask_cache_dir": "target/autogaze-bevy-perf/cache",
         "latest_tensor_interframe_path": "sparse-rects",
         "streaming_cache": true,
         "streaming_cache_effective": true,
@@ -1485,6 +1530,18 @@ fn require_enum(data: &Value, field: &str, allowed: &[&str], required: bool) -> 
         allowed
     );
     Ok(())
+}
+
+fn require_string(data: &Value, field: &str, required: bool) -> Result<Option<String>> {
+    let Some(value) = data.get(field) else {
+        ensure!(!required, "missing required string field `{field}`");
+        return Ok(None);
+    };
+    let value = value
+        .as_str()
+        .ok_or_else(|| anyhow!("`{field}` must be a string"))?;
+    ensure!(!value.is_empty(), "`{field}` must not be empty");
+    Ok(Some(value.to_owned()))
 }
 
 fn require_nullable_enum(data: &Value, field: &str, allowed: &[&str]) -> Result<()> {
@@ -2053,6 +2110,25 @@ mod tests {
             &["--release"]
         );
         assert!(BevyPerfBuildProfile::Dev.cargo_run_args().is_empty());
+    }
+
+    #[test]
+    fn perf_case_metadata_records_xtask_measurement_context() {
+        let mut data = valid_perf_summary();
+        augment_perf_case_metadata(
+            &mut data,
+            "realtime-static-cpu",
+            BevyPerfBuildProfile::Release,
+            Duration::from_secs(42),
+            Path::new("target/autogaze-bevy-perf/cache"),
+        )
+        .expect("metadata should be inserted");
+
+        assert_eq!(data["case"], "realtime-static-cpu");
+        assert_eq!(data["xtask_build_profile"], "release");
+        assert_eq!(data["xtask_case_timeout_seconds"], 42);
+        assert_eq!(data["xtask_cache_dir"], "target/autogaze-bevy-perf/cache");
+        validate_summary(&data, true).expect("augmented summary should validate");
     }
 
     fn completion_audit_args(

@@ -880,7 +880,9 @@ includes deterministic static-source cases and optional live-camera cases,
 writes aggregate `target/autogaze-bevy-perf/summary.json`, and keeps
 `--require-hardware-adapter=true` enabled for every run. It routes
 `XDG_CACHE_HOME` to the perf artifact directory so shader/cache writes do not
-touch a read-only home directory. It uses
+touch a read-only home directory. Each per-case JSON includes xtask measurement
+metadata (`case`, `xtask_build_profile`, `xtask_case_timeout_seconds`, and
+`xtask_cache_dir`) so FPS reports are auditable without reading shell logs. It uses
 `cargo run --release` by default so the captured FPS is not a dev-build artifact;
 use `--profile dev` only for command-path debugging. Use
 `--case-timeout-seconds N` to override the default per-case timeout when first
