@@ -1,0 +1,21 @@
+{
+  "defaults": {
+    "model_dir": "/home/mosure/.cache/huggingface/hub/models--nvidia--AutoGaze/snapshots/5100fae739ec1bf3f875914fa1b703846a18943a",
+    "frames": 2,
+    "gazing_ratio": 0.75,
+    "task_loss_requirement": 0.7
+  },
+  "cases": [
+    {
+      "name": "birds-2f-1080p",
+      "video": "/home/mosure/Videos/birds.mp4",
+      "out_dir": "tests/fixtures/autogaze_birds_2f_1080p_matrix"
+    },
+    {
+      "name": "birds-4f-1080p",
+      "video": "/home/mosure/Videos/birds.mp4",
+      "frames": 4,
+      "out_dir": "tests/fixtures/autogaze_birds_4f_1080p_matrix"
+    }
+  ]
+}

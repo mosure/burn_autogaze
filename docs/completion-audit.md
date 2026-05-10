@@ -8,7 +8,7 @@ environment-bound checks for `burn_autogaze`.
 | requirement | concrete artifact or evidence | current status |
 |---|---|---|
 | Efficient core pipeline across realtime and tiled modes | `AutoGazePipelineOptions`, batched tile embedding/generation, benchmark build checks, Bevy perf summaries, `tools/run_bevy_perf_matrix.sh`, `--perf-summary-path`, and `--require-hardware-adapter=true` guard | Partially covered; hardware GPU FPS remains unverified on this host |
-| Numerical parity with upstream NVIDIA/Python AutoGaze | embedding/generation parity tests, birds fixture, fixture-only multi-scale mask decode checks, fixture-only seeded 224px and 448px upstream mask decode checks, fixture-integrity checks for metadata/mask counts/token ranges, fixture-only birds visualization/interframe checks, multi-scale scale-token and AnyRes stitching unit tests | Covered for checked-in fixtures; broader upstream corpus coverage remains future work |
+| Numerical parity with upstream NVIDIA/Python AutoGaze | embedding/generation parity tests, birds fixture, fixture-only multi-scale mask decode checks, fixture-only seeded 224px and 448px upstream mask decode checks, fixture-integrity checks for metadata/mask counts/token ranges, fixture-only birds visualization/interframe checks, multi-scale scale-token and AnyRes stitching unit tests, and `tools/generate_upstream_fixture_matrix.py` for repeatable expansion of fixture coverage | Covered for checked-in fixtures; broader upstream corpus coverage remains future work |
 | Robust outputs across inputs/configs | RGBA processor tests, static-source browser tests, tiled/realtime Bevy config tests, Bevy config sanitization tests, 1080p AnyRes mask tests | Covered for fixture/static inputs; live camera hardware path remains environment-bound |
 | Well-formed FPS, gaze-ratio, and PSNR metrics | `src/metrics.rs`, visualization PSNR/gaze-ratio tests, Bevy perf JSON tests, wasm Playwright assertions, perf-summary FPS/gaze/PSNR/config/admission-policy fields, and `tools/validate_bevy_perf_summary.py` per-case plus aggregate schema/range validation used by the native perf matrix | Covered by unit/browser/tool tests |
 | Bevy app is a thin wrapper around core pipeline | Bevy tests assert core RGBA prep, core `AutoGazeRgbaFrameClip` buffer reuse, core runtime defaults, stale-result gate, metric delegation, and shared visualization output; source hygiene scans Bevy `lib.rs`, `main.rs`, and `platform.rs` for local generated-output decoding, and now also guards Bevy production visualization/metrics from reimplementing core mask, interframe, PSNR, gaze-ratio, or EMA logic | Covered at logic level |
@@ -25,6 +25,9 @@ environment-bound checks for `burn_autogaze`.
   multi-scale generated tokens, and expose both trace and no-trace readout.
 - Numerical tests compare Burn outputs with checked-in NVIDIA/Python embedding,
   generation, birds, mask, visualization, and interframe fixtures.
+- `tools/generate_upstream_fixture_matrix.py` runs additional upstream
+  NVIDIA/Python fixture cases from a manifest and can immediately invoke the
+  fixture-only Rust parity test after generation.
 - Metrics are centralized in core helpers for FPS, gaze ratio, and PSNR, and
   Bevy reports them through the same types rather than local duplicate math.
 - Bevy native/wasm is a wrapper over the core pipeline: camera/source handling,
@@ -63,8 +66,10 @@ environment-bound checks for `burn_autogaze`.
   `--require-hardware-adapter=true` guard correctly exits before recording CPU
   adapter FPS.
 - Expand upstream numerical parity beyond the checked-in official, birds,
-  seeded 224px, and 448px upstream AnyRes-style fixtures when additional
-  NVIDIA/Python fixture outputs are available.
+  seeded 224px, and 448px upstream AnyRes-style fixtures by adding cases to a
+  fixture matrix manifest and running
+  `tools/generate_upstream_fixture_matrix.py --manifest ... --run-parity-test`
+  in the NVIDIA/Python AutoGaze environment.
 - If downstream tensor-pipeline outputs need raw tiled generated tokens, add a
   representation that carries tile-local metadata. Sparse readout itself is now
   covered by `AutoGazeTensorPipelineConfig::emit_readout_points`, which stores
@@ -158,7 +163,8 @@ its aggregate summary before accepting FPS:
 
 ```sh
 python3 tools/validate_bevy_perf_summary.py --self-test
-python3 -m py_compile tools/generate_upstream_fixture.py tools/validate_bevy_perf_summary.py
+python3 -m py_compile tools/generate_upstream_fixture.py tools/generate_upstream_fixture_matrix.py tools/validate_bevy_perf_summary.py
+python3 tools/generate_upstream_fixture_matrix.py --manifest docs/upstream_fixture_matrix.example.json --dry-run
 bash -n tools/common.sh tools/check_bevy_wasm_demo.sh tools/check_burn_jepa_sparse_readout_integration.sh tools/check_release_readiness.sh tools/run_bevy_perf_matrix.sh
 tools/run_bevy_perf_matrix.sh --dry-run --frames 2 --camera
 tools/check_release_readiness.sh --dry-run | rg -n "bash -n|py_compile|validate_bevy_perf_summary|run_bevy_perf_matrix"

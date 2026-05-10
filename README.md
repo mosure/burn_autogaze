@@ -535,3 +535,15 @@ tools/generate_upstream_fixture.py \
 
 `tools/generate_upstream_fixture.py --help` is dependency-light, so the fixture
 command surface can be inspected without importing the Python model stack.
+Use `tools/generate_upstream_fixture_matrix.py` to expand fixture coverage from
+a manifest and immediately rerun the fixture-only parity check:
+
+```sh
+tools/generate_upstream_fixture_matrix.py \
+  --manifest docs/upstream_fixture_matrix.example.json \
+  --run-parity-test
+```
+
+The matrix wrapper is also dependency-light for `--help` and `--dry-run`; the
+example manifest keeps outputs under `tests/fixtures`, where the existing Rust
+fixture tests discover them automatically.
