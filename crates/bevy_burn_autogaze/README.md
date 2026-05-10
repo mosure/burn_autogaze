@@ -67,7 +67,8 @@ From the repository root, run
 `cargo run -p xtask -- bevy-perf-matrix --frames 120 --camera` on a real GPU
 host to collect deterministic static-source and live camera throughput logs,
 per-case JSON summaries, and an aggregate `summary.json` under
-`target/autogaze-bevy-perf/`.
+`target/autogaze-bevy-perf/`. Use `--case-timeout-seconds N` to override the
+default per-case timeout for slow first-build or driver-tuning hosts.
 
 `--visualization-mode full-blend` renders the current frame's alpha-blended
 mask. The default `--blend-alpha` is intentionally subtle so the output panel

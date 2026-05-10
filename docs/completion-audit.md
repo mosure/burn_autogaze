@@ -878,7 +878,9 @@ The script passes `--perf-summary-path` so each case writes a JSON summary
 artifact directly under `target/autogaze-bevy-perf/`, keeps the matching logs,
 includes deterministic static-source cases and optional live-camera cases,
 writes aggregate `target/autogaze-bevy-perf/summary.json`, and keeps
-`--require-hardware-adapter=true` enabled for every run.
+`--require-hardware-adapter=true` enabled for every run. Use
+`--case-timeout-seconds N` to override the default per-case timeout when first
+builds or driver tuning are expected to be slow.
 
 ## current remote and external-integration snapshot
 

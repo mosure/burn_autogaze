@@ -522,7 +522,8 @@ coverage checklist, browser-test blocker notes, and hardware FPS runbook. Run
 `cargo run -p xtask -- bevy-perf-matrix --frames 120 --camera` on a real GPU host to
 capture native Bevy throughput logs, per-case JSON summaries, and aggregate
 `summary.json` with CPU-adapter failures guarded by
-`--require-hardware-adapter=true`.
+`--require-hardware-adapter=true`. Use `--case-timeout-seconds N` to adjust the
+per-case timeout on slow first-build or driver-tuning hosts.
 
 Use `cargo run -p xtask -- upstream-fixture-matrix` to generate upstream
 NVIDIA/Python parity fixtures from a manifest and immediately rerun the

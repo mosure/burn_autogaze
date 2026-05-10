@@ -86,6 +86,8 @@ struct CompletionAuditArgs {
     strict: bool,
     #[arg(long, default_value_t = 120)]
     frames: u32,
+    #[arg(long, default_value_t = BEVY_PERF_CASE_TIMEOUT_SECS)]
+    case_timeout_seconds: u64,
     #[arg(long, default_value = "target/autogaze-bevy-perf-audit")]
     out: PathBuf,
 }
@@ -105,6 +107,8 @@ struct BevyPerfMatrixArgs {
     out: PathBuf,
     #[arg(long)]
     camera: bool,
+    #[arg(long, default_value_t = BEVY_PERF_CASE_TIMEOUT_SECS)]
+    case_timeout_seconds: u64,
 }
 
 #[derive(Debug, Args)]
@@ -437,6 +441,7 @@ fn release_readiness(root: PathBuf, args: ReleaseReadinessArgs) -> Result<()> {
             hardware_perf: false,
             strict: false,
             frames: 120,
+            case_timeout_seconds: BEVY_PERF_CASE_TIMEOUT_SECS,
             out: PathBuf::from("target/autogaze-bevy-perf-audit"),
         },
     )?;
@@ -467,6 +472,7 @@ fn release_readiness(root: PathBuf, args: ReleaseReadinessArgs) -> Result<()> {
             ),
             out: PathBuf::from("target/autogaze-bevy-perf"),
             camera: true,
+            case_timeout_seconds: BEVY_PERF_CASE_TIMEOUT_SECS,
         },
     )?;
 
@@ -633,10 +639,13 @@ fn completion_audit(root: PathBuf, args: CompletionAuditArgs) -> Result<()> {
                 ),
                 out: args.out.clone(),
                 camera: true,
+                case_timeout_seconds: args.case_timeout_seconds,
             },
         );
         if let Err(error) = perf_result {
-            evidence_errors.push(format!("native hardware Bevy perf audit failed:\n{error:#}"));
+            evidence_errors.push(format!(
+                "native hardware Bevy perf audit failed:\n{error:#}"
+            ));
         }
     } else {
         println!(
@@ -648,6 +657,10 @@ fn completion_audit(root: PathBuf, args: CompletionAuditArgs) -> Result<()> {
 
 fn validate_completion_audit_args(args: &CompletionAuditArgs) -> Result<()> {
     ensure!(args.frames > 0, "--frames must be greater than zero");
+    ensure!(
+        args.case_timeout_seconds > 0,
+        "--case-timeout-seconds must be greater than zero"
+    );
     if args.strict {
         ensure!(
             args.burn_jepa.is_some(),
@@ -841,6 +854,10 @@ fn cleanup_paths(paths: Vec<PathBuf>) -> Result<()> {
 
 fn bevy_perf_matrix(root: PathBuf, args: BevyPerfMatrixArgs) -> Result<()> {
     ensure!(args.frames > 0, "--frames must be greater than zero");
+    ensure!(
+        args.case_timeout_seconds > 0,
+        "--case-timeout-seconds must be greater than zero"
+    );
     let runner = Runner::new(root, &args.common, None);
     let common_static = [
         "--image-path".to_owned(),
@@ -940,7 +957,13 @@ fn bevy_perf_matrix(root: PathBuf, args: BevyPerfMatrixArgs) -> Result<()> {
             OsString::from("--log-pipeline-timing"),
             OsString::from("--require-hardware-adapter=true"),
         ]);
-        run_bevy_perf_case(&runner, &args.out, name, app_args)?;
+        run_bevy_perf_case(
+            &runner,
+            &args.out,
+            name,
+            app_args,
+            Duration::from_secs(args.case_timeout_seconds),
+        )?;
     }
     if !runner.dry_run {
         write_perf_aggregate(&args.out)?;
@@ -957,6 +980,7 @@ fn run_bevy_perf_case(
     out_dir: &Path,
     name: &str,
     app_args: Vec<OsString>,
+    timeout: Duration,
 ) -> Result<()> {
     let log_path = out_dir.join(format!("{name}.log"));
     let json_path = out_dir.join(format!("{name}.json"));
@@ -975,10 +999,7 @@ fn run_bevy_perf_case(
     }
     fs::create_dir_all(out_dir)?;
     let timed_output = runner
-        .output_with_timeout(
-            &command,
-            Duration::from_secs(BEVY_PERF_CASE_TIMEOUT_SECS),
-        )
+        .output_with_timeout(&command, timeout)
         .with_context(|| format!("run case {name}"))?;
     let output = timed_output.output;
     let combined = format!(
@@ -991,7 +1012,7 @@ fn run_bevy_perf_case(
     ensure!(
         !timed_output.timed_out,
         "case {name} timed out after {}s; see {}",
-        BEVY_PERF_CASE_TIMEOUT_SECS,
+        timeout.as_secs(),
         log_path.display()
     );
     ensure!(
@@ -1966,6 +1987,21 @@ mod tests {
     }
 
     #[test]
+    fn completion_audit_rejects_zero_case_timeout() {
+        let args = CompletionAuditArgs {
+            case_timeout_seconds: 0,
+            ..completion_audit_args(false, None, false)
+        };
+
+        let err = validate_completion_audit_args(&args).expect_err("zero timeout should fail");
+
+        assert!(
+            err.to_string().contains("--case-timeout-seconds"),
+            "error should name the invalid timeout argument: {err:?}"
+        );
+    }
+
+    #[test]
     fn completion_audit_evidence_report_preserves_multiple_failures() {
         let err = finish_completion_audit_evidence(vec![
             "burn_jepa migration audit failed".to_owned(),
@@ -1995,6 +2031,7 @@ mod tests {
             hardware_perf,
             strict,
             frames: 120,
+            case_timeout_seconds: BEVY_PERF_CASE_TIMEOUT_SECS,
             out: PathBuf::from("target/autogaze-bevy-perf-audit"),
         }
     }
