@@ -7,10 +7,10 @@ environment-bound checks for `burn_autogaze`.
 
 | requirement | concrete artifact or evidence | current status |
 |---|---|---|
-| Efficient core pipeline across realtime and tiled modes | `AutoGazePipelineOptions`, batched tile embedding/generation, benchmark build checks, Bevy perf summaries, `tools/run_bevy_perf_matrix.sh`, `--perf-summary-path`, and `--require-hardware-adapter=true` guard | Partially covered; hardware GPU FPS remains unverified on this host |
-| Numerical parity with upstream NVIDIA/Python AutoGaze | embedding/generation parity tests, birds fixture, fixture-only multi-scale mask decode checks, fixture-only seeded 224px and 448px upstream mask decode checks, fixture-integrity checks for metadata/mask counts/token ranges, fixture-only birds visualization/interframe checks, multi-scale scale-token and AnyRes stitching unit tests, and `tools/generate_upstream_fixture_matrix.py` for repeatable expansion of fixture coverage | Covered for checked-in fixtures; broader upstream corpus coverage remains future work |
+| Efficient core pipeline across realtime and tiled modes | `AutoGazePipelineOptions`, batched tile embedding/generation, benchmark build checks, Bevy perf summaries, `cargo run -p xtask -- bevy-perf-matrix`, `--perf-summary-path`, and `--require-hardware-adapter=true` guard | Partially covered; hardware GPU FPS remains unverified on this host |
+| Numerical parity with upstream NVIDIA/Python AutoGaze | embedding/generation parity tests, birds fixture, fixture-only multi-scale mask decode checks, fixture-only seeded 224px and 448px upstream mask decode checks, fixture-integrity checks for metadata/mask counts/token ranges, fixture-only birds visualization/interframe checks, multi-scale scale-token and AnyRes stitching unit tests, and `cargo run -p xtask -- upstream-fixture-matrix` for repeatable expansion of fixture coverage | Covered for checked-in fixtures; broader upstream corpus coverage remains future work |
 | Robust outputs across inputs/configs | RGBA processor tests, static-source browser tests, tiled/realtime Bevy config tests, Bevy config sanitization tests, 1080p AnyRes mask tests | Covered for fixture/static inputs; live camera hardware path remains environment-bound |
-| Well-formed FPS, gaze-ratio, and PSNR metrics | `src/metrics.rs`, visualization PSNR/gaze-ratio tests, Bevy perf JSON tests, wasm Playwright assertions, perf-summary FPS/gaze/PSNR/config/admission-policy fields, and `tools/validate_bevy_perf_summary.py` per-case plus aggregate schema/range validation used by the native perf matrix | Covered by unit/browser/tool tests |
+| Well-formed FPS, gaze-ratio, and PSNR metrics | `src/metrics.rs`, visualization PSNR/gaze-ratio tests, Bevy perf JSON tests, wasm Playwright assertions, perf-summary FPS/gaze/PSNR/config/admission-policy fields, and `cargo run -p xtask -- validate-bevy-perf-summary` per-case plus aggregate schema/range validation used by the native perf matrix | Covered by unit/browser/tool tests |
 | Bevy app is a thin wrapper around core pipeline | Bevy tests assert core RGBA prep, core `AutoGazeRgbaFrameClip` buffer reuse, core runtime defaults, stale-result gate, metric delegation, and shared visualization output; source hygiene scans Bevy `lib.rs`, `main.rs`, and `platform.rs` for local generated-output decoding, and now also guards Bevy production visualization/metrics from reimplementing core mask, interframe, PSNR, gaze-ratio, or EMA logic | Covered at logic level |
 | Native and wasm support with minimal platform split | wasm check/clippy, Playwright static/optional model tests, native Bevy tests, platform split limited to camera/model bytes, tensor readout sync/async, and no Bevy `native`/`web` feature toggles | Covered at compile/browser smoke level |
 | Avoid duplicate AutoGaze scale/readout logic in downstream integrations | `src/readout.rs` exports trace and direct `AutoGazeGenerateOutput` readout helpers plus generic image/video-token projection helpers, `SparseVideoPatchGeometry`, one-call trace/generated-to-video adapters, sparse patchification coordinate adapters, and Burn coordinate tensor builders; `AutoGazePipeline::readout_points_with_mode` and `readout_points_with_mode_async` expose no-trace readout for native and wasm callers; `AutoGazePipelinePacket` can emit no-trace readout points for realtime/tiled modes and exposes packet-level sparse-video token, coordinate, and coordinate-tensor projection; `AutoGazeTensorPacketPlan` centralizes tensor-packet validation, generation budget, and packet assembly for sync and async runners; `docs/sparse-readout-integration.md` documents the `burn_jepa` boundary; `docs/burn-jepa-sparse-readout-migration.patch` is a concrete downstream benchmark migration patch | Covered in this repo; `../burn_jepa` still has benchmark-local generated-token decoding until that repo is updated |
@@ -25,7 +25,7 @@ environment-bound checks for `burn_autogaze`.
   multi-scale generated tokens, and expose both trace and no-trace readout.
 - Numerical tests compare Burn outputs with checked-in NVIDIA/Python embedding,
   generation, birds, mask, visualization, and interframe fixtures.
-- `tools/generate_upstream_fixture_matrix.py` runs additional upstream
+- `cargo run -p xtask -- upstream-fixture-matrix` runs additional upstream
   NVIDIA/Python fixture cases from a manifest and can immediately invoke the
   fixture-only Rust parity test after generation.
 - Metrics are centralized in core helpers for FPS, gaze ratio, and PSNR, and
@@ -57,7 +57,7 @@ environment-bound checks for `burn_autogaze`.
   outside the current writable root, so the change is provided as
   `docs/burn-jepa-sparse-readout-migration.patch` and documented in
   `sparse-readout-integration.md` but not applied there. Run
-  `tools/check_burn_jepa_sparse_readout_integration.sh ../burn_jepa` after the
+  `cargo run -p xtask -- check-burn-jepa-sparse-readout-integration ../burn_jepa` after the
   downstream patch; it currently fails against the unpatched checkout by
   detecting `generated_frame_tokens`, `context_mask_from_autogaze_generated`,
   and manual generated-token frame-offset math.
@@ -68,7 +68,7 @@ environment-bound checks for `burn_autogaze`.
 - Expand upstream numerical parity beyond the checked-in official, birds,
   seeded 224px, and 448px upstream AnyRes-style fixtures by adding cases to a
   fixture matrix manifest and running
-  `tools/generate_upstream_fixture_matrix.py --manifest ... --run-parity-test`
+  `cargo run -p xtask -- upstream-fixture-matrix --manifest ... --run-parity-test`
   in the NVIDIA/Python AutoGaze environment.
 - If downstream tensor-pipeline outputs need raw tiled generated tokens, add a
   representation that carries tile-local metadata. Sparse readout itself is now
@@ -98,12 +98,12 @@ environment-bound checks for `burn_autogaze`.
 | Interframe output | `AutoGazeVisualizationState` tests cover sparse accumulation, keyframe refresh, PSNR, and update ratios | Covered |
 | Bevy wrapper thinness | Bevy tests cover delegation to core runtime defaults, core RGBA prep, stale-result rejection, perf JSON samples, and source hygiene against local generated-output decoding in Bevy `lib.rs`, `main.rs`, and `platform.rs`; source hygiene also asserts Bevy production visualization calls `AutoGazeVisualizationState` / `AutoGazeTensorVisualizationState` helpers and Bevy metrics wrap `AutoGazeGazeRatioStats` / `AutoGazePsnrStats` instead of carrying local mask, interframe, PSNR, gaze-ratio, or EMA math | Covered at logic level |
 | Sparse readout adapters | `src/readout.rs`, `src/pipeline.rs`, and `src/nodes.rs` tests cover decoded rectangle projection, token-grid projection, same-grid boundary stability, image-to-video token projection, sparse patchifier grid derivation from frame/tubelet/patch geometry, one-call trace/generated-to-video projection, `burn_jepa` benchmark adapter replacement behavior, packet-level sparse-video readout for trace and generated packets, tubelet grouping, exact/min/max video-token budgets, dilation, fixation caps before projection, frame token caps after projection, full trace helpers, direct `AutoGazeGenerateOutput` readout helpers, packet-level generated readout without traces, tiled packet readout points without traces, and sync/async compile coverage for the same pipeline helpers | Covered |
-| `burn_jepa` integration boundary | `docs/sparse-readout-integration.md` explains why AutoGaze geometry helpers live here and `burn_flex_gmm` patchification remains downstream; `docs/burn-jepa-sparse-readout-migration.patch` gives the downstream benchmark patch; `tools/check_burn_jepa_sparse_readout_integration.sh` audits an external burn_jepa checkout for the expected migration | Documented, externally checkable, and temp-validated |
+| `burn_jepa` integration boundary | `docs/sparse-readout-integration.md` explains why AutoGaze geometry helpers live here and `burn_flex_gmm` patchification remains downstream; `docs/burn-jepa-sparse-readout-migration.patch` gives the downstream benchmark patch; `cargo run -p xtask -- check-burn-jepa-sparse-readout-integration` audits an external burn_jepa checkout for the expected migration | Documented, externally checkable, and temp-validated |
 | Tensor pipeline sync/async duplication | `AutoGazeTensorPacketPlan` keeps validation, generation-budget selection, generated-packet gating, ready readout projection, and packet assembly shared between `run_next` and `run_next_async` | Covered by nodes test and clippy |
 | WGPU/wasm compile regressions | `cargo check -p burn_autogaze --target wasm32-unknown-unknown --no-default-features --features wasm`, `cargo clippy -p burn_autogaze --target wasm32-unknown-unknown --no-default-features --features wasm -- -D warnings`, `cargo check -p bevy_burn_autogaze --target wasm32-unknown-unknown`, and `cargo clippy -p bevy_burn_autogaze --target wasm32-unknown-unknown -- -D warnings` | Covered by compile and no-warning checks |
-| Browser panic regressions | `.github/workflows/test.yml` and `.github/workflows/deploy-pages.yml` build the Bevy wasm demo and run `npm run test:browser`; the Playwright spec checks static-source startup, async model-load failure handling, optional real-model wasm inference, adapter metadata, perf summary fields, and known wasm panic strings; `tools/check_bevy_wasm_demo.sh` preflights `node`/`npm`/`npx`, accepts `--node-bin-dir`/`AUTOGAZE_NODE_BIN_DIR`, and can use `--no-browser-deps` when `sudo` is unavailable | Covered by CI command surface, local static-source browser smoke, and local real-model wasm smoke with staged model assets |
+| Browser panic regressions | `.github/workflows/test.yml` and `.github/workflows/deploy-pages.yml` build the Bevy wasm demo and run `npm run test:browser`; the Playwright spec checks static-source startup, async model-load failure handling, optional real-model wasm inference, adapter metadata, perf summary fields, and known wasm panic strings; `cargo run -p xtask -- check-bevy-wasm-demo` preflights `node`/`npm`/`npx`, accepts `--node-bin-dir`/`AUTOGAZE_NODE_BIN_DIR`, and can use `--no-browser-deps` when `sudo` is unavailable | Covered by CI command surface, local static-source browser smoke, and local real-model wasm smoke with staged model assets |
 | Native/wasm target selection | `crates/bevy_burn_autogaze/Cargo.toml` has no empty `native` or `web` features; platform behavior is selected by `cfg(target_arch = "wasm32")` in code and target-specific dependencies in the manifest | Covered |
-| Native camera/GPU FPS | Bevy static-source perf path emits JSON summaries with render adapter metadata; native `--perf-summary-path` writes summaries directly as JSON artifacts; `tools/run_bevy_perf_matrix.sh` extracts per-case summaries, validates them and aggregate `summary.json` with `tools/validate_bevy_perf_summary.py --require-hardware-adapter`, and fails on CPU adapters; this host's native smoke selected llvmpipe CPU Vulkan, so live camera and hardware WebGPU/CUDA need a real adapter run | Hardware-blocked locally |
+| Native camera/GPU FPS | Bevy static-source perf path emits JSON summaries with render adapter metadata; native `--perf-summary-path` writes summaries directly as JSON artifacts; `cargo run -p xtask -- bevy-perf-matrix` extracts per-case summaries, validates them and aggregate `summary.json` with `cargo run -p xtask -- validate-bevy-perf-summary --require-hardware-adapter`, and fails on CPU adapters; this host's native smoke selected llvmpipe CPU Vulkan, so live camera and hardware WebGPU/CUDA need a real adapter run | Hardware-blocked locally |
 
 ## local blockers
 
@@ -119,7 +119,7 @@ environment-bound checks for `burn_autogaze`.
 PATH=/home/mosure/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin:$PATH \
 RUSTC=/home/mosure/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin/rustc \
 CARGO=/home/mosure/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin/cargo \
-tools/run_bevy_perf_matrix.sh --frames 1 --out target/autogaze-bevy-perf-audit
+cargo run -p xtask -- bevy-perf-matrix --frames 1 --out target/autogaze-bevy-perf-audit
 ```
 
 ## current local validation
@@ -132,7 +132,7 @@ fixture-only upstream parity:
 ```sh
 PATH=/home/mosure/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin:$PATH \
 RUSTC=/home/mosure/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin/rustc \
-tools/check_release_readiness.sh
+cargo run -p xtask -- release-readiness
 ```
 
 That gate ran root tests, Bevy tests, native and wasm clippy/check lanes,
@@ -149,25 +149,23 @@ cargo test -p burn_autogaze --features ndarray --test source_hygiene -- --nocapt
 
 That focused run passed 8 tests.
 
-The Bevy perf-summary metric contract is now also a tool-level release gate.
-`tools/validate_bevy_perf_summary.py` rejects missing or non-finite FPS/timing
+The Bevy perf-summary metric contract is now also an xtask release gate.
+`cargo run -p xtask -- validate-bevy-perf-summary` rejects missing or non-finite FPS/timing
 fields, gaze/update ratios outside `0.0..=1.0`, invalid or missing PSNR fields,
 invalid enum/config fields, invalid frame/dimension counts, p95 lower than p50,
 malformed aggregate `summary.json` files, mismatched min/max FPS extrema, and
 CPU adapters when hardware is required. PSNR is JSON-safe: finite dB values are
 numeric, and perfect/infinite PSNR is represented by a boolean flag rather than
-an invalid JSON number. The release gate runs its built-in self-test, Python
-tooling bytecode checks, shell syntax checks, and the native perf-matrix
-dry-run; the native perf matrix validates every extracted per-case summary and
-its aggregate summary before accepting FPS:
+an invalid JSON number. The release gate runs the xtask self-test and the native
+perf-matrix dry-run; the native perf matrix validates every extracted per-case
+summary and its aggregate summary before accepting FPS:
 
 ```sh
-python3 tools/validate_bevy_perf_summary.py --self-test
-python3 -m py_compile tools/generate_upstream_fixture.py tools/generate_upstream_fixture_matrix.py tools/validate_bevy_perf_summary.py
-python3 tools/generate_upstream_fixture_matrix.py --manifest docs/upstream_fixture_matrix.example.json --dry-run
-bash -n tools/common.sh tools/check_bevy_wasm_demo.sh tools/check_burn_jepa_sparse_readout_integration.sh tools/check_release_readiness.sh tools/run_bevy_perf_matrix.sh
-tools/run_bevy_perf_matrix.sh --dry-run --frames 2 --camera
-tools/check_release_readiness.sh --dry-run | rg -n "bash -n|py_compile|validate_bevy_perf_summary|run_bevy_perf_matrix"
+cargo run -p xtask -- validate-bevy-perf-summary --self-test
+cargo check -p xtask
+cargo run -p xtask -- upstream-fixture-matrix --manifest docs/upstream_fixture_matrix.example.json --dry-run
+cargo run -p xtask -- bevy-perf-matrix --dry-run --frames 2 --camera
+cargo run -p xtask -- release-readiness --dry-run
 PATH=/home/mosure/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin:$PATH \
 RUSTC=/home/mosure/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin/rustc \
 cargo test -p bevy_burn_autogaze inference_timing_summary_json_reports_well_formed_metrics -- --nocapture
@@ -177,16 +175,14 @@ The browser-demo command surface and Node override were checked without running
 Playwright:
 
 ```sh
-bash -n tools/common.sh tools/check_bevy_wasm_demo.sh tools/check_release_readiness.sh
-tools/check_bevy_wasm_demo.sh --browser --dry-run
-tools/check_release_readiness.sh --browser --node-bin-dir /tmp/node/bin --dry-run
-tools/check_release_readiness.sh --real-model-browser --node-bin-dir /tmp/node-v22.11.0-linux-x64/bin --no-browser-deps --dry-run
-bash -lc 'source tools/common.sh; autogaze_require_node_toolchain'
+cargo check -p xtask
+cargo run -p xtask -- check-bevy-wasm-demo --browser --dry-run
+cargo run -p xtask -- release-readiness --browser --node-bin-dir /tmp/node/bin --dry-run
+cargo run -p xtask -- release-readiness --real-model-browser --node-bin-dir /tmp/node-v22.11.0-linux-x64/bin --no-browser-deps --dry-run
 ```
 
-The final command intentionally fails on this host with the Snap
-`snap-confine has elevated permissions` error and prints the non-Snap Node
-override guidance.
+The xtask Node preflight prints the non-Snap Node override guidance when the
+active `node`/`npm`/`npx` toolchain fails with the Snap `snap-confine` error.
 
 The static-source Bevy wasm browser smoke later passed locally by staging
 Node.js v22.11.0 under `/tmp`, using `--node-bin-dir`, and installing Playwright
@@ -194,7 +190,7 @@ Chromium under `/tmp` without system dependency escalation:
 
 ```sh
 PLAYWRIGHT_BROWSERS_PATH=/tmp/ms-playwright \
-tools/check_bevy_wasm_demo.sh \
+cargo run -p xtask -- check-bevy-wasm-demo \
   --browser \
   --node-bin-dir /tmp/node-v22.11.0-linux-x64/bin \
   --skip-check \
@@ -212,7 +208,7 @@ for the duration of the run and enabling `--real-model-browser`:
 PLAYWRIGHT_BROWSERS_PATH=/tmp/ms-playwright \
 PATH=/home/mosure/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin:/home/mosure/.cargo/bin:/tmp/node-v22.11.0-linux-x64/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
 RUSTC=/home/mosure/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin/rustc \
-tools/check_bevy_wasm_demo.sh \
+cargo run -p xtask -- check-bevy-wasm-demo \
   --real-model-browser \
   --node-bin-dir /tmp/node-v22.11.0-linux-x64/bin \
   --skip-check \
@@ -223,7 +219,7 @@ That run passed all three Playwright cases, including `runs optional real wasm
 inference smoke when model assets are available`. The staged model symlinks
 were removed after the run and are not tracked.
 
-`tools/check_bevy_wasm_demo.sh --real-model-browser` now performs that staging
+`cargo run -p xtask -- check-bevy-wasm-demo --real-model-browser` now performs that staging
 itself when cached model assets are available. It creates temporary
 `www/config.json` and `www/model.safetensors` symlinks from
 `AUTOGAZE_WASM_MODEL_DIR` or the default local Hugging Face AutoGaze snapshot,
@@ -242,7 +238,7 @@ absence, and temporary model-asset cleanup:
 PLAYWRIGHT_BROWSERS_PATH=/tmp/ms-playwright \
 PATH=/home/mosure/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin:/home/mosure/.cargo/bin:/tmp/node-v22.11.0-linux-x64/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
 RUSTC=/home/mosure/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin/rustc \
-tools/check_bevy_wasm_demo.sh \
+cargo run -p xtask -- check-bevy-wasm-demo \
   --real-model-browser \
   --node-bin-dir /tmp/node-v22.11.0-linux-x64/bin \
   --skip-check \
@@ -260,7 +256,7 @@ assets, and `git diff --check`:
 PATH=/home/mosure/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin:/home/mosure/.cargo/bin:/tmp/node-v22.11.0-linux-x64/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
 RUSTC=/home/mosure/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin/rustc \
 PLAYWRIGHT_BROWSERS_PATH=/tmp/ms-playwright \
-tools/check_release_readiness.sh \
+cargo run -p xtask -- release-readiness \
   --real-model-browser \
   --node-bin-dir /tmp/node-v22.11.0-linux-x64/bin \
   --no-browser-deps
@@ -314,7 +310,7 @@ external checkout and intentionally failed, proving it catches the remaining
 unmigrated local generated-token decoder and projection glue:
 
 ```sh
-tools/check_burn_jepa_sparse_readout_integration.sh ../burn_jepa
+cargo run -p xtask -- check-burn-jepa-sparse-readout-integration ../burn_jepa
 ```
 
 The migration patch in `docs/burn-jepa-sparse-readout-migration.patch` was also
@@ -326,7 +322,7 @@ tmp=$(mktemp -d /tmp/burn_jepa-readout.XXXXXX)
 tar --exclude='./target' --exclude='./.git' -C ../burn_jepa -cf - . | tar -x -C "$tmp"
 git -C "$tmp" apply "$PWD/docs/burn-jepa-sparse-readout-migration.patch"
 perl -0pi -e 's#burn_autogaze = \{ version = "0\.21\.2", default-features = false, features = \["ndarray"\] \}#burn_autogaze = { version = "0.21.2", path = "'$PWD'", default-features = false, features = ["ndarray"] }#' "$tmp/Cargo.toml"
-tools/check_burn_jepa_sparse_readout_integration.sh "$tmp"
+cargo run -p xtask -- check-burn-jepa-sparse-readout-integration "$tmp"
 PATH=/home/mosure/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin:$PATH \
 RUSTC=/home/mosure/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin/rustc \
 cargo check --manifest-path "$tmp/Cargo.toml" \
@@ -355,8 +351,8 @@ cd crates/bevy_burn_autogaze && npm ci && npm run test:browser
 AUTOGAZE_WASM_MODEL_E2E=1 npm run test:browser
 cargo run -p bevy_burn_autogaze -- --image-path tests/fixtures/autogaze_birds_python_generate/raw_rgba_frame_00.png --mode realtime --display-transfer cpu --perf-summary-frames 4 --log-pipeline-timing --show-psnr=false
 cargo run -p bevy_burn_autogaze -- --image-path tests/fixtures/autogaze_birds_python_generate/raw_rgba_frame_00.png --mode realtime --perf-summary-frames 1 --require-hardware-adapter=true
-tools/run_bevy_perf_matrix.sh --dry-run --frames 2 --camera
-tools/run_bevy_perf_matrix.sh --help
+cargo run -p xtask -- bevy-perf-matrix --dry-run --frames 2 --camera
+cargo run -p xtask -- bevy-perf-matrix --help
 git diff --check
 ```
 
@@ -373,7 +369,7 @@ cargo clippy -p burn_autogaze --target wasm32-unknown-unknown --no-default-featu
 cargo check -p bevy_burn_autogaze --target wasm32-unknown-unknown
 cargo clippy -p bevy_burn_autogaze --target wasm32-unknown-unknown -- -D warnings
 RUSTC=/home/mosure/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin/rustc cargo package -p burn_autogaze --allow-dirty
-tools/run_bevy_perf_matrix.sh --dry-run --frames 2 --out /tmp/autogaze-perf-dry-run
+cargo run -p xtask -- bevy-perf-matrix --dry-run --frames 2 --out /tmp/autogaze-perf-dry-run
 git diff --check
 ```
 
@@ -415,8 +411,7 @@ cargo check -p bevy_burn_autogaze
 cargo check -p bevy_burn_autogaze --target wasm32-unknown-unknown
 cargo clippy -p bevy_burn_autogaze --all-targets -- -D warnings
 cargo clippy -p bevy_burn_autogaze --target wasm32-unknown-unknown -- -D warnings
-python3 tools/generate_upstream_fixture.py --help
-python3 -m py_compile tools/generate_upstream_fixture.py
+cargo run -p xtask -- upstream-fixture-matrix --manifest docs/upstream_fixture_matrix.example.json --dry-run
 ```
 
 The fixture-only generated-mask decode test was later made directory-driven:
@@ -483,24 +478,23 @@ cargo package -p burn_autogaze --allow-dirty
 git diff --check
 ```
 
-The full non-browser release gate passed again on 2026-05-10 after factoring
-shared script behavior into `tools/common.sh` and wiring both the release and
-Bevy wasm-demo scripts through it. This reran root tests, Bevy wrapper tests,
+The full non-browser release gate passed again on 2026-05-10 after moving the
+repo command surface into the Rust `xtask` crate. This reran root tests, Bevy wrapper tests,
 clippy with warnings denied, native and wasm checks, benchmark compilation,
 package verification, and whitespace checks from the shared gate:
 
 ```sh
-bash -n tools/common.sh tools/check_bevy_wasm_demo.sh tools/check_release_readiness.sh
-tools/check_bevy_wasm_demo.sh --browser --dry-run
-tools/check_release_readiness.sh --browser --dry-run
-tools/check_release_readiness.sh
+cargo check -p xtask
+cargo run -p xtask -- check-bevy-wasm-demo --browser --dry-run
+cargo run -p xtask -- release-readiness --browser --dry-run
+cargo run -p xtask -- release-readiness
 ```
 
 The same full gate passed again after adding the compiled sparse-video readout
 adapter example to both workspace and generated-package checks:
 
 ```sh
-tools/check_release_readiness.sh
+cargo run -p xtask -- release-readiness
 ```
 
 The release gate now also enforces the generated-package checkout regression
@@ -516,7 +510,7 @@ cargo test --features ndarray readout -- --nocapture
 ```
 
 The GitHub test workflow now delegates the Rust, wasm, benchmark-build,
-package, and static-source browser smoke gates to `tools/check_release_readiness.sh --browser`,
+package, and static-source browser smoke gates to `cargo run -p xtask -- release-readiness --browser`,
 so CI and the documented release gate share the same command list instead of
 drifting separately. The script installs the matching `wasm-bindgen-cli`,
 preflights `node`/`npm`/`npx`, runs `npm ci`, installs Playwright Chromium,
@@ -524,20 +518,20 @@ builds the Bevy wasm artifacts, and runs the browser smoke when `--browser` is
 passed. The non-browser gate completed successfully in this workspace:
 
 ```sh
-bash -n tools/check_release_readiness.sh
-tools/check_release_readiness.sh --browser --dry-run
-tools/check_release_readiness.sh
+bash -n cargo run -p xtask -- release-readiness
+cargo run -p xtask -- release-readiness --browser --dry-run
+cargo run -p xtask -- release-readiness
 ```
 
 The Pages workflow now delegates its wasm target check, wasm-bindgen install,
 npm toolchain preflight, npm dependency install, Bevy wasm build, and
-static-source browser smoke to `tools/check_bevy_wasm_demo.sh --browser`. The
+static-source browser smoke to `cargo run -p xtask -- check-bevy-wasm-demo --browser`. The
 readiness gate calls that same script for browser coverage, so the deploy and
 test workflows share the wasm demo build path:
 
 ```sh
-bash -n tools/check_bevy_wasm_demo.sh
-tools/check_bevy_wasm_demo.sh --browser --dry-run
+bash -n cargo run -p xtask -- check-bevy-wasm-demo
+cargo run -p xtask -- check-bevy-wasm-demo --browser --dry-run
 ```
 
 Local browser smoke on this host now passes with a portable non-Snap Node
@@ -600,7 +594,7 @@ removing an unnecessary panic edge from the hot path:
 ```sh
 cargo test -p burn_autogaze --features ndarray model::tests::streaming -- --nocapture
 cargo clippy -p burn_autogaze --features ndarray --all-targets -- -D warnings
-tools/check_release_readiness.sh
+cargo run -p xtask -- release-readiness
 ```
 
 Additional low-level input robustness checks passed on 2026-05-10 after making
@@ -614,7 +608,7 @@ promise preprocessed model input:
 cargo test -p burn_autogaze --features ndarray low_level_embed_video_prepares_non_model_sized_inputs_without_panic -- --nocapture
 cargo test -p burn_autogaze --features ndarray try_embed_model_input_rejects_non_square_model_input_without_panic -- --nocapture
 cargo clippy -p burn_autogaze --features ndarray --all-targets -- -D warnings
-tools/check_release_readiness.sh
+cargo run -p xtask -- release-readiness
 ```
 
 An executable migration sketch was added for downstream crates that need to
@@ -718,7 +712,7 @@ cargo test -p bevy_burn_autogaze inference_timing_summary_json_reports_well_form
 cargo test -p bevy_burn_autogaze -- --nocapture
 cargo clippy -p bevy_burn_autogaze --all-targets -- -D warnings
 cargo clippy -p bevy_burn_autogaze --target wasm32-unknown-unknown -- -D warnings
-tools/check_release_readiness.sh
+cargo run -p xtask -- release-readiness
 ```
 
 The same source-hygiene guard also passed from the generated package checkout
@@ -824,7 +818,7 @@ can fail instead of recording CPU-adapter numbers.
 Use this command before publishing or claiming current non-hardware readiness:
 
 ```sh
-tools/check_release_readiness.sh
+cargo run -p xtask -- release-readiness
 ```
 
 It runs the command list below with the direct nightly toolchain path when that
@@ -855,9 +849,9 @@ Use `--no-browser-deps` in sandboxed environments where Playwright cannot call
 `sudo` to install OS packages:
 
 ```sh
-tools/check_release_readiness.sh --browser
-tools/check_release_readiness.sh --browser --node-bin-dir /path/to/node/bin
-tools/check_release_readiness.sh --browser --node-bin-dir /path/to/node/bin --no-browser-deps
+cargo run -p xtask -- release-readiness --browser
+cargo run -p xtask -- release-readiness --browser --node-bin-dir /path/to/node/bin
+cargo run -p xtask -- release-readiness --browser --node-bin-dir /path/to/node/bin --no-browser-deps
 ```
 
 To run the optional real-model browser inference smoke, stage local model assets
@@ -866,14 +860,14 @@ outside git and set `AUTOGAZE_WASM_MODEL_E2E=1`:
 ```sh
 ln -s /path/to/AutoGaze/config.json www/config.json
 ln -s /path/to/AutoGaze/model.safetensors www/model.safetensors
-tools/check_release_readiness.sh --real-model-browser
+cargo run -p xtask -- release-readiness --real-model-browser
 rm www/config.json www/model.safetensors
 ```
 
 Run this on the target GPU host for real throughput evidence:
 
 ```sh
-tools/run_bevy_perf_matrix.sh --frames 120 --camera
+cargo run -p xtask -- bevy-perf-matrix --frames 120 --camera
 ```
 
 The script passes `--perf-summary-path` so each case writes a JSON summary
@@ -914,7 +908,7 @@ gh run list --repo mosure/burn_autogaze --limit 5 \
 Focused in-repo checks after that push still pass:
 
 ```sh
-tools/check_completion_audit.sh
+cargo run -p xtask -- completion-audit
 
 cargo test -p burn_autogaze --features ndarray --test source_hygiene -- --nocapture
 # 8 passed
@@ -922,7 +916,7 @@ cargo test -p burn_autogaze --features ndarray --test source_hygiene -- --nocapt
 cargo test -p burn_autogaze --features ndarray readout -- --nocapture
 # 31 passed, including readout, packet, sync/async, and tiled no-trace coverage
 
-python3 tools/validate_bevy_perf_summary.py --self-test
+cargo run -p xtask -- validate-bevy-perf-summary --self-test
 # passed
 ```
 
@@ -931,7 +925,7 @@ audit correctly fails there because the benchmark still contains local
 AutoGaze generated-token decoding and image-to-video projection:
 
 ```sh
-tools/check_completion_audit.sh --burn-jepa ../burn_jepa
+cargo run -p xtask -- completion-audit --burn-jepa ../burn_jepa
 # missing generated_to_frame_readout_tokens / generated_to_video_readout_tokens
 # missing SparseReadoutGrid / SparseVideoReadoutGrid / SparseVideoReadoutOptions
 # still present generated_frame_tokens / context_mask_from_autogaze_generated
@@ -948,5 +942,5 @@ The same completion-audit script can enforce the hardware-bound throughput lane
 on a target GPU/camera host:
 
 ```sh
-tools/check_completion_audit.sh --hardware-perf --frames 120
+cargo run -p xtask -- completion-audit --hardware-perf --frames 120
 ```

@@ -129,7 +129,7 @@ downstream mask type.
 current `../burn_jepa/benches/autogaze_sparse_jepa_pipeline.rs` benchmark. It
 was checked in a temporary copy of `../burn_jepa` with this crate patched in as
 the local `burn_autogaze` dependency.
-`tools/check_burn_jepa_sparse_readout_integration.sh PATH_TO_BURN_JEPA` is the
+`cargo run -p xtask -- check-burn-jepa-sparse-readout-integration PATH_TO_BURN_JEPA` is the
 external audit for that migration. It fails while the downstream benchmark still
 contains local `generated_frame_tokens` /
 `context_mask_from_autogaze_generated` logic, and passes only after the bench
@@ -156,7 +156,7 @@ tmp=$(mktemp -d /tmp/burn_jepa-readout.XXXXXX)
 tar --exclude='./target' --exclude='./.git' -C ../burn_jepa -cf - . | tar -x -C "$tmp"
 git -C "$tmp" apply "$PWD/docs/burn-jepa-sparse-readout-migration.patch"
 perl -0pi -e 's#burn_autogaze = \{ version = "0\.21\.2", default-features = false, features = \["ndarray"\] \}#burn_autogaze = { version = "0.21.2", path = "'$PWD'", default-features = false, features = ["ndarray"] }#' "$tmp/Cargo.toml"
-tools/check_burn_jepa_sparse_readout_integration.sh "$tmp"
+cargo run -p xtask -- check-burn-jepa-sparse-readout-integration "$tmp"
 cargo check --manifest-path "$tmp/Cargo.toml" --bench autogaze_sparse_jepa_pipeline --no-default-features --features ndarray,sparse-patchify-wgpu
 find "$tmp" -depth -mindepth 1 -delete && rmdir "$tmp"
 ```

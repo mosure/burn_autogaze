@@ -306,6 +306,47 @@ fn generated_output_decoding_stays_in_core_model_and_readout_helpers() {
 }
 
 #[test]
+fn repo_tooling_entrypoints_live_in_xtask() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let xtask = manifest.join("xtask").join("src").join("main.rs");
+    if !xtask.is_file() {
+        eprintln!("skipping repo tooling hygiene check outside workspace checkout");
+        return;
+    }
+
+    let legacy_tools = manifest.join("tools");
+    assert!(
+        !legacy_tools.exists(),
+        "repo-level command entry points should live in xtask, not tools/*.sh or tools/*.py"
+    );
+
+    let checked_docs = [
+        manifest.join("README.md"),
+        manifest.join("docs").join("completion-audit.md"),
+        manifest.join("docs").join("sparse-readout-integration.md"),
+        manifest.join(".github").join("workflows").join("test.yml"),
+        manifest
+            .join(".github")
+            .join("workflows")
+            .join("deploy-pages.yml"),
+    ];
+    for path in checked_docs {
+        let Some(source) = optional_source(&path) else {
+            continue;
+        };
+        assert!(
+            !source.contains("tools/check_")
+                && !source.contains("tools/run_")
+                && !source.contains("tools/validate_")
+                && !source.contains("tools/generate_")
+                && !source.contains("tools/common.sh"),
+            "{} should use cargo run -p xtask instead of legacy tools scripts",
+            path.display()
+        );
+    }
+}
+
+#[test]
 fn bevy_realtime_admission_uses_configured_core_policy() {
     let Some(source) = bevy_source() else {
         return;

@@ -46,7 +46,7 @@ jobs:
           cache-dependency-path: crates/bevy_burn_autogaze/package-lock.json
 
       - name: build and test bevy wasm demo
-        run: tools/check_bevy_wasm_demo.sh --browser
+        run: cargo run -p xtask -- check-bevy-wasm-demo --browser
 
       - name: prepare pages artifact
         run: |

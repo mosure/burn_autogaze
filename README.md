@@ -487,7 +487,7 @@ cargo bench -p bevy_burn_autogaze --bench viewer_pipeline -- bevy_autogaze_viewe
 ## validation
 
 ```sh
-tools/check_release_readiness.sh
+cargo run -p xtask -- release-readiness
 cargo test
 cargo test --features cuda --test backend_pipeline -- --nocapture
 cargo clippy --all-targets --features cuda -- -D warnings
@@ -497,15 +497,15 @@ cargo check -p bevy_burn_autogaze --target wasm32-unknown-unknown
 cargo clippy -p bevy_burn_autogaze --target wasm32-unknown-unknown -- -D warnings
 cargo package --allow-dirty
 cd crates/bevy_burn_autogaze && npm ci && npm run test:browser
-tools/run_bevy_perf_matrix.sh --dry-run --frames 2 --camera
+cargo run -p xtask -- bevy-perf-matrix --dry-run --frames 2 --camera
 ```
 
-`tools/check_release_readiness.sh` runs the local non-hardware release gate:
+`cargo run -p xtask -- release-readiness` runs the local non-hardware release gate:
 root and Bevy tests, native/wasm checks, clippy with warnings denied, benchmark
 compilation, package verification, and `git diff --check`. Pass `--browser` on
 a host with a normal Node/Playwright setup to include the static-source browser
 smoke, or `--real-model-browser` after staging local wasm model assets.
-`tools/check_bevy_wasm_demo.sh --browser` is the narrower Pages/demo gate used
+`cargo run -p xtask -- check-bevy-wasm-demo --browser` is the narrower Pages/demo gate used
 by the deploy workflow; it checks the Bevy wasm target, installs the matching
 `wasm-bindgen-cli`, installs npm dependencies, builds `www/out`, and runs the
 static-source browser smoke. If the system `node`/`npm`/`npx` are Snap-provided
@@ -519,27 +519,17 @@ cuda/webgpu backend tests and benches skip cleanly when the requested
 accelerator is not available on the host.
 See [docs/completion-audit.md](./docs/completion-audit.md) for the current
 coverage checklist, browser-test blocker notes, and hardware FPS runbook. Run
-`tools/run_bevy_perf_matrix.sh --frames 120 --camera` on a real GPU host to
+`cargo run -p xtask -- bevy-perf-matrix --frames 120 --camera` on a real GPU host to
 capture native Bevy throughput logs, per-case JSON summaries, and aggregate
 `summary.json` with CPU-adapter failures guarded by
 `--require-hardware-adapter=true`.
 
-The upstream parity fixtures are generated from the NVIDIA Python package with:
+Use `cargo run -p xtask -- upstream-fixture-matrix` to generate upstream
+NVIDIA/Python parity fixtures from a manifest and immediately rerun the
+fixture-only parity check:
 
 ```sh
-tools/generate_upstream_fixture.py \
-  --model-dir /path/to/AutoGaze \
-  --video /path/to/video.mp4 \
-  --out-dir tests/fixtures/autogaze_birds_python_generate
-```
-
-`tools/generate_upstream_fixture.py --help` is dependency-light, so the fixture
-command surface can be inspected without importing the Python model stack.
-Use `tools/generate_upstream_fixture_matrix.py` to expand fixture coverage from
-a manifest and immediately rerun the fixture-only parity check:
-
-```sh
-tools/generate_upstream_fixture_matrix.py \
+cargo run -p xtask -- upstream-fixture-matrix \
   --manifest docs/upstream_fixture_matrix.example.json \
   --run-parity-test
 ```

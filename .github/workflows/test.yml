@@ -40,4 +40,4 @@ jobs:
 
       - name: release readiness gate
         timeout-minutes: 75
-        run: tools/check_release_readiness.sh --browser --no-browser-deps
+        run: cargo run -p xtask -- release-readiness --browser --no-browser-deps
