@@ -63,10 +63,11 @@ Use `--require-hardware-adapter=true` for perf runs that should fail fast
 instead of silently measuring a CPU/software render adapter.
 Use `--load-model=false` to verify camera/preview rendering without waiting for
 model load or inference.
-From the repository root, run `tools/run_bevy_perf_matrix.sh --frames 120
---camera` on a real GPU host to collect deterministic static-source and live
-camera throughput logs, per-case JSON summaries, and an aggregate
-`summary.json` under `target/autogaze-bevy-perf/`.
+From the repository root, run
+`cargo run -p xtask -- bevy-perf-matrix --frames 120 --camera` on a real GPU
+host to collect deterministic static-source and live camera throughput logs,
+per-case JSON summaries, and an aggregate `summary.json` under
+`target/autogaze-bevy-perf/`.
 
 `--visualization-mode full-blend` renders the current frame's alpha-blended
 mask. The default `--blend-alpha` is intentionally subtle so the output panel

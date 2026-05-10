@@ -324,6 +324,11 @@ fn repo_tooling_entrypoints_live_in_xtask() {
         manifest.join("README.md"),
         manifest.join("docs").join("completion-audit.md"),
         manifest.join("docs").join("sparse-readout-integration.md"),
+        manifest
+            .join("crates")
+            .join("bevy_burn_autogaze")
+            .join("README.md"),
+        manifest.join("web").join("README.md"),
         manifest.join(".github").join("workflows").join("test.yml"),
         manifest
             .join(".github")
@@ -339,7 +344,9 @@ fn repo_tooling_entrypoints_live_in_xtask() {
                 && !source.contains("tools/run_")
                 && !source.contains("tools/validate_")
                 && !source.contains("tools/generate_")
-                && !source.contains("tools/common.sh"),
+                && !source.contains("tools/common.sh")
+                && !source.contains("bash -n cargo run")
+                && !source.contains("py_compile tools"),
             "{} should use cargo run -p xtask instead of legacy tools scripts",
             path.display()
         );

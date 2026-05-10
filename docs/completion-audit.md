@@ -518,7 +518,6 @@ builds the Bevy wasm artifacts, and runs the browser smoke when `--browser` is
 passed. The non-browser gate completed successfully in this workspace:
 
 ```sh
-bash -n cargo run -p xtask -- release-readiness
 cargo run -p xtask -- release-readiness --browser --dry-run
 cargo run -p xtask -- release-readiness
 ```
@@ -530,7 +529,6 @@ readiness gate calls that same script for browser coverage, so the deploy and
 test workflows share the wasm demo build path:
 
 ```sh
-bash -n cargo run -p xtask -- check-bevy-wasm-demo
 cargo run -p xtask -- check-bevy-wasm-demo --browser --dry-run
 ```
 
