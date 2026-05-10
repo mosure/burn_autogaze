@@ -3571,6 +3571,12 @@ mod tests {
 
     #[test]
     fn prepared_run_uses_core_processor_tensor_and_raw_display_frame() {
+        if skip_native_wgpu_test_on_github_actions(
+            "prepared_run_uses_core_processor_tensor_and_raw_display_frame",
+        ) {
+            return;
+        }
+
         let device = AutoGazeBevyDevice::default();
         let first = [10, 20, 30, 255, 40, 50, 60, 255];
         let second = [70, 80, 90, 255, 100, 110, 120, 255];
@@ -3648,6 +3654,12 @@ mod tests {
 
     #[test]
     fn prepared_birds_run_uses_same_core_rgba_path_as_python_fixture() {
+        if skip_native_wgpu_test_on_github_actions(
+            "prepared_birds_run_uses_same_core_rgba_path_as_python_fixture",
+        ) {
+            return;
+        }
+
         let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .join("tests/fixtures/autogaze_birds_python_generate");
@@ -3763,6 +3775,12 @@ mod tests {
 
     #[test]
     fn gpu_display_transfer_matches_cpu_visualization_outputs() {
+        if skip_native_wgpu_test_on_github_actions(
+            "gpu_display_transfer_matches_cpu_visualization_outputs",
+        ) {
+            return;
+        }
+
         let device = AutoGazeBevyDevice::default();
         let width = 4;
         let height = 2;
@@ -3923,6 +3941,11 @@ mod tests {
 
     #[test]
     fn gpu_display_transfer_uses_split_panel_tensors() {
+        if skip_native_wgpu_test_on_github_actions("gpu_display_transfer_uses_split_panel_tensors")
+        {
+            return;
+        }
+
         let device = AutoGazeBevyDevice::default();
         let width = 4;
         let height = 2;
@@ -4088,6 +4111,17 @@ mod tests {
                 "tensor value {index} diverged: {left} vs {right}"
             );
         }
+    }
+
+    fn skip_native_wgpu_test_on_github_actions(test_name: &str) -> bool {
+        if std::env::var_os("GITHUB_ACTIONS").is_some() {
+            eprintln!(
+                "skipping {test_name}: GitHub Actions does not provide a stable native WGPU/CubeCL device; wasm WebGPU is covered by the Pages browser workflow"
+            );
+            return true;
+        }
+
+        false
     }
 
     #[test]
