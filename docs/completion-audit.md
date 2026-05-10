@@ -158,13 +158,14 @@ invalid enum/config fields, invalid frame/dimension counts, p95 lower than p50,
 malformed aggregate `summary.json` files, mismatched min/max FPS extrema, and
 CPU adapters when hardware is required. PSNR is JSON-safe: finite dB values are
 numeric, and perfect/infinite PSNR is represented by a boolean flag rather than
-an invalid JSON number. The release gate runs the xtask self-test and the native
-perf-matrix dry-run; the native perf matrix validates every extracted per-case
-summary and its aggregate summary before accepting FPS:
+an invalid JSON number. The release gate runs xtask unit tests, the perf-summary
+self-test, and the native perf-matrix dry-run; the native perf matrix validates
+every extracted per-case summary and its aggregate summary before accepting FPS:
 
 ```sh
 cargo run -p xtask -- validate-bevy-perf-summary --self-test
 cargo check -p xtask
+cargo test -p xtask
 cargo run -p xtask -- upstream-fixture-matrix --manifest docs/upstream_fixture_matrix.example.json --dry-run
 cargo run -p xtask -- bevy-perf-matrix --dry-run --frames 2 --camera
 cargo run -p xtask -- release-readiness --dry-run
@@ -517,9 +518,9 @@ so CI and the documented release gate share the same command list instead of
 drifting separately. The script installs the matching `wasm-bindgen-cli`,
 preflights `node`/`npm`/`npx`, runs `npm ci`, installs Playwright Chromium,
 builds the Bevy wasm artifacts, and runs the browser smoke when `--browser` is
-passed. The release gate checks and clippy-lints the `xtask` crate itself so
-repo task orchestration stays no-warning ready. The non-browser gate completed
-successfully in this workspace:
+passed. The release gate checks, tests, and clippy-lints the `xtask` crate
+itself so repo task orchestration stays no-warning ready. The non-browser gate
+completed successfully in this workspace:
 
 ```sh
 cargo run -p xtask -- release-readiness --browser --dry-run

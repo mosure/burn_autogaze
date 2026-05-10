@@ -376,6 +376,7 @@ fn release_readiness(root: PathBuf, args: ReleaseReadinessArgs) -> Result<()> {
     }
 
     runner.run(runner.command(&cargo, ["check", "-p", "xtask"]))?;
+    runner.run(runner.command(&cargo, ["test", "-p", "xtask"]))?;
     runner.run(runner.command(&cargo, ["clippy", "-p", "xtask", "--", "-D", "warnings"]))?;
     completion_audit(
         root.clone(),
@@ -1752,4 +1753,121 @@ fn shell_escape(value: &OsStr) -> String {
         return value.into_owned();
     }
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn perf_summary_validator_reports_missing_required_field() {
+        let mut data = valid_perf_summary();
+        data.as_object_mut()
+            .expect("summary object")
+            .remove("p95_total_ms");
+
+        let err = validate_summary(&data, false).expect_err("missing p95 should fail");
+
+        assert!(
+            err.to_string().contains("p95_total_ms"),
+            "error should name the missing field: {err:?}"
+        );
+    }
+
+    #[test]
+    fn perf_summary_validator_rejects_inconsistent_percentile_order() {
+        let mut data = valid_perf_summary();
+        data["p50_total_ms"] = json!(20.0);
+        data["p95_total_ms"] = json!(19.0);
+
+        let err = validate_summary(&data, false).expect_err("p95 below p50 should fail");
+
+        assert!(
+            err.to_string().contains("p95_total_ms"),
+            "error should explain the percentile mismatch: {err:?}"
+        );
+    }
+
+    #[test]
+    fn perf_summary_validator_rejects_infinite_psnr_with_finite_value() {
+        let mut data = valid_perf_summary();
+        data["latest_psnr_db_infinite"] = json!(true);
+
+        let err = validate_summary(&data, false).expect_err("conflicting PSNR should fail");
+
+        assert!(
+            err.to_string().contains("latest_psnr_db"),
+            "error should name the conflicting PSNR field: {err:?}"
+        );
+    }
+
+    #[test]
+    fn aggregate_perf_summary_validator_reports_missing_case_count() {
+        let data = json!({
+            "min_output_fps": 54.0,
+            "max_output_fps": 54.0,
+            "cases": [valid_perf_summary()]
+        });
+
+        let err =
+            validate_aggregate_summary(&data, false).expect_err("missing case_count should fail");
+
+        assert!(
+            err.to_string().contains("case_count"),
+            "error should name the missing aggregate field: {err:?}"
+        );
+    }
+
+    fn valid_perf_summary() -> Value {
+        json!({
+            "avg_output_fps": 54.0,
+            "avg_model_frame_fps": 54.0,
+            "avg_input_fps": 60.0,
+            "avg_total_ms": 18.0,
+            "p50_total_ms": 17.0,
+            "p95_total_ms": 19.0,
+            "avg_model_ms": 6.0,
+            "avg_input_ms": 1.0,
+            "avg_pack_ms": 1.0,
+            "avg_visualize_ms": 2.0,
+            "avg_visualize_cpu_ms": 1.0,
+            "avg_tensor_ms": 1.0,
+            "avg_display_ms": 1.0,
+            "avg_gaze_update_ratio": 0.25,
+            "latest_gaze_update_ratio": 0.2,
+            "processed_frames": 4,
+            "processed_model_frames": 8,
+            "latest_clip_frames": 2,
+            "latest_model_frames": 2,
+            "latest_width": 640,
+            "latest_height": 360,
+            "latest_trace_points": 12,
+            "latest_sequence": 3,
+            "target_frames": 4,
+            "mode": "resize-224",
+            "visualization_mode": "interframe",
+            "display_transfer": "gpu",
+            "latest_tensor_interframe_path": "sparse-rects",
+            "streaming_cache": true,
+            "streaming_cache_effective": true,
+            "latest_psnr_db": 35.0,
+            "latest_psnr_db_infinite": false,
+            "ema_psnr_db": 34.0,
+            "ema_psnr_db_infinite": false,
+            "show_psnr": true,
+            "configured_max_in_flight": 1,
+            "effective_max_in_flight": 1,
+            "frames_per_clip": 2,
+            "top_k": 10,
+            "tile_batch_size": 64,
+            "inference_width": 640,
+            "inference_height": 360,
+            "max_gaze_tokens_each_frame": 0,
+            "tensor_sparse_update_max_rects": 256,
+            "tensor_sparse_update_max_ratio": 0.35,
+            "render_adapter_device_type": "DiscreteGpu",
+            "render_adapter_name": "test gpu",
+            "case": "self-test"
+        })
+    }
 }
