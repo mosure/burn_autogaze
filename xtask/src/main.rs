@@ -1837,6 +1837,25 @@ mod tests {
     }
 
     #[test]
+    fn xtask_production_code_avoids_unrecoverable_panics() {
+        let source = include_str!("main.rs");
+        let production = source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap_or(source);
+
+        for (line_no, line) in production.lines().enumerate() {
+            for forbidden in ["panic!", ".unwrap()", ".expect("] {
+                assert!(
+                    !line.contains(forbidden),
+                    "xtask production code should report contextual errors instead of {forbidden} at line {}",
+                    line_no + 1
+                );
+            }
+        }
+    }
+
+    #[test]
     fn strict_completion_audit_requires_external_evidence_lanes() {
         let args = completion_audit_args(true, None, false);
 
