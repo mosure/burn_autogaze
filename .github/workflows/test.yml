@@ -39,4 +39,5 @@ jobs:
           cache-dependency-path: crates/bevy_burn_autogaze/package-lock.json
 
       - name: release readiness gate
-        run: tools/check_release_readiness.sh --browser
+        timeout-minutes: 75
+        run: tools/check_release_readiness.sh --browser --no-browser-deps
