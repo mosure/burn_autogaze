@@ -78,6 +78,7 @@ enum TensorFixationCase {
     ModelDefault,
     TinySparse,
     CoarseDense,
+    DenseGrid64,
 }
 
 impl TensorFixationCase {
@@ -86,6 +87,7 @@ impl TensorFixationCase {
             Self::ModelDefault => "model-fixations",
             Self::TinySparse => "tiny-sparse",
             Self::CoarseDense => "coarse-dense",
+            Self::DenseGrid64 => "dense-grid-64",
         }
     }
 
@@ -103,6 +105,7 @@ impl TensorFixationCase {
             Self::CoarseDense => vec![FixationPoint::with_grid_extent(
                 0.25, 0.25, 0.5, 0.5, 1.0, 2,
             )],
+            Self::DenseGrid64 => dense_grid_fixations(64),
         }
     }
 }
@@ -214,6 +217,7 @@ const TENSOR_FIXATION_CASES: &[TensorFixationCase] = &[
     TensorFixationCase::ModelDefault,
     TensorFixationCase::TinySparse,
     TensorFixationCase::CoarseDense,
+    TensorFixationCase::DenseGrid64,
 ];
 const MODEL_INPUT_SIZE: usize = 224;
 const PATCH_SIZE: usize = 16;
@@ -1853,6 +1857,24 @@ fn deterministic_fixations(model: ModelCase) -> Vec<FixationPoint> {
             FixationPoint::with_extent(6.5 / 14.0, 11.5 / 14.0, 1.0 / 14.0, 1.0 / 14.0, 0.71),
         ]
     }
+}
+
+fn dense_grid_fixations(grid: usize) -> Vec<FixationPoint> {
+    let extent = 1.0 / grid as f32;
+    (0..grid)
+        .flat_map(|row| {
+            (0..grid).map(move |col| {
+                FixationPoint::with_grid_extent(
+                    (col as f32 + 0.5) * extent,
+                    (row as f32 + 0.5) * extent,
+                    extent,
+                    extent,
+                    1.0,
+                    grid,
+                )
+            })
+        })
+        .collect()
 }
 
 fn deterministic_video<B: Backend>(

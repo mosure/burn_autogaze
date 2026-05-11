@@ -185,12 +185,14 @@ impl AutoGazeVisualizationState {
         let _ = validate_rgba_dimensions(rgba, width, height)?;
         let (mask_rgba, output_rgba, mask_pixel_count, updated_pixel_count) = match self.mode {
             AutoGazeVisualizationMode::FullBlend => {
-                let mask = mask_rgba_and_alpha(rgba, width, height, points, cell_scale)?;
+                let mask = mask_rgba_and_rects(rgba, width, height, points, cell_scale)?;
+                let output_rgba =
+                    blend_masked_rects_rgba(rgba, width, height, &mask.plan.rects, blend_alpha)?;
                 (
                     mask.mask_rgba,
-                    blend_masked_rgba(rgba, &mask.alpha, blend_alpha),
-                    mask.mask_pixel_count,
-                    mask.mask_pixel_count,
+                    output_rgba,
+                    mask.plan.pixel_count,
+                    mask.plan.pixel_count,
                 )
             }
             AutoGazeVisualizationMode::Interframe => {
@@ -440,9 +442,14 @@ impl<B: Backend> AutoGazeTensorVisualizationState<B> {
         let mut interframe_path = None;
         let (output, mask_pixel_count, updated_pixel_count) = match self.mode {
             AutoGazeVisualizationMode::FullBlend => {
-                let alpha =
-                    fixation_effective_alpha_mask(width, height, points, options.cell_scale);
-                let mask_pixel_count = alpha.iter().filter(|&&mask| mask > 0).count();
+                let plan = fixation_effective_sparse_update_plan(
+                    width,
+                    height,
+                    points,
+                    options.cell_scale,
+                )?;
+                let alpha = alpha_mask_from_rects(width, height, &plan.rects);
+                let mask_pixel_count = plan.pixel_count;
                 let alpha = alpha_u8_to_unit_tensor(&alpha, width, height, device)?;
                 let blend = alpha_blend_tensor(alpha, width, height, options.blend_alpha, device);
                 let inverse = Tensor::<B, 3>::ones([height, width, 4], device).sub(blend.clone());
@@ -453,20 +460,23 @@ impl<B: Backend> AutoGazeTensorVisualizationState<B> {
                 )
             }
             AutoGazeVisualizationMode::Interframe => {
-                let rects =
-                    fixation_effective_cell_rects(width, height, points, options.cell_scale);
+                let plan = fixation_effective_sparse_update_plan(
+                    width,
+                    height,
+                    points,
+                    options.cell_scale,
+                )?;
                 let keyframe = self.is_keyframe(width, height);
                 let use_sparse = !keyframe
                     && should_use_sparse_tensor_update_rects(
                         width,
                         height,
-                        &rects,
+                        &plan.rects,
                         options.sparse_update_max_rects,
                         options.sparse_update_max_ratio,
                     );
                 if use_sparse {
                     interframe_path = Some(AutoGazeTensorInterframePath::SparseRects);
-                    let plan = AutoGazeSparseUpdatePlan::new(width, height, rects)?;
                     let previous = self
                         .interframe_output_rgba
                         .clone()
@@ -479,8 +489,8 @@ impl<B: Backend> AutoGazeTensorVisualizationState<B> {
                     } else {
                         AutoGazeTensorInterframePath::DenseMask
                     });
-                    let alpha = alpha_mask_from_rects(width, height, &rects);
-                    let mask_pixel_count = alpha.iter().filter(|&&mask| mask > 0).count();
+                    let alpha = alpha_mask_from_rects(width, height, &plan.rects);
+                    let mask_pixel_count = plan.pixel_count;
                     let updated_pixel_count = if keyframe { pixels } else { mask_pixel_count };
                     let output = if keyframe {
                         input.clone()
@@ -641,16 +651,10 @@ fn alpha_mask_from_rects(width: usize, height: usize, rects: &[FixationPixelRect
     let height = height.max(1);
     let mut alpha = vec![0u8; width * height];
 
-    for rect in rects {
-        let rect = rect.clamped(width, height);
-        if rect.is_empty() {
-            continue;
-        }
-        for y in rect.y0..rect.y1 {
-            let start = y * width + rect.x0;
-            let end = y * width + rect.x1;
-            alpha[start..end].fill(255);
-        }
+    for (y, x0, x1) in merged_rect_row_spans(width, height, rects) {
+        let start = y * width + x0;
+        let end = y * width + x1;
+        alpha[start..end].fill(255);
     }
 
     alpha
@@ -672,7 +676,11 @@ pub fn fixation_effective_alpha_mask(
 ) -> Vec<u8> {
     let width = width.max(1);
     let height = height.max(1);
-    let rects = fixation_effective_cell_rects(width, height, points, cell_scale);
+    let rects = compact_pixel_rects(
+        width,
+        height,
+        fixation_effective_cell_rects(width, height, points, cell_scale),
+    );
     alpha_mask_from_rects(width, height, &rects)
 }
 
@@ -833,11 +841,12 @@ pub fn fixation_effective_sparse_update_plan(
     points: &[FixationPoint],
     cell_scale: f32,
 ) -> Result<AutoGazeSparseUpdatePlan> {
-    AutoGazeSparseUpdatePlan::new(
-        width,
-        height,
+    let rects = compact_pixel_rects(
+        width.max(1),
+        height.max(1),
         fixation_effective_cell_rects(width, height, points, cell_scale),
-    )
+    );
+    AutoGazeSparseUpdatePlan::new(width, height, rects)
 }
 
 /// Copy source RGBA pixels for sparse update rectangles into a persistent output frame.
@@ -947,6 +956,71 @@ fn effective_point_pixel_rect(
     FixationPixelRect { x0, x1, y0, y1 }
 }
 
+fn compact_pixel_rects<I>(width: usize, height: usize, rects: I) -> Vec<FixationPixelRect>
+where
+    I: IntoIterator<Item = FixationPixelRect>,
+{
+    let mut rects = rects
+        .into_iter()
+        .map(|rect| rect.clamped(width, height))
+        .filter(|rect| !rect.is_empty())
+        .collect::<Vec<_>>();
+    rects.sort_unstable_by_key(|rect| (rect.y0, rect.y1, rect.x0, rect.x1));
+
+    let mut compacted: Vec<FixationPixelRect> = Vec::with_capacity(rects.len());
+    for rect in rects {
+        if let Some(last) = compacted.last_mut()
+            && last.y0 == rect.y0
+            && last.y1 == rect.y1
+            && rect.x0 <= last.x1
+        {
+            last.x1 = last.x1.max(rect.x1);
+            continue;
+        }
+        compacted.push(rect);
+    }
+    compacted
+}
+
+fn merged_rect_row_spans(
+    width: usize,
+    height: usize,
+    rects: &[FixationPixelRect],
+) -> Vec<(usize, usize, usize)> {
+    if rects.is_empty() || width == 0 || height == 0 {
+        return Vec::new();
+    }
+
+    let rects = compact_pixel_rects(width, height, rects.iter().copied());
+    let mut spans = Vec::new();
+    for rect in rects {
+        for y in rect.y0..rect.y1 {
+            spans.push((y, rect.x0, rect.x1));
+        }
+    }
+    if spans.len() <= 1 {
+        return spans;
+    }
+
+    spans.sort_unstable();
+    let mut merged = Vec::with_capacity(spans.len());
+    let mut current_y = spans[0].0;
+    let mut current_x0 = spans[0].1;
+    let mut current_x1 = spans[0].2;
+    for (y, x0, x1) in spans.into_iter().skip(1) {
+        if y == current_y && x0 <= current_x1 {
+            current_x1 = current_x1.max(x1);
+        } else {
+            merged.push((current_y, current_x0, current_x1));
+            current_y = y;
+            current_x0 = x0;
+            current_x1 = x1;
+        }
+    }
+    merged.push((current_y, current_x0, current_x1));
+    merged
+}
+
 fn project_point_to_grid_cell(point: FixationPoint, target_grid: usize) -> (usize, usize) {
     let target_grid = target_grid.max(1);
     if let Some(source_grid) = point.cell_grid() {
@@ -994,15 +1068,26 @@ fn fill_cell(rgba: &mut [u8], width: usize, rect: FixationPixelRect, color: [u8;
         255,
     ];
     let span = rect.x1 - rect.x0;
-    let mut scanline = Vec::with_capacity(span * 4);
-    for _ in 0..span {
-        scanline.extend_from_slice(&pixel);
-    }
 
     for y in rect.y0..rect.y1 {
         let start = (y * width + rect.x0) * 4;
         let end = start + span * 4;
-        rgba[start..end].copy_from_slice(&scanline);
+        fill_rgba_span(&mut rgba[start..end], pixel);
+    }
+}
+
+fn fill_rgba_span(span: &mut [u8], pixel: [u8; 4]) {
+    if span.len() < 4 {
+        return;
+    }
+
+    span[..4].copy_from_slice(&pixel);
+    let mut filled = 4;
+    while filled < span.len() {
+        let copy_len = filled.min(span.len() - filled);
+        let (source, target) = span.split_at_mut(filled);
+        target[..copy_len].copy_from_slice(&source[..copy_len]);
+        filled += copy_len;
     }
 }
 
@@ -1156,35 +1241,9 @@ fn alpha_blend_tensor<B: Backend>(
     Tensor::cat(vec![rgb, alpha], 2)
 }
 
-struct MaskRgbaAndAlpha {
-    mask_rgba: Vec<u8>,
-    alpha: Vec<u8>,
-    mask_pixel_count: usize,
-}
-
 struct MaskRgbaAndRects {
     mask_rgba: Vec<u8>,
     plan: AutoGazeSparseUpdatePlan,
-}
-
-fn mask_rgba_and_alpha(
-    rgba: &[u8],
-    width: usize,
-    height: usize,
-    points: &[FixationPoint],
-    cell_scale: f32,
-) -> Result<MaskRgbaAndAlpha> {
-    let _ = validate_rgba_dimensions(rgba, width, height)?;
-    let rects = fixation_effective_cell_rects(width, height, points, cell_scale);
-    let alpha = alpha_mask_from_rects(width, height, &rects);
-    let mask_rgba = fixation_scale_mask_rgba(width, height, points, cell_scale);
-    let mask_pixel_count = fixation_rect_union_pixel_count(&rects, width, height);
-
-    Ok(MaskRgbaAndAlpha {
-        mask_rgba,
-        alpha,
-        mask_pixel_count,
-    })
 }
 
 fn mask_rgba_and_rects(
@@ -1215,33 +1274,42 @@ fn mask_and_blend_rgba(
     cell_scale: f32,
     blend_alpha: f32,
 ) -> Result<MaskBlendRgba> {
-    let mask = mask_rgba_and_alpha(rgba, width, height, points, cell_scale)?;
-    let blend_rgba = blend_masked_rgba(rgba, &mask.alpha, blend_alpha);
+    let mask = mask_rgba_and_rects(rgba, width, height, points, cell_scale)?;
+    let blend_rgba = blend_masked_rects_rgba(rgba, width, height, &mask.plan.rects, blend_alpha)?;
 
     Ok(MaskBlendRgba {
         mask_rgba: mask.mask_rgba,
         blend_rgba,
-        mask_pixel_count: mask.mask_pixel_count,
+        mask_pixel_count: mask.plan.pixel_count,
     })
 }
 
-fn blend_masked_rgba(rgba: &[u8], alpha: &[u8], blend_alpha: f32) -> Vec<u8> {
-    debug_assert_eq!(rgba.len(), alpha.len() * 4);
-    let pixels = alpha.len();
-    let mut blend_rgba = vec![0u8; pixels * 4];
+fn blend_masked_rects_rgba(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    rects: &[FixationPixelRect],
+    blend_alpha: f32,
+) -> Result<Vec<u8>> {
+    let _ = validate_rgba_dimensions(rgba, width, height)?;
+    let mut blend_rgba = rgba.to_vec();
     let blend_alpha = blend_alpha.clamp(0.0, 1.0);
-
-    for (pixel, mask) in alpha.iter().copied().enumerate() {
-        let src = pixel * 4;
-        let overlay = if mask > 0 { blend_alpha } else { 0.0 };
-        for channel in 0..3 {
-            let base = rgba[src + channel] as f32;
-            blend_rgba[src + channel] = (base * (1.0 - overlay) + 255.0 * overlay).round() as u8;
-        }
-        blend_rgba[src + 3] = rgba[src + 3];
+    if blend_alpha <= 0.0 || rects.is_empty() {
+        return Ok(blend_rgba);
     }
 
-    blend_rgba
+    for (y, x0, x1) in merged_rect_row_spans(width, height, rects) {
+        for x in x0..x1 {
+            let offset = (y * width + x) * 4;
+            for channel in 0..3 {
+                let base = rgba[offset + channel] as f32;
+                blend_rgba[offset + channel] =
+                    (base * (1.0 - blend_alpha) + 255.0 * blend_alpha).round() as u8;
+            }
+        }
+    }
+
+    Ok(blend_rgba)
 }
 
 fn copy_rects_rgba(
@@ -1254,18 +1322,11 @@ fn copy_rects_rgba(
     debug_assert_eq!(source_rgba.len(), width * height * 4);
     debug_assert_eq!(target_rgba.len(), source_rgba.len());
     let row_bytes = width * 4;
-    for rect in rects {
-        let x0 = rect.x0.min(width);
-        let x1 = rect.x1.min(width);
-        if x0 >= x1 {
-            continue;
-        }
-        for y in rect.y0.min(height)..rect.y1.min(height) {
-            let row = y * row_bytes;
-            let start = row + x0 * 4;
-            let end = row + x1 * 4;
-            target_rgba[start..end].copy_from_slice(&source_rgba[start..end]);
-        }
+    for (y, x0, x1) in merged_rect_row_spans(width, height, rects) {
+        let row = y * row_bytes;
+        let start = row + x0 * 4;
+        let end = row + x1 * 4;
+        target_rgba[start..end].copy_from_slice(&source_rgba[start..end]);
     }
 }
 
@@ -1278,41 +1339,10 @@ pub fn fixation_rect_union_pixel_count(
         return 0;
     }
 
-    let mut spans = Vec::new();
-    for rect in rects {
-        let x0 = rect.x0.min(width);
-        let x1 = rect.x1.min(width);
-        if x0 >= x1 {
-            continue;
-        }
-        for y in rect.y0.min(height)..rect.y1.min(height) {
-            spans.push((y, x0, x1));
-        }
-    }
-    if spans.is_empty() {
-        return 0;
-    }
-
-    spans.sort_unstable();
-    let mut count = 0usize;
-    let mut current_y = spans[0].0;
-    let mut current_x0 = spans[0].1;
-    let mut current_x1 = spans[0].2;
-    for (y, x0, x1) in spans.into_iter().skip(1) {
-        if y != current_y {
-            count = count.saturating_add(current_x1.saturating_sub(current_x0));
-            current_y = y;
-            current_x0 = x0;
-            current_x1 = x1;
-        } else if x0 <= current_x1 {
-            current_x1 = current_x1.max(x1);
-        } else {
-            count = count.saturating_add(current_x1.saturating_sub(current_x0));
-            current_x0 = x0;
-            current_x1 = x1;
-        }
-    }
-    count.saturating_add(current_x1.saturating_sub(current_x0))
+    merged_rect_row_spans(width, height, rects)
+        .into_iter()
+        .map(|(_, x0, x1)| x1.saturating_sub(x0))
+        .sum()
 }
 
 fn build_visualization(
@@ -1738,6 +1768,37 @@ mod tests {
         ];
 
         assert_eq!(fixation_rect_union_pixel_count(&rects, 4, 4), 9);
+    }
+
+    #[test]
+    fn effective_sparse_update_plan_merges_dense_grid_cells_into_row_bands() {
+        let width = 640;
+        let height = 360;
+        let grid = 64;
+        let points = dense_grid_points(grid);
+
+        let raw_rects = fixation_effective_cell_rects(width, height, &points, 1.0);
+        let plan =
+            fixation_effective_sparse_update_plan(width, height, &points, 1.0).expect("plan");
+
+        assert_eq!(raw_rects.len(), grid * grid);
+        assert_eq!(plan.rects.len(), grid);
+        assert_eq!(plan.pixel_count, width * height);
+    }
+
+    #[test]
+    fn full_blend_overlapping_cells_are_blended_once() {
+        let coarse = FixationPoint::with_grid_extent(0.5, 0.5, 1.0, 1.0, 1.0, 2);
+        let duplicate = FixationPoint::with_grid_extent(0.5, 0.5, 1.0, 1.0, 1.0, 2);
+        let rgba = [100, 0, 0, 255];
+        let mut state = AutoGazeVisualizationState::new(AutoGazeVisualizationMode::FullBlend, 10);
+
+        let visualization = state
+            .visualize_rgba_panels(&rgba, 1, 1, &[coarse, duplicate], 1.0, 0.5)
+            .expect("visualize");
+
+        assert_eq!(&visualization.blend_rgba[0..4], &[178, 128, 128, 255]);
+        assert_eq!(visualization.mask_pixel_count, 1);
     }
 
     #[test]
@@ -2212,5 +2273,23 @@ mod tests {
             }
         }
         rgba
+    }
+
+    fn dense_grid_points(grid: usize) -> Vec<FixationPoint> {
+        let extent = 1.0 / grid as f32;
+        (0..grid)
+            .flat_map(|row| {
+                (0..grid).map(move |col| {
+                    FixationPoint::with_grid_extent(
+                        (col as f32 + 0.5) * extent,
+                        (row as f32 + 0.5) * extent,
+                        extent,
+                        extent,
+                        1.0,
+                        grid,
+                    )
+                })
+            })
+            .collect()
     }
 }

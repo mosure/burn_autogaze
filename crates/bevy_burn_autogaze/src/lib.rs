@@ -65,16 +65,15 @@ pub const DEFAULT_WEIGHTS_URL: &str =
     "https://huggingface.co/nvidia/AutoGaze/resolve/main/model.safetensors";
 const MODEL_INPUT_SIZE: usize = 224;
 pub const DEFAULT_REALTIME_INFERENCE_WIDTH: u32 = 640;
-pub const DEFAULT_REALTIME_MAX_GAZE_TOKENS: usize = DEFAULT_MODEL_GENERATION_BUDGET;
+pub const DEFAULT_REALTIME_MAX_GAZE_TOKENS: usize = 8;
 /// Viewer config sentinel for using the AutoGaze model's configured inference budget.
 ///
 /// The NVIDIA config uses a fixed inference gazing ratio of 0.75, which maps to
 /// 198 tokens for its 265-token multi-scale vocabulary. This remains available
-/// by passing `0`. The realtime viewer keeps this model default because
-/// over-capping generation tends to leave only coarse multi-scale cells, which
-/// can look like a broken full-frame mask. Tiled mode still uses an explicit
-/// per-tile cap by default to avoid multiplying the full model budget by every
-/// tile in the frame.
+/// by passing `0`. The realtime viewer uses a small nonzero default budget so
+/// the Bevy demo stays interactive; use `0` for upstream-budget inspection.
+/// Tiled mode also uses an explicit per-tile cap by default to avoid multiplying
+/// the full model budget by every tile in the frame.
 pub const DEFAULT_TILED_INFERENCE_WIDTH: u32 = 1280;
 const MAX_SPARE_CLIP_BUFFERS: usize = 2;
 const TIMING_LOG_INTERVAL_MS: f64 = 5_000.0;
@@ -243,7 +242,7 @@ impl Default for BevyBurnAutoGazeConfig {
             inference_height: None,
             mask_cell_scale: 1.0,
             blend_alpha: DEFAULT_BLEND_ALPHA,
-            visualization_mode: AutoGazeVisualizationMode::FullBlend,
+            visualization_mode: AutoGazeVisualizationMode::Interframe,
             keyframe_duration: DEFAULT_KEYFRAME_DURATION,
             display_transfer: BevyDisplayTransfer::Cpu,
             tensor_sparse_update_max_rects: DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RECTS,
@@ -978,6 +977,7 @@ struct InferenceTimingStats {
     total_ms: f64,
     model_ms: f64,
     model_frames: usize,
+    trace_points: usize,
     input_ms: f64,
     pack_ms: f64,
     visualize_ms: f64,
@@ -1077,6 +1077,7 @@ impl InferenceTimingStats {
         self.total_ms += timing.total_ms;
         self.model_ms += timing.model_ms;
         self.model_frames += timing.model_frames;
+        self.trace_points += timing.trace_points;
         self.input_ms += timing.input_ms;
         self.pack_ms += timing.pack_ms;
         self.visualize_ms += timing.visualize_ms;
@@ -1157,6 +1158,7 @@ impl InferenceTimingStats {
         } else {
             0.0
         };
+        let avg_trace_points = mean_or_zero(self.trace_points as f64, processed_frames);
         let p50_total_ms = percentile_ms(&self.samples, 0.50);
         let p95_total_ms = percentile_ms(&self.samples, 0.95);
         let latest_clip_frames = self
@@ -1178,6 +1180,7 @@ impl InferenceTimingStats {
             "p50_total_ms": p50_total_ms,
             "p95_total_ms": p95_total_ms,
             "avg_model_ms": avg_model_ms,
+            "avg_trace_points": avg_trace_points,
             "avg_input_ms": avg_input_ms,
             "avg_pack_ms": avg_pack_ms,
             "avg_visualize_ms": avg_visualize_ms,
@@ -1330,6 +1333,7 @@ fn perf_sample_json(stats: &InferenceTimingStats) -> Option<String> {
     } else {
         0.0
     };
+    let avg_trace_points = mean_or_zero(stats.trace_points as f64, stats.processed_frames());
     let mut sample = serde_json::json!({
         "processed_frames": stats.processed_frames(),
         "processed_model_frames": stats.model_frames,
@@ -1353,6 +1357,7 @@ fn perf_sample_json(stats: &InferenceTimingStats) -> Option<String> {
         "avg_output_fps": avg_output_fps,
         "avg_model_frame_fps": avg_model_frame_fps,
         "avg_input_fps": avg_input_fps,
+        "avg_trace_points": avg_trace_points,
         "avg_gaze_update_ratio": mean_or_zero(stats.gaze_update_ratio, stats.processed_frames()),
         "latest_psnr_db": psnr_metric_json_value(&stats.psnr_stats, PsnrMetricKind::Current),
         "latest_psnr_db_infinite": psnr_metric_is_infinite(&stats.psnr_stats, PsnrMetricKind::Current),
@@ -3450,7 +3455,7 @@ mod tests {
         assert_eq!(config.frames_per_clip, DEFAULT_REALTIME_FRAMES_PER_CLIP);
         assert_eq!(config.max_in_flight, DEFAULT_MAX_IN_FLIGHT);
         assert_eq!(DEFAULT_REALTIME_TOP_K, 10);
-        assert_eq!(DEFAULT_REALTIME_MAX_GAZE_TOKENS, 0);
+        assert_eq!(DEFAULT_REALTIME_MAX_GAZE_TOKENS, 8);
         assert_eq!(DEFAULT_MODEL_GENERATION_BUDGET, 0);
         assert_eq!(DEFAULT_REALTIME_FRAMES_PER_CLIP, 2);
         assert_eq!(DEFAULT_MAX_IN_FLIGHT, 1);
@@ -4286,6 +4291,7 @@ mod tests {
         assert_eq!(summary["avg_input_fps"], 100.0);
         assert_eq!(summary["avg_model_frame_fps"], 250.0);
         assert_eq!(summary["avg_model_ms"], 8.0);
+        assert_eq!(summary["avg_trace_points"], 42.0);
         assert_eq!(summary["avg_input_ms"], 2.0);
         assert_eq!(summary["avg_pack_ms"], 1.0);
         assert_eq!(summary["avg_visualize_ms"], 3.0);
@@ -4300,6 +4306,7 @@ mod tests {
         assert_eq!(sample["latest_clip_frames"], 16);
         assert_eq!(sample["latest_model_frames"], 2);
         assert_eq!(sample["latest_trace_points"], 42);
+        assert_eq!(sample["avg_trace_points"], 42.0);
         assert_eq!(sample["latest_width"], 640);
         assert_eq!(sample["latest_height"], 360);
         assert_eq!(sample["latest_gaze_update_ratio"], 0.25);

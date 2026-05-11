@@ -31,8 +31,8 @@ Use `--perf-summary-frames N` with `--image-path` or another deterministic
 source to process `N` inference outputs, print a JSON FPS/timing summary, and
 exit. Add `--perf-summary-path target/autogaze-bevy-perf/run.json` to write the
 same summary as a JSON artifact for hardware throughput reports.
-The viewer display default is `--top-k 10`,
-`--max-gaze-tokens-each-frame 0`, and `--frames-per-clip 2` for realtime use.
+The viewer display default is `--visualization-mode interframe`, `--top-k 10`,
+`--max-gaze-tokens-each-frame 8`, and `--frames-per-clip 2` for realtime use.
 In `tiled` mode the defaults are `--top-k 2`,
 `--max-gaze-tokens-each-frame 24`, `--frames-per-clip 2`, and
 `--tile-batch-size 64`. Leave `--streaming-cache=true` enabled in realtime mode
@@ -42,10 +42,8 @@ new camera frames refresh the buffered input window but do not queue stale model
 jobs. Realtime streaming-cache mode is always kept to one in-flight task so KV
 state advances in order; values above `1` apply to tiled or
 `--streaming-cache=false` experiments. Use `--streaming-cache=false` for
-full-window comparison. A max-gaze value of `0` uses the model default, which is
-`198` for the NVIDIA config. The realtime
-default uses this upstream budget so the mask does not collapse to only coarse
-multi-scale cells. The maximum frame budget is
+full-window comparison. A max-gaze value of `0` uses the upstream model default,
+which is `198` for the NVIDIA config. The maximum frame budget is
 `max-gaze-tokens-each-frame * tile-count`, before task-loss stopping and
 confidence filtering. The native CLI defaults to a 640px-wide
 aspect-preserving source frame in `realtime` mode and 1280px-wide source frames

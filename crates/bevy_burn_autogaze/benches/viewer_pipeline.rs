@@ -28,6 +28,7 @@ enum FixationCase {
     Multiscale,
     TinySparse,
     CoarseDense,
+    DenseGrid64,
 }
 
 impl FixationCase {
@@ -36,6 +37,7 @@ impl FixationCase {
             Self::Multiscale => "multiscale",
             Self::TinySparse => "tiny-sparse",
             Self::CoarseDense => "coarse-dense",
+            Self::DenseGrid64 => "dense-grid-64",
         }
     }
 
@@ -53,6 +55,7 @@ impl FixationCase {
             Self::CoarseDense => vec![FixationPoint::with_grid_extent(
                 0.25, 0.25, 0.5, 0.5, 1.0, 2,
             )],
+            Self::DenseGrid64 => dense_grid_fixations(64),
         }
     }
 }
@@ -99,6 +102,7 @@ const FIXATION_CASES: &[FixationCase] = &[
     FixationCase::Multiscale,
     FixationCase::TinySparse,
     FixationCase::CoarseDense,
+    FixationCase::DenseGrid64,
 ];
 const BLEND_ALPHA: f32 = 0.72;
 const KEYFRAME_DURATION: usize = 30;
@@ -364,6 +368,24 @@ fn multiscale_fixations() -> Vec<FixationPoint> {
         FixationPoint::with_extent(3.5 / 7.0, 5.5 / 7.0, 1.0 / 7.0, 1.0 / 7.0, 0.84),
         FixationPoint::with_extent(11.5 / 14.0, 8.5 / 14.0, 1.0 / 14.0, 1.0 / 14.0, 0.77),
     ]
+}
+
+fn dense_grid_fixations(grid: usize) -> Vec<FixationPoint> {
+    let extent = 1.0 / grid as f32;
+    (0..grid)
+        .flat_map(|row| {
+            (0..grid).map(move |col| {
+                FixationPoint::with_grid_extent(
+                    (col as f32 + 0.5) * extent,
+                    (row as f32 + 0.5) * extent,
+                    extent,
+                    extent,
+                    1.0,
+                    grid,
+                )
+            })
+        })
+        .collect()
 }
 
 criterion_group!(benches, bench_viewer_pipeline);

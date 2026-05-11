@@ -237,7 +237,7 @@ struct NativeArgs {
         long,
         value_name = "COUNT",
         value_parser = parse_usize,
-        help = "Model-side generated-token cap. Defaults to model budget in realtime and 24 per tile in tiled mode; pass 0 to use the model's configured inference budget."
+        help = "Model-side generated-token cap. Defaults to 8 in realtime and 24 per tile in tiled mode; pass 0 to use the model's configured inference budget."
     )]
     max_gaze_tokens_each_frame: Option<usize>,
 
@@ -320,7 +320,7 @@ struct NativeArgs {
     #[arg(
         long,
         value_enum,
-        default_value_t = NativeVisualizationMode::FullBlend,
+        default_value_t = NativeVisualizationMode::Interframe,
         help = "Output visualization. Aliases: blend, alpha-blend, delta, video."
     )]
     visualization_mode: NativeVisualizationMode,

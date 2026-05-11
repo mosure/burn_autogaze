@@ -352,6 +352,7 @@ this is the low-level wasm-bindgen api demo.
 ## bevy
 
 ```sh
+cargo run -p bevy_burn_autogaze -- --mode realtime
 cargo run -p bevy_burn_autogaze -- --mode realtime --visualization-mode full-blend
 cargo run -p bevy_burn_autogaze -- --mode tiled --visualization-mode interframe
 
@@ -370,16 +371,16 @@ Set `--show-fps=false` or `--show-gaze-ratio=false` to hide the default text
 overlays, or `--show-psnr=true` to enable output PSNR. Set
 `--log-pipeline-timing` to print source capture, resize/prep, pack, input
 upload/preprocess, model, visualization, display, and total timing. The native CLI
-defaults to `--top-k 10`, `--max-gaze-tokens-each-frame 0`,
+defaults to `--top-k 10`, `--max-gaze-tokens-each-frame 8`,
 `--frames-per-clip 2`, and a 640px-wide
 aspect-preserving source resize for realtime use. `--mode tiled`
 defaults to a 1280px-wide source frame, `--top-k 2`,
 `--max-gaze-tokens-each-frame 24`, `--frames-per-clip 2`, and
 `--tile-batch-size 64`. In realtime mode `--streaming-cache=true`
 keeps decoder KV state across frames and advances one new frame per inference.
-Pass `--streaming-cache=false` for direct full-window comparison. The realtime
-default uses the upstream model budget so the mask does not collapse to only
-coarse multi-scale cells. Pass explicit `--max-gaze-tokens-each-frame`,
+Pass `--streaming-cache=false` for direct full-window comparison. Pass
+`--max-gaze-tokens-each-frame 0` for upstream-budget inspection, or pass
+explicit `--max-gaze-tokens-each-frame`,
 `--top-k`, `--tile-batch-size`, `--inference-width`, and
 `--inference-height` values for fixed full-resolution inspection. Native
 `realtime` requests a 640x360 camera stream when height is omitted so camera
