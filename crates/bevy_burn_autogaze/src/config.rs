@@ -204,7 +204,7 @@ impl Default for BevyBurnAutoGazeConfig {
             inference_width,
             inference_height,
             mask_cell_scale: 1.0,
-            mask_visualization_mode: AutoGazeMaskVisualizationMode::Overlay,
+            mask_visualization_mode: AutoGazeMaskVisualizationMode::ImageMaskOnly,
             blend_alpha: DEFAULT_BLEND_ALPHA,
             visualization_mode: AutoGazeVisualizationMode::Interframe,
             keyframe_duration: DEFAULT_BIRDS_KEYFRAME_DURATION,
@@ -557,7 +557,7 @@ impl BevyBurnAutoGazeConfig {
             frames_per_clip: DEFAULT_BIRDS_FRAMES_PER_CLIP,
             inference_width: Some(DEFAULT_BIRDS_INFERENCE_WIDTH),
             inference_height: Some(DEFAULT_BIRDS_INFERENCE_HEIGHT),
-            mask_visualization_mode: AutoGazeMaskVisualizationMode::Overlay,
+            mask_visualization_mode: AutoGazeMaskVisualizationMode::ImageMaskOnly,
             blend_alpha: DEFAULT_BIRDS_BLEND_ALPHA,
             keyframe_duration: DEFAULT_BIRDS_KEYFRAME_DURATION,
             display_transfer: BevyDisplayTransfer::Auto,
@@ -807,6 +807,25 @@ mod tests {
     }
 
     #[test]
+    fn mask_visualization_query_accepts_image_overlay() {
+        let mut config = BevyBurnAutoGazeConfig::default();
+        let errors = config.apply_query_string("?mask-visualization=image-overlay");
+
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            config.mask_visualization_mode,
+            AutoGazeMaskVisualizationMode::ImageOverlay
+        );
+
+        let errors = config.apply_query_string("?mask-visualization=image-mask-only");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            config.mask_visualization_mode,
+            AutoGazeMaskVisualizationMode::ImageMaskOnly
+        );
+    }
+
+    #[test]
     fn bevy_mode_parser_accepts_documented_aliases() {
         assert_eq!(
             "realtime".parse::<BevyAutoGazeMode>().unwrap(),
@@ -850,7 +869,7 @@ mod tests {
         assert_eq!(config.blend_alpha, DEFAULT_BIRDS_BLEND_ALPHA);
         assert_eq!(
             config.mask_visualization_mode,
-            AutoGazeMaskVisualizationMode::Overlay
+            AutoGazeMaskVisualizationMode::ImageMaskOnly
         );
         assert_eq!(config.keyframe_duration, DEFAULT_BIRDS_KEYFRAME_DURATION);
         assert_eq!(config.display_transfer, BevyDisplayTransfer::Auto);

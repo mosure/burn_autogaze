@@ -31,10 +31,12 @@ few seconds. In `tiled` mode, source frames are resized into a complete AnyRes
 224px chunk grid and `--max-gaze-tokens-each-frame` controls the per-tile
 generation cap. The output recovery stitches each tile-local scale grid into a
 full-frame grid for that scale, matching upstream's mask recovery semantics.
-The default mask panel uses `--mask-visualization overlay` to show the combined
-sparse-update footprint. Use `--mask-visualization scale-rows` for a diagnostic
-view that draws only the active scale rows, each letterboxed to the source
-frame aspect.
+The default mask panel uses `--mask-visualization image-mask-only` to show only
+masked source pixels. Use `--mask-visualization image-overlay` to alpha-blend
+the colored mask over the full source frame, `--mask-visualization overlay` to
+show only the combined sparse-update footprint, or `--mask-visualization
+scale-rows` for a diagnostic view that draws only the active scale rows, each
+letterboxed to the source frame aspect.
 Use `--perf-summary-frames N` with `--image-path` or another deterministic
 source to process `N` inference outputs, print a JSON FPS/timing summary, and
 exit. Add `--perf-summary-path target/autogaze-bevy-perf/run.json` to write the
@@ -93,9 +95,10 @@ timeout for slow first-build or driver-tuning hosts.
 
 `--visualization-mode full-blend` renders the current frame's alpha-blended
 mask. The default `--blend-alpha 0.38` keeps live overlays readable; the docs
-birds profile uses `0.55`. The center mask panel colors the decoded multi-scale
-AutoGaze cells by scale; `scale-rows` keeps per-scale diagnostics separate
-without reserving empty scale rows.
+birds profile uses `0.55`. The center mask panel can color only the decoded
+multi-scale AutoGaze cells, alpha-blend those colors over the input image with
+`image-overlay`, show only masked input pixels with `image-mask-only`, or keep
+per-scale diagnostics separate with `scale-rows`.
 `--visualization-mode
 interframe --keyframe-duration 0` preserves the previous output outside masked
 cells and updates masked cells to the current input without periodic full-frame

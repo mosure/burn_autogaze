@@ -354,7 +354,8 @@ fn bevy_visualization_delegates_to_core_visualization_helpers() {
     );
     assert!(byte_body.contains(".cpu"));
     assert!(byte_body.contains("visualize_rgba_with_options("));
-    assert!(byte_body.contains("visualize_rgba_panels_with_options("));
+    assert!(byte_body.contains("visualize_rgba_panels_with_options_into("));
+    assert!(byte_body.contains("AutoGazeRgbaVisualizationBuffers"));
     assert!(byte_body.contains("output_psnr_db(rgba)"));
     assert!(
         !byte_body.contains("rgba_psnr_db")
@@ -699,6 +700,7 @@ fn repo_tooling_entrypoints_live_in_xtask() {
         manifest.join("docs").join("api.md"),
         manifest.join("docs").join("benchmarking.md"),
         manifest.join("docs").join("completion-audit.md"),
+        manifest.join("docs").join("performance-goal-loop.md"),
         manifest.join("docs").join("sparse-readout-integration.md"),
         manifest.join("docs").join("validation.md"),
         manifest
@@ -768,6 +770,7 @@ fn bevy_platform_selection_is_target_cfg_not_feature_flags() {
         manifest.join("README.md"),
         manifest.join("docs").join("api.md"),
         manifest.join("docs").join("benchmarking.md"),
+        manifest.join("docs").join("performance-goal-loop.md"),
         manifest.join("docs").join("validation.md"),
         manifest
             .join("crates")

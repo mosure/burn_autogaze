@@ -104,6 +104,23 @@ impl From<NativeVisualizationMode> for AutoGazeVisualizationMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum NativeMaskVisualizationMode {
     #[value(
+        name = "image-overlay",
+        alias = "image",
+        alias = "input-overlay",
+        alias = "source-overlay",
+        alias = "alpha-overlay",
+        help = "Render the input image with the colored multi-scale mask alpha-blended on top."
+    )]
+    ImageOverlay,
+    #[value(
+        name = "image-mask-only",
+        alias = "mask-only",
+        alias = "image-mask",
+        alias = "masked-image",
+        help = "Render only masked pixels as input image plus alpha-blended colored mask; unmasked pixels are transparent."
+    )]
+    ImageMaskOnly,
+    #[value(
         name = "scale-rows",
         alias = "rows",
         alias = "per-scale",
@@ -124,6 +141,8 @@ enum NativeMaskVisualizationMode {
 impl fmt::Display for NativeMaskVisualizationMode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::ImageOverlay => "image-overlay",
+            Self::ImageMaskOnly => "image-mask-only",
             Self::ScaleRows => "scale-rows",
             Self::Overlay => "overlay",
         })
@@ -134,6 +153,8 @@ impl fmt::Display for NativeMaskVisualizationMode {
 impl From<NativeMaskVisualizationMode> for AutoGazeMaskVisualizationMode {
     fn from(mode: NativeMaskVisualizationMode) -> Self {
         match mode {
+            NativeMaskVisualizationMode::ImageOverlay => Self::ImageOverlay,
+            NativeMaskVisualizationMode::ImageMaskOnly => Self::ImageMaskOnly,
             NativeMaskVisualizationMode::ScaleRows => Self::ScaleRows,
             NativeMaskVisualizationMode::Overlay => Self::Overlay,
         }
@@ -383,8 +404,8 @@ struct NativeArgs {
         alias = "mask-visualization-mode",
         alias = "mask-mode",
         value_enum,
-        default_value_t = NativeMaskVisualizationMode::Overlay,
-        help = "Mask panel display. overlay draws one full-frame mask matching output updates; scale-rows draws aspect-preserved diagnostic rows."
+        default_value_t = NativeMaskVisualizationMode::ImageMaskOnly,
+        help = "Mask panel display. overlay draws colored mask cells; image-overlay alpha-blends colored mask cells over the input image; image-mask-only alpha-blends only masked input pixels and leaves unmasked pixels transparent; scale-rows draws aspect-preserved diagnostic rows."
     )]
     mask_visualization_mode: NativeMaskVisualizationMode,
 
@@ -809,7 +830,7 @@ mod tests {
             inference_width: None,
             inference_height: None,
             mask_cell_scale: 1.0,
-            mask_visualization_mode: NativeMaskVisualizationMode::Overlay,
+            mask_visualization_mode: NativeMaskVisualizationMode::ImageMaskOnly,
             blend_alpha: DEFAULT_BLEND_ALPHA,
             visualization_mode: NativeVisualizationMode::Interframe,
             keyframe_duration: DEFAULT_BIRDS_KEYFRAME_DURATION,

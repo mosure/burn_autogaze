@@ -38,6 +38,8 @@ Additional docs:
 
 - [`api.md`](./api.md): core pipeline, visualization, and readout API notes.
 - [`benchmarking.md`](./benchmarking.md): benchmark lanes and filters.
+- [`performance-goal-loop.md`](./performance-goal-loop.md): iterative
+  performance, quality, metrics, and hot-path cleanup loop.
 - [`validation.md`](./validation.md): release, wasm, browser, and fixture gates.
 - [`completion-audit.md`](./completion-audit.md): detailed historical coverage
   checklist and hardware/browser notes.

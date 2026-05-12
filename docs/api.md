@@ -68,7 +68,10 @@ AutoGaze emits multi-scale token positions. The Rust decoder maps NVIDIA tokens
 back to `2x2`, `4x4`, `7x7`, and `14x14` cells and preserves those cells with
 nearest sampling. `scale-rows` mirrors the upstream NVIDIA diagnostic view by
 drawing one stable row per scale. `overlay` draws the unioned sparse-update
-footprint in source space.
+footprint in source space. `image-overlay` draws that same colored multi-scale
+mask alpha-blended over the source image for a more readable mask panel.
+`image-mask-only` uses the same alpha-blended source/mask pixels but leaves
+unmasked pixels transparent.
 
 | mode | output behavior | update ratio |
 |---|---|---|

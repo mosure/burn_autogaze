@@ -4,7 +4,10 @@ use bevy::{
     prelude::*,
     render::render_resource::{Extent3d, TextureDimension, TextureFormat},
 };
-use burn_autogaze::{AutoGazeVisualizationMode, AutoGazeVisualizationState, FixationPoint};
+use burn_autogaze::{
+    AutoGazeRgbaVisualizationBuffers, AutoGazeRgbaVisualizationOptions, AutoGazeVisualizationMode,
+    AutoGazeVisualizationState, FixationPoint,
+};
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 
@@ -161,6 +164,7 @@ fn bench_viewer_case(
                             input: images.add(empty_panel_image(case)),
                             mask: images.add(empty_panel_image(case)),
                             output: images.add(empty_panel_image(case)),
+                            buffers: AutoGazeRgbaVisualizationBuffers::default(),
                         }
                     } else {
                         BenchImages::SideBySide {
@@ -194,17 +198,22 @@ fn bench_viewer_case(
                         input,
                         mask,
                         output,
+                        mut buffers,
                     } => {
                         let panels = state
-                            .visualize_rgba_panels(
+                            .visualize_rgba_panels_with_options_into(
                                 &current,
-                                case.width,
-                                case.height,
                                 &points,
-                                1.0,
-                                BLEND_ALPHA,
+                                AutoGazeRgbaVisualizationOptions::new(
+                                    case.width,
+                                    case.height,
+                                    1.0,
+                                    BLEND_ALPHA,
+                                ),
+                                &mut buffers,
                             )
                             .expect("visualize autogaze panels");
+                        let update_ratio = panels.update_ratio();
                         write_panel_images(
                             PanelHandles {
                                 input: &input,
@@ -214,9 +223,10 @@ fn bench_viewer_case(
                             &mut images,
                             case,
                             current.clone(),
-                            panels.mask_rgba,
-                            panels.blend_rgba,
+                            std::mem::take(&mut buffers.mask_rgba),
+                            std::mem::take(&mut buffers.blend_rgba),
                         );
+                        black_box(update_ratio);
                         black_box(images.get(&output).and_then(|image| image.data.as_ref()));
                     }
                 },
@@ -234,6 +244,7 @@ enum BenchImages {
         input: Handle<Image>,
         mask: Handle<Image>,
         output: Handle<Image>,
+        buffers: AutoGazeRgbaVisualizationBuffers,
     },
 }
 

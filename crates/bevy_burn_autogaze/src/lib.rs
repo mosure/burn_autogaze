@@ -33,12 +33,12 @@ use burn_autogaze::{
     AutoGazeMaskPlanStats, AutoGazeMaskVisualizationMode, AutoGazePipeline,
     AutoGazePipelineOptions, AutoGazePreparedRun as CoreAutoGazePreparedRun, AutoGazePsnrStats,
     AutoGazeReadoutRunOutput, AutoGazeRgbaClipShape, AutoGazeRgbaFrameClip, AutoGazeRgbaFrameQueue,
-    AutoGazeRgbaVisualizationOptions, AutoGazeStreamingCache, AutoGazeTensorInterframePath,
-    AutoGazeTensorVisualizationOptions, AutoGazeTensorVisualizationState,
-    AutoGazeVisualizationMode, AutoGazeVisualizationState, FixationPoint, format_fps,
-    format_gaze_ratio_percent, format_psnr_db, fps_from_millis, prepare_rgba_clip_for_trace,
-    resize_rgba_frame_to_dimensions, rgba_clip_to_tensor, should_use_streaming_cache,
-    video_frame_tensor,
+    AutoGazeRgbaVisualizationBuffers, AutoGazeRgbaVisualizationOptions, AutoGazeStreamingCache,
+    AutoGazeTensorInterframePath, AutoGazeTensorVisualizationOptions,
+    AutoGazeTensorVisualizationState, AutoGazeVisualizationMode, AutoGazeVisualizationState,
+    FixationPoint, format_fps, format_gaze_ratio_percent, format_psnr_db, fps_from_millis,
+    prepare_rgba_clip_for_trace, resize_rgba_frame_to_dimensions, rgba_clip_to_tensor,
+    should_use_streaming_cache, video_frame_tensor,
 };
 pub use burn_autogaze::{
     DEFAULT_BLEND_ALPHA, DEFAULT_KEYFRAME_DURATION, DEFAULT_MAX_IN_FLIGHT,
@@ -1964,7 +1964,7 @@ impl VisualizationOptions {
         Self {
             cell_scale,
             blend_alpha,
-            mask_visualization_mode: AutoGazeMaskVisualizationMode::Overlay,
+            mask_visualization_mode: AutoGazeMaskVisualizationMode::ImageMaskOnly,
             calculate_psnr,
             display_transfer,
             sparse_update_max_rects: DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RECTS,
@@ -2328,9 +2328,10 @@ fn visualize_rgba_bytes(
             })
         }
         CpuVisualizationLayout::Panels => {
+            let mut buffers = AutoGazeRgbaVisualizationBuffers::default();
             let panels = visualization_state
                 .cpu
-                .visualize_rgba_panels_with_options(rgba, points, rgba_options)
+                .visualize_rgba_panels_with_options_into(rgba, points, rgba_options, &mut buffers)
                 .map_err(|err| format!("{err:#}"))?;
             let psnr_db = options
                 .calculate_psnr
@@ -2352,8 +2353,8 @@ fn visualize_rgba_bytes(
             let visualize_cpu_ms = elapsed_ms(visualize_cpu_start);
             let gaze_update_ratio = panels.update_ratio();
             let mask_plan_stats = panels.mask_plan_stats;
-            let mask_rgba = panels.mask_rgba;
-            let output_rgba = panels.blend_rgba;
+            let mask_rgba = std::mem::take(&mut buffers.mask_rgba);
+            let output_rgba = std::mem::take(&mut buffers.blend_rgba);
             let input_rgba = rgba.to_vec();
             let output_rgba_bytes = input_rgba.len() + mask_rgba.len() + output_rgba.len();
             Ok(Visualization {
@@ -2804,7 +2805,7 @@ mod tests {
         assert_eq!(config.inference_height, None);
         assert_eq!(
             config.mask_visualization_mode,
-            AutoGazeMaskVisualizationMode::Overlay
+            AutoGazeMaskVisualizationMode::ImageMaskOnly
         );
         assert_eq!(config.blend_alpha, DEFAULT_BLEND_ALPHA);
         assert_eq!(config.keyframe_duration, DEFAULT_BIRDS_KEYFRAME_DURATION);
@@ -3881,7 +3882,7 @@ mod tests {
         );
         assert_eq!(summary["mode"], "tiled");
         assert_eq!(summary["visualization_mode"], "interframe");
-        assert_eq!(summary["mask_visualization_mode"], "overlay");
+        assert_eq!(summary["mask_visualization_mode"], "image-mask-only");
         assert_eq!(summary["display_transfer"], "gpu");
         assert_eq!(summary["streaming_cache"], true);
         assert_eq!(summary["streaming_cache_effective"], false);
@@ -3957,7 +3958,7 @@ mod tests {
         );
         assert_eq!(sample["mode"], "tiled");
         assert_eq!(sample["visualization_mode"], "interframe");
-        assert_eq!(sample["mask_visualization_mode"], "overlay");
+        assert_eq!(sample["mask_visualization_mode"], "image-mask-only");
         assert_eq!(sample["display_transfer"], "gpu");
         assert_eq!(sample["streaming_cache"], true);
         assert_eq!(sample["streaming_cache_effective"], false);

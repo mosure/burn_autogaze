@@ -128,6 +128,8 @@ wasm-bindgen API.
   command.
 - [docs/benchmarking.md](./docs/benchmarking.md): benchmark lanes and useful
   filters.
+- [docs/performance-goal-loop.md](./docs/performance-goal-loop.md):
+  iterative performance, quality, metrics, and hot-path cleanup loop.
 - [docs/validation.md](./docs/validation.md): release, wasm, browser, and
   upstream fixture gates.
 - [docs/sparse-readout-integration.md](./docs/sparse-readout-integration.md):
