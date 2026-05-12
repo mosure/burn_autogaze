@@ -30,6 +30,8 @@ bevy/webgpu demos.
   truncating the frame to a sparse global top-k list
 - the NVIDIA fixed inference defaults are applied by default:
   `gazing_ratio=0.75` and `task_loss_requirement=0.7`
+- task-loss stopping can also be configured as an L1 reconstruction-error dB
+  target via app/API helpers, e.g. `28 dB` maps to a threshold of about `0.04`
 - mask visualizations preserve the model's multi-scale `2x2`/`4x4`/`7x7`/`14x14`
   token cells with nearest sampling
 - optional `interframe` visualization keeps stale output outside the mask and
@@ -297,13 +299,24 @@ AutoGaze emits multi-scale token positions. For the NVIDIA config, the Rust
 trace decoder maps those tokens back to `2x2`, `4x4`, `7x7`, and `14x14`
 cells. In tiled full-resolution mode those are recovered as per-scale
 full-frame grids before rendering with nearest sampling so the cell structure
-stays crisp and scale-aligned.
+stays crisp without smoothing.
+The upstream NVIDIA visualizer renders each scale in its own row rather than
+forcing all scales into a single combined overlay. This matters because the
+default `7x7` scale is not a quadtree subdivision of `2x2` or `4x4`. Use
+`scale-rows` for the most upstream-faithful diagnostic mask view; it reserves a
+stable row for each standard scale even when a frame has no active cells at
+that scale. Use `overlay` when you specifically want the unioned sparse-update
+footprint.
 
 The gaze ratio metric reports how much of the output frame changed compared to
 a full-frame redraw. The Bevy overlay shows the current frame ratio plus an EMA
 across processed frames. When `show-psnr` is enabled, Bevy also computes PSNR in
 dB between the current input frame and the rendered output frame; this RGB pixel
 comparison is skipped when the PSNR overlay is disabled.
+AutoGaze's task-loss head predicts the upstream reconstruction loss, which is
+L1 for the NVIDIA VideoMAE reconstruction task, not the output-column PSNR
+metric. The `task-loss-requirement-db` interface is therefore a convenience
+conversion using `threshold = 10^(-dB / 20)`.
 
 The README GIFs are generated from `/home/mosure/Videos/birds.mp4` at
 `1920x1080` inference resolution with the NVIDIA AutoGaze weights and the same
@@ -315,9 +328,9 @@ The maximum fixation budget is 8910 tokens per high-res frame before task-loss
 stopping and confidence filtering; tiles are generated in batches of 4. The RGBA
 convenience path applies the upstream
 AutoGazeImageProcessor affine preprocessing (`image / 127.5 - 1`, then
-ImageNet mean/std normalization). The mask GIF uses scale colors from the
-decoded model grid metadata, drawing larger cells first and smaller cells on
-top. The per-run ratios, PSNR, and detected cell scale histogram are checked in at
+ImageNet mean/std normalization). The mask GIF uses the upstream-style
+per-scale row view with stable rows and colors from the decoded model grid
+metadata. The per-run ratios, PSNR, and detected cell scale histogram are checked in at
 [`docs/autogaze_birds_metrics.json`](./docs/autogaze_birds_metrics.json).
 
 ```sh
@@ -414,7 +427,7 @@ The native app accepts CLI flags; the wasm app accepts the same viewer/inference
 knobs through query parameters:
 
 ```text
-http://localhost:8080/?mode=tiled&visualization-mode=interframe&keyframe-duration=0&frames-per-clip=16&inference-width=1920&inference-height=1080&tile-batch-size=4&show-fps=true&show-gaze-ratio=true&show-psnr=true
+http://localhost:8080/?mode=tiled&visualization-mode=interframe&mask-visualization=scale-rows&keyframe-duration=0&frames-per-clip=16&inference-width=1920&inference-height=1080&tile-batch-size=4&show-fps=true&show-gaze-ratio=true&show-psnr=true
 ```
 
 That query matches the full-resolution docs birds asset profile. The no-arg

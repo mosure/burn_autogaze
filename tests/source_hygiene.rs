@@ -277,8 +277,8 @@ fn bevy_visualization_delegates_to_core_visualization_helpers() {
         "fn visualize_rgba_bytes",
     );
     assert!(byte_body.contains(".cpu"));
-    assert!(byte_body.contains("visualize_rgba("));
-    assert!(byte_body.contains("visualize_rgba_panels("));
+    assert!(byte_body.contains("visualize_rgba_with_options("));
+    assert!(byte_body.contains("visualize_rgba_panels_with_options("));
     assert!(byte_body.contains("output_psnr_db(rgba)"));
     assert!(
         !byte_body.contains("rgba_psnr_db")

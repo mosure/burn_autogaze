@@ -1,9 +1,10 @@
 use crate::{
-    AutoGazeConfig, AutoGazeInferenceMode, AutoGazeLoadOptions, AutoGazePipeline,
-    AutoGazePipelineOptions, AutoGazeRgbaClipShape, AutoGazeVisualizationMode,
-    AutoGazeVisualizationState, DEFAULT_BLEND_ALPHA, DEFAULT_KEYFRAME_DURATION,
-    DEFAULT_REALTIME_TOP_K, DEFAULT_TILED_TILE_BATCH_SIZE, NativeAutoGazeModel, format_psnr_db,
-    last_rgba_frame,
+    AutoGazeConfig, AutoGazeInferenceMode, AutoGazeLoadOptions, AutoGazeMaskVisualizationMode,
+    AutoGazePipeline, AutoGazePipelineOptions, AutoGazeRgbaClipShape,
+    AutoGazeRgbaVisualizationOptions, AutoGazeVisualizationMode, AutoGazeVisualizationState,
+    DEFAULT_BLEND_ALPHA, DEFAULT_KEYFRAME_DURATION, DEFAULT_REALTIME_TOP_K,
+    DEFAULT_TILED_TILE_BATCH_SIZE, NativeAutoGazeModel, format_psnr_db, last_rgba_frame,
+    task_loss_requirement_from_l1_db,
 };
 use std::sync::OnceLock;
 use wasm_bindgen::prelude::*;
@@ -20,6 +21,7 @@ pub struct WasmAutoGaze {
     mode: AutoGazeInferenceMode,
     top_k: usize,
     mask_cell_scale: f32,
+    mask_visualization_mode: AutoGazeMaskVisualizationMode,
     blend_alpha: f32,
     visualization_mode: AutoGazeVisualizationMode,
     keyframe_duration: usize,
@@ -58,6 +60,7 @@ impl WasmAutoGaze {
             mode: AutoGazeInferenceMode::ResizeToModelInput,
             top_k: DEFAULT_REALTIME_TOP_K,
             mask_cell_scale: 1.0,
+            mask_visualization_mode: AutoGazeMaskVisualizationMode::ScaleRows,
             blend_alpha: DEFAULT_BLEND_ALPHA,
             visualization_mode: AutoGazeVisualizationMode::FullBlend,
             keyframe_duration: DEFAULT_KEYFRAME_DURATION,
@@ -109,8 +112,19 @@ impl WasmAutoGaze {
             .set_task_loss_requirement(Some(task_loss_requirement));
     }
 
+    pub fn set_task_loss_requirement_db(&mut self, db: f32) {
+        self.pipeline
+            .set_task_loss_requirement(Some(task_loss_requirement_from_l1_db(f64::from(
+                db.max(0.0),
+            ))));
+    }
+
     pub fn disable_task_loss_requirement(&mut self) {
         self.pipeline.set_task_loss_requirement(None);
+    }
+
+    pub fn reset_task_loss_requirement(&mut self) {
+        self.pipeline.reset_task_loss_requirement();
     }
 
     pub fn set_mask_radius_scale(&mut self, scale: f32) {
@@ -119,6 +133,17 @@ impl WasmAutoGaze {
 
     pub fn set_mask_cell_scale(&mut self, scale: f32) {
         self.mask_cell_scale = scale.clamp(0.25, 12.0);
+    }
+
+    pub fn mask_visualization_mode(&self) -> String {
+        self.mask_visualization_mode.as_str().to_string()
+    }
+
+    pub fn set_mask_visualization_mode(&mut self, mode: &str) -> Result<(), JsValue> {
+        self.mask_visualization_mode = mode
+            .parse()
+            .map_err(|err| js_error(format!("failed to parse mask visualization mode: {err}")))?;
+        Ok(())
     }
 
     pub fn set_blend_alpha(&mut self, alpha: f32) {
@@ -216,13 +241,16 @@ impl WasmAutoGaze {
             .configure(self.visualization_mode, self.keyframe_duration);
         let visualization = self
             .visualization_state
-            .visualize_rgba(
+            .visualize_rgba_with_options(
                 last_frame,
-                width,
-                height,
                 &points,
-                self.mask_cell_scale,
-                self.blend_alpha,
+                AutoGazeRgbaVisualizationOptions::new(
+                    width,
+                    height,
+                    self.mask_cell_scale,
+                    self.blend_alpha,
+                )
+                .with_mask_visualization_mode(self.mask_visualization_mode),
             )
             .map_err(|err| js_error(format!("failed to render AutoGaze visualization: {err:#}")))?;
 

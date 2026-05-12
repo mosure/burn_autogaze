@@ -9,10 +9,12 @@ const configUrl = document.getElementById("config-url");
 const weightsUrl = document.getElementById("weights-url");
 const mode = document.getElementById("mode");
 const visualizationMode = document.getElementById("visualization-mode");
+const maskVisualization = document.getElementById("mask-visualization");
 const resolution = document.getElementById("resolution");
 const clipFrames = document.getElementById("clip-frames");
 const topK = document.getElementById("top-k");
 const maxGazeTokens = document.getElementById("max-gaze-tokens");
+const taskLossDb = document.getElementById("task-loss-db");
 const keyframeDuration = document.getElementById("keyframe-duration");
 const loadModel = document.getElementById("load-model");
 const startCamera = document.getElementById("start-camera");
@@ -43,8 +45,10 @@ loadModel.addEventListener("click", () => loadAutogazeModel());
 startCamera.addEventListener("click", () => toggleCamera());
 mode.addEventListener("change", applyModelOptions);
 visualizationMode.addEventListener("change", applyModelOptions);
+maskVisualization.addEventListener("change", applyModelOptions);
 topK.addEventListener("change", applyModelOptions);
 maxGazeTokens.addEventListener("change", applyModelOptions);
+taskLossDb.addEventListener("change", applyModelOptions);
 keyframeDuration.addEventListener("change", applyModelOptions);
 
 function setStatus(message) {
@@ -235,8 +239,16 @@ function applyModelOptions() {
   } else {
     model.reset_max_gaze_tokens_each_frame();
   }
+  if (taskLossDb.value.trim()) {
+    model.set_task_loss_requirement_db(Math.max(0, Number(taskLossDb.value)));
+  } else if (typeof model.reset_task_loss_requirement === "function") {
+    model.reset_task_loss_requirement();
+  }
   model.set_keyframe_duration(clampInteger(keyframeDuration.value, 1, 300));
   model.set_visualization_mode(visualizationMode.value);
+  if (typeof model.set_mask_visualization_mode === "function") {
+    model.set_mask_visualization_mode(maskVisualization.value);
+  }
   if (mode.value === "tile") {
     if (typeof model.set_anyres_tiled_mode === 'function') {
       model.set_anyres_tiled_mode(224);

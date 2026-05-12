@@ -32,15 +32,16 @@ use burn::tensor::Tensor;
 #[cfg(target_arch = "wasm32")]
 use burn_autogaze::{AutoGazeConfig, AutoGazeLoadOptions, NativeAutoGazeModel};
 use burn_autogaze::{
-    AutoGazeGazeRatioStats, AutoGazeInferenceMode, AutoGazeInferenceSequencer, AutoGazePipeline,
-    AutoGazePipelineOptions, AutoGazePreparedRun as CoreAutoGazePreparedRun, AutoGazePsnrStats,
-    AutoGazeReadoutRunOutput, AutoGazeRealtimePolicy, AutoGazeRgbaClipShape, AutoGazeRgbaFrameClip,
-    AutoGazeRgbaFrameQueue, AutoGazeStreamingCache, AutoGazeTensorInterframePath,
+    AutoGazeGazeRatioStats, AutoGazeInferenceMode, AutoGazeInferenceSequencer,
+    AutoGazeMaskVisualizationMode, AutoGazePipeline, AutoGazePipelineOptions,
+    AutoGazePreparedRun as CoreAutoGazePreparedRun, AutoGazePsnrStats, AutoGazeReadoutRunOutput,
+    AutoGazeRealtimePolicy, AutoGazeRgbaClipShape, AutoGazeRgbaFrameClip, AutoGazeRgbaFrameQueue,
+    AutoGazeRgbaVisualizationOptions, AutoGazeStreamingCache, AutoGazeTensorInterframePath,
     AutoGazeTensorVisualizationOptions, AutoGazeTensorVisualizationState,
     AutoGazeVisualizationMode, AutoGazeVisualizationState, FixationPoint, format_fps,
     format_gaze_ratio_percent, format_psnr_db, fps_from_millis, prepare_rgba_clip_for_trace,
     resize_rgba_frame_to_dimensions, rgba_clip_to_tensor, should_use_streaming_cache,
-    video_frame_tensor,
+    task_loss_requirement_from_l1_db, video_frame_tensor,
 };
 pub use burn_autogaze::{
     DEFAULT_BLEND_ALPHA, DEFAULT_KEYFRAME_DURATION, DEFAULT_MAX_IN_FLIGHT,
@@ -222,6 +223,7 @@ pub struct BevyBurnAutoGazeConfig {
     pub inference_width: Option<u32>,
     pub inference_height: Option<u32>,
     pub mask_cell_scale: f32,
+    pub mask_visualization_mode: AutoGazeMaskVisualizationMode,
     pub blend_alpha: f32,
     pub visualization_mode: AutoGazeVisualizationMode,
     pub keyframe_duration: usize,
@@ -260,6 +262,7 @@ impl Default for BevyBurnAutoGazeConfig {
             inference_width,
             inference_height,
             mask_cell_scale: 1.0,
+            mask_visualization_mode: AutoGazeMaskVisualizationMode::ScaleRows,
             blend_alpha: DEFAULT_BLEND_ALPHA,
             visualization_mode: AutoGazeVisualizationMode::Interframe,
             keyframe_duration: DEFAULT_BIRDS_KEYFRAME_DURATION,
@@ -349,6 +352,17 @@ impl BevyBurnAutoGazeConfig {
                 }
                 Ok(())
             }
+            "task-loss-requirement-db"
+            | "task-loss-db"
+            | "task-psnr-db"
+            | "task-psnr"
+            | "task-psnr-requirement" => {
+                self.task_loss_requirement = Some(task_loss_requirement_from_l1_db(f64::from(
+                    parse_nonnegative_f32_option(&key, value)?,
+                )));
+                self.disable_task_loss_requirement = false;
+                Ok(())
+            }
             "disable-task-loss-requirement" | "disable-task-loss" => {
                 self.disable_task_loss_requirement = parse_bool_option(&key, value)?;
                 if self.disable_task_loss_requirement {
@@ -374,6 +388,10 @@ impl BevyBurnAutoGazeConfig {
             }
             "mask-cell-scale" | "mask-radius-scale" => {
                 self.mask_cell_scale = parse_f32_option(&key, value)?;
+                Ok(())
+            }
+            "mask-visualization" | "mask-visualization-mode" | "mask-mode" | "mask-display" => {
+                self.mask_visualization_mode = value.parse()?;
                 Ok(())
             }
             "blend-alpha" => {
@@ -576,6 +594,7 @@ impl BevyBurnAutoGazeConfig {
             frames_per_clip: DEFAULT_BIRDS_FRAMES_PER_CLIP,
             inference_width: Some(DEFAULT_BIRDS_INFERENCE_WIDTH),
             inference_height: Some(DEFAULT_BIRDS_INFERENCE_HEIGHT),
+            mask_visualization_mode: AutoGazeMaskVisualizationMode::ScaleRows,
             blend_alpha: DEFAULT_BIRDS_BLEND_ALPHA,
             keyframe_duration: DEFAULT_BIRDS_KEYFRAME_DURATION,
             display_transfer: BevyDisplayTransfer::Gpu,
@@ -688,6 +707,15 @@ fn parse_f32_option(key: &str, value: &str) -> Result<f32, String> {
     value
         .parse()
         .map_err(|_| format!("invalid f32 for `{key}`: `{value}`"))
+}
+
+fn parse_nonnegative_f32_option(key: &str, value: &str) -> Result<f32, String> {
+    let parsed = parse_f32_option(key, value)?;
+    if parsed.is_finite() && parsed >= 0.0 {
+        Ok(parsed)
+    } else {
+        Err(format!("invalid non-negative f32 for `{key}`: `{value}`"))
+    }
 }
 
 fn parse_f64_option(key: &str, value: &str) -> Result<f64, String> {
@@ -1061,6 +1089,7 @@ struct InferenceTimingStats {
 struct InferenceRunConfigSummary {
     mode: &'static str,
     visualization_mode: &'static str,
+    mask_visualization_mode: &'static str,
     display_transfer: &'static str,
     streaming_cache: bool,
     streaming_cache_effective: bool,
@@ -1083,6 +1112,7 @@ impl From<&BevyBurnAutoGazeConfig> for InferenceRunConfigSummary {
         Self {
             mode: config.mode.as_str(),
             visualization_mode: config.visualization_mode.as_str(),
+            mask_visualization_mode: config.mask_visualization_mode.as_str(),
             display_transfer: config.display_transfer.as_str(),
             streaming_cache: config.streaming_cache,
             streaming_cache_effective: should_use_streaming_cache(
@@ -1367,6 +1397,10 @@ fn insert_run_config_json_fields(
     fields.insert(
         "visualization_mode".to_string(),
         config.visualization_mode.into(),
+    );
+    fields.insert(
+        "mask_visualization_mode".to_string(),
+        config.mask_visualization_mode.into(),
     );
     fields.insert(
         "display_transfer".to_string(),
@@ -1923,6 +1957,7 @@ fn process_frames(
         frame_input.config.tensor_sparse_update_max_rects,
         frame_input.config.tensor_sparse_update_max_ratio,
     )
+    .with_mask_visualization_mode(frame_input.config.mask_visualization_mode)
     .with_cpu_panels();
     let run_config = InferenceRunConfigSummary::from(frame_input.config.as_ref());
     frame_input.visualization_state.configure(
@@ -2435,6 +2470,7 @@ enum CpuVisualizationLayout {
 struct VisualizationOptions {
     cell_scale: f32,
     blend_alpha: f32,
+    mask_visualization_mode: AutoGazeMaskVisualizationMode,
     calculate_psnr: bool,
     display_transfer: BevyDisplayTransfer,
     sparse_update_max_rects: usize,
@@ -2452,6 +2488,7 @@ impl VisualizationOptions {
         Self {
             cell_scale,
             blend_alpha,
+            mask_visualization_mode: AutoGazeMaskVisualizationMode::Overlay,
             calculate_psnr,
             display_transfer,
             sparse_update_max_rects: DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RECTS,
@@ -2463,6 +2500,11 @@ impl VisualizationOptions {
     fn with_sparse_update_policy(mut self, max_rects: usize, max_update_ratio: f64) -> Self {
         self.sparse_update_max_rects = max_rects;
         self.sparse_update_max_ratio = max_update_ratio;
+        self
+    }
+
+    fn with_mask_visualization_mode(mut self, mode: AutoGazeMaskVisualizationMode) -> Self {
+        self.mask_visualization_mode = mode;
         self
     }
 
@@ -2636,6 +2678,7 @@ fn visualize_rgba_tensor(
                 options.cell_scale,
                 options.blend_alpha,
             )
+            .with_mask_visualization_mode(options.mask_visualization_mode)
             .with_sparse_update_policy(
                 options.sparse_update_max_rects,
                 options.sparse_update_max_ratio,
@@ -2653,16 +2696,16 @@ fn visualize_rgba_tensor(
     );
     let cpu_psnr_start = timestamp_now();
     let psnr_db = if options.calculate_psnr {
+        let rgba_options = AutoGazeRgbaVisualizationOptions::new(
+            width,
+            height,
+            options.cell_scale,
+            options.blend_alpha,
+        )
+        .with_mask_visualization_mode(options.mask_visualization_mode);
         let cpu_panels = visualization_state
             .cpu
-            .visualize_rgba_panels(
-                input.rgba,
-                width,
-                height,
-                points,
-                options.cell_scale,
-                options.blend_alpha,
-            )
+            .visualize_rgba_panels_with_options(input.rgba, points, rgba_options)
             .map_err(|err| format!("failed to mirror AutoGaze CPU PSNR output: {err:#}"))?;
         debug_assert_eq!(
             visualization_state.cpu.last_frame_was_keyframe(),
@@ -2748,18 +2791,18 @@ fn visualize_rgba_bytes(
     let width = width.max(1);
     let height = height.max(1);
     let visualize_cpu_start = timestamp_now();
+    let rgba_options = AutoGazeRgbaVisualizationOptions::new(
+        width,
+        height,
+        options.cell_scale,
+        options.blend_alpha,
+    )
+    .with_mask_visualization_mode(options.mask_visualization_mode);
     match options.cpu_layout {
         CpuVisualizationLayout::SideBySide => {
             let visualization = visualization_state
                 .cpu
-                .visualize_rgba(
-                    rgba,
-                    width,
-                    height,
-                    points,
-                    options.cell_scale,
-                    options.blend_alpha,
-                )
+                .visualize_rgba_with_options(rgba, points, rgba_options)
                 .map_err(|err| format!("{err:#}"))?;
             let psnr_db = options
                 .calculate_psnr
@@ -2804,14 +2847,7 @@ fn visualize_rgba_bytes(
         CpuVisualizationLayout::Panels => {
             let panels = visualization_state
                 .cpu
-                .visualize_rgba_panels(
-                    rgba,
-                    width,
-                    height,
-                    points,
-                    options.cell_scale,
-                    options.blend_alpha,
-                )
+                .visualize_rgba_panels_with_options(rgba, points, rgba_options)
                 .map_err(|err| format!("{err:#}"))?;
             let psnr_db = options
                 .calculate_psnr
@@ -3602,7 +3638,7 @@ mod tests {
     fn applies_url_query_to_viewer_config() {
         let mut config = BevyBurnAutoGazeConfig::default();
         let errors = config.apply_query_string(
-            "?mode=full-res&top_k=2&frames-per-clip=3&max-in-flight=2&inference-width=1920&inference-height=1080&show-fps=false&show-psnr=false&task-loss-requirement=0.65&tile-batch-size=4&config-url=%2Fconfig.json&weights-url=%2Fmodel.safetensors&load-model=false&mask-cell-scale=2.5&blend-alpha=0.5&visualization-mode=interframe&keyframe-duration=7&display-transfer=cpu&tensor-sparse-update-max-rects=8&tensor-sparse-update-max-ratio=0.05&streaming-cache=false&require-hardware-adapter=true&perf-summary-frames=5&perf-summary-path=target%2Fperf.json",
+            "?mode=full-res&top_k=2&frames-per-clip=3&max-in-flight=2&inference-width=1920&inference-height=1080&show-fps=false&show-psnr=false&task-loss-requirement=0.65&tile-batch-size=4&config-url=%2Fconfig.json&weights-url=%2Fmodel.safetensors&load-model=false&mask-cell-scale=2.5&mask-visualization=overlay&blend-alpha=0.5&visualization-mode=interframe&keyframe-duration=7&display-transfer=cpu&tensor-sparse-update-max-rects=8&tensor-sparse-update-max-ratio=0.05&streaming-cache=false&require-hardware-adapter=true&perf-summary-frames=5&perf-summary-path=target%2Fperf.json",
         );
 
         assert!(errors.is_empty(), "{errors:?}");
@@ -3622,6 +3658,10 @@ mod tests {
         assert_eq!(config.weights_url, "/model.safetensors");
         assert!(!config.load_model);
         assert_eq!(config.mask_cell_scale, 2.5);
+        assert_eq!(
+            config.mask_visualization_mode,
+            AutoGazeMaskVisualizationMode::Overlay
+        );
         assert_eq!(config.blend_alpha, 0.5);
         assert_eq!(
             config.visualization_mode,
@@ -3646,6 +3686,11 @@ mod tests {
         let errors = config.apply_query_string("?show-psnr=true");
         assert!(errors.is_empty(), "{errors:?}");
         assert!(config.show_psnr);
+
+        let errors = config.apply_query_string("?task-loss-requirement-db=20");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!((config.task_loss_requirement.expect("threshold") - 0.1).abs() < 1.0e-6);
+        assert!(!config.disable_task_loss_requirement);
 
         let errors = config.apply_query_string("?task-loss-requirement=none");
         assert!(errors.is_empty(), "{errors:?}");
@@ -3696,6 +3741,10 @@ mod tests {
             Some(DEFAULT_REALTIME_INFERENCE_WIDTH)
         );
         assert_eq!(config.inference_height, None);
+        assert_eq!(
+            config.mask_visualization_mode,
+            AutoGazeMaskVisualizationMode::ScaleRows
+        );
         assert_eq!(config.blend_alpha, DEFAULT_BLEND_ALPHA);
         assert_eq!(config.keyframe_duration, DEFAULT_BIRDS_KEYFRAME_DURATION);
         assert_eq!(config.display_transfer, BevyDisplayTransfer::Gpu);
@@ -3732,6 +3781,10 @@ mod tests {
             Some(DEFAULT_BIRDS_INFERENCE_HEIGHT)
         );
         assert_eq!(config.blend_alpha, DEFAULT_BIRDS_BLEND_ALPHA);
+        assert_eq!(
+            config.mask_visualization_mode,
+            AutoGazeMaskVisualizationMode::ScaleRows
+        );
         assert_eq!(config.keyframe_duration, DEFAULT_BIRDS_KEYFRAME_DURATION);
         assert_eq!(config.display_transfer, BevyDisplayTransfer::Gpu);
         assert!(!should_use_streaming_cache(
@@ -4855,6 +4908,7 @@ mod tests {
         );
         assert_eq!(summary["mode"], "tiled");
         assert_eq!(summary["visualization_mode"], "interframe");
+        assert_eq!(summary["mask_visualization_mode"], "scale-rows");
         assert_eq!(summary["display_transfer"], "gpu");
         assert_eq!(summary["streaming_cache"], true);
         assert_eq!(summary["streaming_cache_effective"], false);
@@ -4917,6 +4971,7 @@ mod tests {
         );
         assert_eq!(sample["mode"], "tiled");
         assert_eq!(sample["visualization_mode"], "interframe");
+        assert_eq!(sample["mask_visualization_mode"], "scale-rows");
         assert_eq!(sample["display_transfer"], "gpu");
         assert_eq!(sample["streaming_cache"], true);
         assert_eq!(sample["streaming_cache_effective"], false);

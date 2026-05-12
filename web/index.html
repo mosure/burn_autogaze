@@ -32,6 +32,13 @@
           </select>
         </div>
         <div class="field">
+          <label for="mask-visualization">mask</label>
+          <select id="mask-visualization">
+            <option value="scale-rows">scale rows</option>
+            <option value="overlay">overlay</option>
+          </select>
+        </div>
+        <div class="field">
           <label for="resolution">camera</label>
           <select id="resolution">
             <option value="720">720p</option>
@@ -50,6 +57,10 @@
         <div class="field short">
           <label for="max-gaze-tokens">tokens</label>
           <input id="max-gaze-tokens" type="number" min="0" max="265" step="1" value="0" />
+        </div>
+        <div class="field short">
+          <label for="task-loss-db">task dB</label>
+          <input id="task-loss-db" type="number" min="0" step="0.5" placeholder="model" />
         </div>
         <div class="field short">
           <label for="keyframe-duration">keyframe</label>

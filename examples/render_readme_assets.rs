@@ -1,8 +1,9 @@
 use anyhow::{Context, Result, bail, ensure};
 use burn::tensor::backend::Backend;
 use burn_autogaze::{
-    AutoGazeInferenceMode, AutoGazePipeline, AutoGazeRgbaClipShape, AutoGazeTileLayout,
-    AutoGazeVisualizationMode, AutoGazeVisualizationState, FixationPoint,
+    AutoGazeInferenceMode, AutoGazeMaskVisualizationMode, AutoGazePipeline, AutoGazeRgbaClipShape,
+    AutoGazeRgbaVisualizationOptions, AutoGazeTileLayout, AutoGazeVisualizationMode,
+    AutoGazeVisualizationState, FixationPoint, task_loss_requirement_from_l1_db,
 };
 use serde::Serialize;
 use std::{
@@ -133,6 +134,11 @@ impl Args {
                 }
                 "--task-loss-requirement" | "--task-loss" => {
                     args.task_loss_requirement = Some(parse_optional_f32(&key, &value)?);
+                }
+                "--task-loss-requirement-db" | "--task-loss-db" | "--task-psnr-db" => {
+                    args.task_loss_requirement = Some(Some(task_loss_requirement_from_l1_db(
+                        f64::from(parse_nonnegative_f32(&key, &value)?),
+                    )));
                 }
                 "--tile-size" => args.tile_size = parse_usize(&key, &value)?,
                 "--stride" => args.stride = parse_usize(&key, &value)?,
@@ -299,13 +305,16 @@ where
                 .map(|set| set.points.clone())
                 .unwrap_or_default();
             record_points(&points, &mut stats, &args);
-            let visualization = state.visualize_rgba(
+            let visualization = state.visualize_rgba_with_options(
                 current,
-                args.inference_width,
-                args.inference_height,
                 &points,
-                args.mask_cell_scale,
-                args.blend_alpha,
+                AutoGazeRgbaVisualizationOptions::new(
+                    args.inference_width,
+                    args.inference_height,
+                    args.mask_cell_scale,
+                    args.blend_alpha,
+                )
+                .with_mask_visualization_mode(AutoGazeMaskVisualizationMode::ScaleRows),
             )?;
             let psnr_db = visualization.output_psnr_db(current)?;
             stats.record_ratios(visualization.mask_ratio(), visualization.update_ratio());
@@ -818,6 +827,15 @@ fn parse_f32(key: &str, value: &str) -> Result<f32> {
     value
         .parse()
         .with_context(|| format!("parse {key} value `{value}` as f32"))
+}
+
+fn parse_nonnegative_f32(key: &str, value: &str) -> Result<f32> {
+    let parsed = parse_f32(key, value)?;
+    ensure!(
+        parsed.is_finite() && parsed >= 0.0,
+        "{key} must be a finite non-negative f32"
+    );
+    Ok(parsed)
 }
 
 fn parse_optional_f32(key: &str, value: &str) -> Result<Option<f32>> {

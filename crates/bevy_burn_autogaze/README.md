@@ -17,11 +17,14 @@ generation budget, GPU display transfer, PSNR overlay, interframe output, and no
 periodic visualization keyframes. Common viewer/inference knobs include `--top-k`, `--frames-per-clip`,
 `--max-in-flight`, `--max-gaze-tokens-each-frame`, `--inference-width`,
 `--inference-height`, `--task-loss-requirement`, `--disable-task-loss-requirement`,
-`--mask-cell-scale`, `--blend-alpha`, and `--show-fps`. `--show-gaze-ratio`
+`--task-loss-requirement-db`, `--mask-cell-scale`, `--blend-alpha`, and `--show-fps`. `--show-gaze-ratio`
 toggles the text overlay for per-frame and EMA output update ratio.
 `--show-psnr=false` hides PSNR in dB between the current input and rendered
 output; the pixel comparison is skipped when this overlay is disabled. GPU
 display transfer remains active when PSNR is enabled.
+`--task-loss-requirement-db 28` expresses the upstream L1 reconstruction-loss
+threshold as `10^(-28 / 20)`, which is more PSNR-like but is not the same value
+as the rendered output PSNR overlay.
 `--help` lists the accepted values and aliases for mode-like options.
 `--log-pipeline-timing` prints source capture, resize/prep, pack, input
 upload/preprocess, model, visualization, and Bevy texture-update timing every
@@ -29,6 +32,9 @@ few seconds. In `tiled` mode, source frames are resized into a complete AnyRes
 224px chunk grid and `--max-gaze-tokens-each-frame` controls the per-tile
 generation cap. The output recovery stitches each tile-local scale grid into a
 full-frame grid for that scale, matching upstream's mask recovery semantics.
+The default mask panel uses `--mask-visualization scale-rows`, which mirrors the
+upstream NVIDIA visualizer by drawing stable per-scale rows. Use
+`--mask-visualization overlay` to inspect the combined sparse-update footprint.
 Use `--perf-summary-frames N` with `--image-path` or another deterministic
 source to process `N` inference outputs, print a JSON FPS/timing summary, and
 exit. Add `--perf-summary-path target/autogaze-bevy-perf/run.json` to write the
@@ -40,7 +46,7 @@ cargo run -p bevy_burn_autogaze -- \
   --mode tiled --visualization-mode interframe \
   --max-gaze-tokens-each-frame 0 --frames-per-clip 16 \
   --tile-batch-size 4 --inference-width 1920 --inference-height 1080 \
-  --blend-alpha 0.55 --keyframe-duration 0
+  --blend-alpha 0.55 --mask-visualization scale-rows --keyframe-duration 0
 ```
 
 Realtime mode uses `--streaming-cache=true` by default. The cache advances one
@@ -84,7 +90,8 @@ timeout for slow first-build or driver-tuning hosts.
 `--visualization-mode full-blend` renders the current frame's alpha-blended
 mask. The default `--blend-alpha 0.38` keeps live overlays readable; the docs
 birds profile uses `0.55`. The center mask panel colors the decoded multi-scale
-AutoGaze cells by scale and draws crisp cell bounds. `--visualization-mode
+AutoGaze cells by scale and draws crisp per-scale rows by default.
+`--visualization-mode
 interframe --keyframe-duration 0` preserves the previous output outside masked
 cells and updates masked cells to the current input without periodic full-frame
 refreshes. Positive keyframe durations remain available for debugging. The
@@ -119,7 +126,7 @@ UI is rendered by Bevy into the `#bevy` canvas, matching the native path. Pass
 the same viewer/inference knobs as query parameters:
 
 ```text
-http://localhost:8080/?mode=tiled&visualization-mode=interframe&keyframe-duration=0&frames-per-clip=16&inference-width=1920&inference-height=1080&tile-batch-size=4&show-fps=true&show-gaze-ratio=true&show-psnr=true
+http://localhost:8080/?mode=tiled&visualization-mode=interframe&mask-visualization=scale-rows&keyframe-duration=0&frames-per-clip=16&inference-width=1920&inference-height=1080&tile-batch-size=4&show-fps=true&show-gaze-ratio=true&show-psnr=true
 ```
 
 Use `?source=static` for a generated static frame, or `?image-url=./frame.png`

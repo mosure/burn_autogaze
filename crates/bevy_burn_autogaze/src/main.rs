@@ -8,7 +8,9 @@ use bevy_burn_autogaze::{
 };
 use bevy_burn_autogaze::{BevyBurnAutoGazeConfig, run_app};
 #[cfg(not(target_arch = "wasm32"))]
-use burn_autogaze::AutoGazeVisualizationMode;
+use burn_autogaze::{
+    AutoGazeMaskVisualizationMode, AutoGazeVisualizationMode, task_loss_requirement_from_l1_db,
+};
 
 #[cfg(not(target_arch = "wasm32"))]
 use clap::{ArgAction, Parser, ValueEnum};
@@ -94,6 +96,46 @@ impl From<NativeVisualizationMode> for AutoGazeVisualizationMode {
         match mode {
             NativeVisualizationMode::FullBlend => Self::FullBlend,
             NativeVisualizationMode::Interframe => Self::Interframe,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum NativeMaskVisualizationMode {
+    #[value(
+        name = "scale-rows",
+        alias = "rows",
+        alias = "per-scale",
+        alias = "upstream",
+        help = "Render one diagnostic mask row per AutoGaze scale, matching the NVIDIA visualizer."
+    )]
+    ScaleRows,
+    #[value(
+        name = "overlay",
+        alias = "combined",
+        alias = "union",
+        help = "Render all selected scale cells in one full-frame overlay."
+    )]
+    Overlay,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl fmt::Display for NativeMaskVisualizationMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ScaleRows => "scale-rows",
+            Self::Overlay => "overlay",
+        })
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<NativeMaskVisualizationMode> for AutoGazeMaskVisualizationMode {
+    fn from(mode: NativeMaskVisualizationMode) -> Self {
+        match mode {
+            NativeMaskVisualizationMode::ScaleRows => Self::ScaleRows,
+            NativeMaskVisualizationMode::Overlay => Self::Overlay,
         }
     }
 }
@@ -258,6 +300,18 @@ struct NativeArgs {
     task_loss_requirement: Option<TaskLossRequirementArg>,
 
     #[arg(
+        long = "task-loss-requirement-db",
+        alias = "task-loss-db",
+        alias = "task-psnr-db",
+        alias = "task-psnr",
+        value_name = "DB",
+        value_parser = parse_nonnegative_f32,
+        conflicts_with = "task_loss_requirement",
+        help = "Override model task-loss threshold using L1 reconstruction-error dB: threshold = 10^(-dB / 20)."
+    )]
+    task_loss_requirement_db: Option<f32>,
+
+    #[arg(
         long,
         action = ArgAction::SetTrue,
         help = "Disable model task-loss filtering."
@@ -308,6 +362,16 @@ struct NativeArgs {
         help = "Scale factor for crisp multi-scale mask cell extents."
     )]
     mask_cell_scale: f32,
+
+    #[arg(
+        long = "mask-visualization",
+        alias = "mask-visualization-mode",
+        alias = "mask-mode",
+        value_enum,
+        default_value_t = NativeMaskVisualizationMode::ScaleRows,
+        help = "Mask panel display. scale-rows mirrors NVIDIA's per-scale mask view; overlay draws one combined full-frame mask."
+    )]
+    mask_visualization_mode: NativeMaskVisualizationMode,
 
     #[arg(
         long,
@@ -424,6 +488,7 @@ impl From<NativeArgs> for BevyBurnAutoGazeConfig {
             .unwrap_or_else(|| default_frames_per_clip(mode));
         let (task_loss_requirement, disable_task_loss_requirement) = task_loss_config(
             args.task_loss_requirement,
+            args.task_loss_requirement_db,
             args.disable_task_loss_requirement,
         );
         BevyBurnAutoGazeConfig {
@@ -445,6 +510,7 @@ impl From<NativeArgs> for BevyBurnAutoGazeConfig {
             inference_width,
             inference_height: inference_height.or(defaults.inference_height),
             mask_cell_scale: args.mask_cell_scale,
+            mask_visualization_mode: args.mask_visualization_mode.into(),
             blend_alpha: args.blend_alpha,
             visualization_mode,
             keyframe_duration: args.keyframe_duration,
@@ -475,9 +541,16 @@ fn inference_dimensions_for_args(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn task_loss_config(arg: Option<TaskLossRequirementArg>, disable: bool) -> (Option<f32>, bool) {
+fn task_loss_config(
+    arg: Option<TaskLossRequirementArg>,
+    db: Option<f32>,
+    disable: bool,
+) -> (Option<f32>, bool) {
     if disable {
         return (None, true);
+    }
+    if let Some(db) = db {
+        return (Some(task_loss_requirement_from_l1_db(f64::from(db))), false);
     }
     match arg {
         Some(TaskLossRequirementArg::ModelDefault) | None => (None, false),
@@ -700,12 +773,14 @@ mod tests {
             max_gaze_tokens_each_frame: None,
             tile_batch_size: None,
             task_loss_requirement: None,
+            task_loss_requirement_db: None,
             disable_task_loss_requirement: false,
             frames_per_clip: None,
             max_in_flight: bevy_burn_autogaze::DEFAULT_MAX_IN_FLIGHT,
             inference_width: None,
             inference_height: None,
             mask_cell_scale: 1.0,
+            mask_visualization_mode: NativeMaskVisualizationMode::ScaleRows,
             blend_alpha: DEFAULT_BLEND_ALPHA,
             visualization_mode: NativeVisualizationMode::Interframe,
             keyframe_duration: DEFAULT_BIRDS_KEYFRAME_DURATION,
@@ -764,13 +839,16 @@ mod tests {
     #[test]
     fn native_cli_accepts_task_loss_disable_value() {
         assert_eq!(
-            task_loss_config(Some(TaskLossRequirementArg::Disabled), false),
+            task_loss_config(Some(TaskLossRequirementArg::Disabled), None, false),
             (None, true)
         );
         assert_eq!(
-            task_loss_config(Some(TaskLossRequirementArg::Value(0.7)), false),
+            task_loss_config(Some(TaskLossRequirementArg::Value(0.7)), None, false),
             (Some(0.7), false)
         );
+        let (threshold, disabled) = task_loss_config(None, Some(20.0), false);
+        assert!(!disabled);
+        assert!((threshold.expect("threshold") - 0.1).abs() < 1.0e-6);
     }
 
     #[test]

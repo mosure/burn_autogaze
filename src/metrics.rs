@@ -143,6 +143,27 @@ pub fn format_psnr_db(value: f64) -> String {
     }
 }
 
+pub fn task_loss_requirement_from_l1_db(db: f64) -> f32 {
+    if db.is_infinite() && db.is_sign_positive() {
+        0.0
+    } else if db.is_finite() {
+        10.0_f64.powf(-db.max(0.0) / 20.0) as f32
+    } else {
+        f32::NAN
+    }
+}
+
+pub fn task_loss_requirement_to_l1_db(task_loss_requirement: f32) -> f64 {
+    let value = f64::from(task_loss_requirement);
+    if value <= 0.0 {
+        f64::INFINITY
+    } else if value.is_finite() {
+        -20.0 * value.log10()
+    } else {
+        f64::NAN
+    }
+}
+
 fn format_fixed_one_decimal(value: f64, max: f64, invalid: &str) -> String {
     if value.is_finite() {
         format!("{:05.1}", value.clamp(0.0, max))
@@ -198,6 +219,16 @@ mod tests {
     fn fps_from_millis_handles_zero_and_positive_values() {
         assert_eq!(fps_from_millis(0.0), 0.0);
         assert_eq!(fps_from_millis(20.0), 50.0);
+    }
+
+    #[test]
+    fn task_loss_requirement_db_conversion_uses_l1_amplitude_scale() {
+        let threshold = task_loss_requirement_from_l1_db(20.0);
+        assert!((threshold - 0.1).abs() < 1.0e-6);
+
+        let db = task_loss_requirement_to_l1_db(0.45);
+        assert!((db - 6.935_749).abs() < 1.0e-6);
+        assert!(task_loss_requirement_to_l1_db(0.0).is_infinite());
     }
 
     #[test]

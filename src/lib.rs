@@ -19,7 +19,7 @@ pub use config::{
 pub use metrics::{
     AutoGazeEmaMetric, AutoGazeGazeRatioStats, AutoGazePsnrStats, DEFAULT_METRIC_EMA_ALPHA,
     ema_metric, format_fps, format_gaze_ratio_percent, format_psnr_db, fps_from_millis,
-    sanitize_gaze_ratio,
+    sanitize_gaze_ratio, task_loss_requirement_from_l1_db, task_loss_requirement_to_l1_db,
 };
 pub use model::{
     AutoGazeCausalLmOutput, AutoGazeGazingModel, AutoGazeGenerateOutput, AutoGazeLoadOptions,
@@ -76,16 +76,16 @@ pub use safetensors_io::AutoGazeTraceStore;
 pub use teacher::AutoGazeTeacher;
 pub use trace::{FixationBounds, FixationPoint, FixationSet, FrameFixationTrace};
 pub use visualization::{
-    AutoGazeSparseUpdatePlan, AutoGazeTensorInterframePath, AutoGazeTensorVisualization,
-    AutoGazeTensorVisualizationOptions, AutoGazeTensorVisualizationPanels,
-    AutoGazeTensorVisualizationState, AutoGazeVisualization, AutoGazeVisualizationMode,
-    AutoGazeVisualizationPanels, AutoGazeVisualizationState,
+    AutoGazeMaskVisualizationMode, AutoGazeRgbaVisualizationOptions, AutoGazeSparseUpdatePlan,
+    AutoGazeTensorInterframePath, AutoGazeTensorVisualization, AutoGazeTensorVisualizationOptions,
+    AutoGazeTensorVisualizationPanels, AutoGazeTensorVisualizationState, AutoGazeVisualization,
+    AutoGazeVisualizationMode, AutoGazeVisualizationPanels, AutoGazeVisualizationState,
     DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RATIO, DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RECTS,
     FixationPixelRect, copy_sparse_update_rgba, copy_sparse_update_tensor, fixation_alpha_mask,
     fixation_cell_rects, fixation_effective_alpha_mask, fixation_effective_cell_rects,
-    fixation_effective_scale_mask_rgba, fixation_effective_sparse_update_plan,
-    fixation_rect_union_pixel_count, fixation_scale_mask_rgba, fixation_sparse_update_plan,
-    normalized_rgb_clip_to_unit_rgba_tensor, visualize_fixations_rgba,
+    fixation_effective_scale_mask_rgba, fixation_effective_sparse_update_plan, fixation_mask_rgba,
+    fixation_rect_union_pixel_count, fixation_scale_mask_rgba, fixation_scale_rows_mask_rgba,
+    fixation_sparse_update_plan, normalized_rgb_clip_to_unit_rgba_tensor, visualize_fixations_rgba,
 };
 #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
 pub use wasm::*;

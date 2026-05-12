@@ -4,7 +4,9 @@ use crate::{
 };
 use anyhow::{Result, ensure};
 use burn::tensor::{Int, Tensor, TensorData, backend::Backend};
-use std::{fmt, str::FromStr};
+use std::{collections::BTreeMap, fmt, str::FromStr};
+
+const DEFAULT_AUTOGAZE_SCALE_GRIDS: [usize; 4] = [2, 4, 7, 14];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AutoGazeVisualization {
@@ -106,6 +108,71 @@ impl FromStr for AutoGazeVisualizationMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AutoGazeMaskVisualizationMode {
+    #[default]
+    Overlay,
+    ScaleRows,
+}
+
+impl AutoGazeMaskVisualizationMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Overlay => "overlay",
+            Self::ScaleRows => "scale-rows",
+        }
+    }
+}
+
+impl fmt::Display for AutoGazeMaskVisualizationMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for AutoGazeMaskVisualizationMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "overlay" | "combined" | "union" | "native" | "native-overlay" => Ok(Self::Overlay),
+            "scale-rows" | "rows" | "per-scale" | "upstream" | "nvidia" => Ok(Self::ScaleRows),
+            other => Err(format!(
+                "unsupported AutoGaze mask visualization mode `{other}`"
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AutoGazeRgbaVisualizationOptions {
+    pub width: usize,
+    pub height: usize,
+    pub cell_scale: f32,
+    pub blend_alpha: f32,
+    pub mask_mode: AutoGazeMaskVisualizationMode,
+}
+
+impl AutoGazeRgbaVisualizationOptions {
+    pub const fn new(width: usize, height: usize, cell_scale: f32, blend_alpha: f32) -> Self {
+        Self {
+            width,
+            height,
+            cell_scale,
+            blend_alpha,
+            mask_mode: AutoGazeMaskVisualizationMode::Overlay,
+        }
+    }
+
+    pub const fn with_mask_visualization_mode(
+        mut self,
+        mode: AutoGazeMaskVisualizationMode,
+    ) -> Self {
+        self.mask_mode = mode;
+        self
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AutoGazeVisualizationState {
     mode: AutoGazeVisualizationMode,
@@ -176,7 +243,20 @@ impl AutoGazeVisualizationState {
         cell_scale: f32,
         blend_alpha: f32,
     ) -> Result<AutoGazeVisualization> {
-        self.visualize_rgba_panels(rgba, width, height, points, cell_scale, blend_alpha)?
+        self.visualize_rgba_with_options(
+            rgba,
+            points,
+            AutoGazeRgbaVisualizationOptions::new(width, height, cell_scale, blend_alpha),
+        )
+    }
+
+    pub fn visualize_rgba_with_options(
+        &mut self,
+        rgba: &[u8],
+        points: &[FixationPoint],
+        options: AutoGazeRgbaVisualizationOptions,
+    ) -> Result<AutoGazeVisualization> {
+        self.visualize_rgba_panels_with_options(rgba, points, options)?
             .into_side_by_side(rgba)
     }
 
@@ -189,13 +269,40 @@ impl AutoGazeVisualizationState {
         cell_scale: f32,
         blend_alpha: f32,
     ) -> Result<AutoGazeVisualizationPanels> {
+        self.visualize_rgba_panels_with_options(
+            rgba,
+            points,
+            AutoGazeRgbaVisualizationOptions::new(width, height, cell_scale, blend_alpha),
+        )
+    }
+
+    pub fn visualize_rgba_panels_with_options(
+        &mut self,
+        rgba: &[u8],
+        points: &[FixationPoint],
+        options: AutoGazeRgbaVisualizationOptions,
+    ) -> Result<AutoGazeVisualizationPanels> {
+        let width = options.width;
+        let height = options.height;
         let _ = validate_rgba_dimensions(rgba, width, height)?;
         let (mask_rgba, output_rgba, mask_pixel_count, updated_pixel_count) = match self.mode {
             AutoGazeVisualizationMode::FullBlend => {
                 self.last_keyframe = false;
-                let mask = mask_rgba_and_rects(rgba, width, height, points, cell_scale)?;
-                let output_rgba =
-                    blend_masked_rects_rgba(rgba, width, height, &mask.plan.rects, blend_alpha)?;
+                let mask = mask_rgba_and_rects(
+                    rgba,
+                    width,
+                    height,
+                    points,
+                    options.cell_scale,
+                    options.mask_mode,
+                )?;
+                let output_rgba = blend_masked_rects_rgba(
+                    rgba,
+                    width,
+                    height,
+                    &mask.plan.rects,
+                    options.blend_alpha,
+                )?;
                 (
                     mask.mask_rgba,
                     output_rgba,
@@ -204,7 +311,14 @@ impl AutoGazeVisualizationState {
                 )
             }
             AutoGazeVisualizationMode::Interframe => {
-                let mask = mask_rgba_and_rects(rgba, width, height, points, cell_scale)?;
+                let mask = mask_rgba_and_rects(
+                    rgba,
+                    width,
+                    height,
+                    points,
+                    options.cell_scale,
+                    options.mask_mode,
+                )?;
                 let (output_rgba, updated_pixel_count) = self.interframe_rgba(rgba, &mask.plan)?;
                 (
                     mask.mask_rgba,
@@ -329,6 +443,7 @@ pub struct AutoGazeTensorVisualizationOptions {
     pub height: usize,
     pub cell_scale: f32,
     pub blend_alpha: f32,
+    pub mask_mode: AutoGazeMaskVisualizationMode,
     pub sparse_update_max_rects: usize,
     pub sparse_update_max_ratio: f64,
 }
@@ -340,9 +455,18 @@ impl AutoGazeTensorVisualizationOptions {
             height,
             cell_scale,
             blend_alpha,
+            mask_mode: AutoGazeMaskVisualizationMode::Overlay,
             sparse_update_max_rects: DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RECTS,
             sparse_update_max_ratio: DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RATIO,
         }
+    }
+
+    pub const fn with_mask_visualization_mode(
+        mut self,
+        mode: AutoGazeMaskVisualizationMode,
+    ) -> Self {
+        self.mask_mode = mode;
+        self
     }
 
     pub const fn with_sparse_update_policy(
@@ -446,7 +570,8 @@ impl<B: Backend> AutoGazeTensorVisualizationState<B> {
         let width = options.width;
         let height = options.height;
         let pixels = validate_dimensions(width, height)?;
-        let mask_rgba = fixation_scale_mask_rgba(width, height, points, options.cell_scale);
+        let mask_rgba =
+            fixation_mask_rgba(width, height, points, options.cell_scale, options.mask_mode);
         let input = normalized_rgb_clip_to_unit_rgba_tensor(tensor, width, height, device)?;
         let mask = rgba_u8_to_unit_tensor(&mask_rgba, width, height, device)?;
         let mut interframe_path = None;
@@ -720,6 +845,85 @@ pub fn fixation_scale_mask_rgba(
     }
 
     rgba
+}
+
+pub fn fixation_scale_rows_mask_rgba(
+    width: usize,
+    height: usize,
+    points: &[FixationPoint],
+    cell_scale: f32,
+) -> Vec<u8> {
+    let width = width.max(1);
+    let height = height.max(1);
+    let mut rgba = vec![0u8; width * height * 4];
+    for pixel in rgba.chunks_exact_mut(4) {
+        pixel[3] = 255;
+    }
+
+    let mut by_grid = BTreeMap::<usize, Vec<FixationPoint>>::new();
+    for point in points
+        .iter()
+        .copied()
+        .filter(|point| point.confidence > 0.0)
+    {
+        by_grid
+            .entry(scale_grid_for_point(point))
+            .or_default()
+            .push(point);
+    }
+    let row_grids = scale_row_grids(&by_grid);
+    let rows = row_grids.len().max(1);
+
+    for (row_idx, grid) in row_grids.into_iter().enumerate() {
+        let Some(mut row_points) = by_grid.remove(&grid) else {
+            continue;
+        };
+        let (row_y0, row_y1) = partition_range(row_idx, rows, height);
+        let row_height = row_y1.saturating_sub(row_y0);
+        if row_height == 0 {
+            continue;
+        }
+        row_points.sort_by(|left, right| {
+            right
+                .cell_width()
+                .total_cmp(&left.cell_width())
+                .then_with(|| right.cell_height().total_cmp(&left.cell_height()))
+        });
+
+        for point in row_points {
+            let color = scale_color_for_point(point);
+            let bounds = point.scaled_bounds(cell_scale);
+            let (x0, x1) = pixel_range(bounds.x_min, bounds.x_max, width);
+            let (local_y0, local_y1) = pixel_range(bounds.y_min, bounds.y_max, row_height);
+            let rect = FixationPixelRect {
+                x0,
+                x1,
+                y0: row_y0 + local_y0,
+                y1: row_y0 + local_y1,
+            };
+            fill_cell(&mut rgba, width, rect, color, 0.42);
+            stroke_cell(&mut rgba, width, rect, color);
+        }
+    }
+
+    rgba
+}
+
+pub fn fixation_mask_rgba(
+    width: usize,
+    height: usize,
+    points: &[FixationPoint],
+    cell_scale: f32,
+    mode: AutoGazeMaskVisualizationMode,
+) -> Vec<u8> {
+    match mode {
+        AutoGazeMaskVisualizationMode::Overlay => {
+            fixation_scale_mask_rgba(width, height, points, cell_scale)
+        }
+        AutoGazeMaskVisualizationMode::ScaleRows => {
+            fixation_scale_rows_mask_rgba(width, height, points, cell_scale)
+        }
+    }
 }
 
 /// Colorize the same projected cells used by [`fixation_effective_alpha_mask`].
@@ -1264,10 +1468,11 @@ fn mask_rgba_and_rects(
     height: usize,
     points: &[FixationPoint],
     cell_scale: f32,
+    mask_mode: AutoGazeMaskVisualizationMode,
 ) -> Result<MaskRgbaAndRects> {
     let _ = validate_rgba_dimensions(rgba, width, height)?;
     let plan = fixation_sparse_update_plan(width, height, points, cell_scale)?;
-    let mask_rgba = fixation_scale_mask_rgba(width, height, points, cell_scale);
+    let mask_rgba = fixation_mask_rgba(width, height, points, cell_scale, mask_mode);
 
     Ok(MaskRgbaAndRects { mask_rgba, plan })
 }
@@ -1286,7 +1491,14 @@ fn mask_and_blend_rgba(
     cell_scale: f32,
     blend_alpha: f32,
 ) -> Result<MaskBlendRgba> {
-    let mask = mask_rgba_and_rects(rgba, width, height, points, cell_scale)?;
+    let mask = mask_rgba_and_rects(
+        rgba,
+        width,
+        height,
+        points,
+        cell_scale,
+        AutoGazeMaskVisualizationMode::Overlay,
+    )?;
     let blend_rgba = blend_masked_rects_rgba(rgba, width, height, &mask.plan.rects, blend_alpha)?;
 
     Ok(MaskBlendRgba {
@@ -1421,10 +1633,7 @@ fn ratio(count: usize, total: usize) -> f64 {
 }
 
 fn scale_color_for_point(point: FixationPoint) -> [u8; 3] {
-    match point
-        .cell_grid()
-        .unwrap_or_else(|| nearest_scale_grid(point))
-    {
+    match scale_grid_for_point(point) {
         0..=2 => [255, 180, 0],
         3..=4 => [60, 220, 120],
         5..=7 => [0, 185, 255],
@@ -1432,14 +1641,52 @@ fn scale_color_for_point(point: FixationPoint) -> [u8; 3] {
     }
 }
 
+fn scale_grid_for_point(point: FixationPoint) -> usize {
+    point
+        .cell_grid()
+        .unwrap_or_else(|| nearest_scale_grid(point))
+}
+
 fn nearest_scale_grid(point: FixationPoint) -> usize {
     let recovered = 1.0 / point.cell_width().max(point.cell_height()).max(1.0e-6);
-    [2usize, 4, 7, 14]
+    DEFAULT_AUTOGAZE_SCALE_GRIDS
         .into_iter()
         .min_by(|left, right| {
             ((*left as f32 - recovered).abs()).total_cmp(&(*right as f32 - recovered).abs())
         })
         .unwrap_or(14)
+}
+
+fn scale_row_grids(by_grid: &BTreeMap<usize, Vec<FixationPoint>>) -> Vec<usize> {
+    let mut grids = if by_grid
+        .keys()
+        .any(|grid| DEFAULT_AUTOGAZE_SCALE_GRIDS.contains(grid))
+    {
+        DEFAULT_AUTOGAZE_SCALE_GRIDS.to_vec()
+    } else {
+        by_grid.keys().copied().collect::<Vec<_>>()
+    };
+
+    for grid in by_grid.keys().copied() {
+        if !grids.contains(&grid) {
+            grids.push(grid);
+        }
+    }
+
+    if grids.is_empty() {
+        grids.extend(DEFAULT_AUTOGAZE_SCALE_GRIDS);
+    }
+
+    grids
+}
+
+fn partition_range(index: usize, parts: usize, extent: usize) -> (usize, usize) {
+    let parts = parts.max(1);
+    let extent = extent.max(1);
+    let index = index.min(parts - 1);
+    let start = index.saturating_mul(extent) / parts;
+    let end = (index + 1).saturating_mul(extent).saturating_add(parts - 1) / parts;
+    (start.min(extent), end.min(extent).max(start))
 }
 
 fn pixel_range(min: f32, max: f32, extent: usize) -> (usize, usize) {
@@ -1576,6 +1823,23 @@ mod tests {
         assert_eq!(
             &rgba[mid_only_interior..mid_only_interior + 4],
             &[25, 92, 50, 255]
+        );
+    }
+
+    #[test]
+    fn scale_rows_mask_visualization_separates_non_nested_scale_grids() {
+        let coarse = FixationPoint::with_grid_extent(0.25, 0.25, 0.5, 0.5, 1.0, 2);
+        let fine = FixationPoint::with_grid_extent(0.875, 0.875, 0.25, 0.25, 1.0, 4);
+        let rgba = fixation_scale_rows_mask_rgba(8, 8, &[fine, coarse], 1.0);
+
+        assert_eq!(&rgba[0..4], &[255, 180, 0, 255]);
+        let fine_offset = (3 * 8 + 7) * 4;
+        assert_eq!(&rgba[fine_offset..fine_offset + 4], &[60, 220, 120, 255]);
+
+        let unused_scale_position = (7 * 8 + 7) * 4;
+        assert_eq!(
+            &rgba[unused_scale_position..unused_scale_position + 4],
+            &[0, 0, 0, 255]
         );
     }
 
