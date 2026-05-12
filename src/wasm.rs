@@ -60,7 +60,7 @@ impl WasmAutoGaze {
             mode: AutoGazeInferenceMode::ResizeToModelInput,
             top_k: DEFAULT_REALTIME_TOP_K,
             mask_cell_scale: 1.0,
-            mask_visualization_mode: AutoGazeMaskVisualizationMode::ScaleRows,
+            mask_visualization_mode: AutoGazeMaskVisualizationMode::Overlay,
             blend_alpha: DEFAULT_BLEND_ALPHA,
             visualization_mode: AutoGazeVisualizationMode::FullBlend,
             keyframe_duration: DEFAULT_KEYFRAME_DURATION,

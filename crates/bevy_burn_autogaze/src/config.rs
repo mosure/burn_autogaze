@@ -146,6 +146,7 @@ pub struct BevyBurnAutoGazeConfig {
     pub config_url: String,
     pub weights_url: String,
     pub load_model: bool,
+    pub warmup_model: bool,
     pub image_path: Option<PathBuf>,
     pub mode: BevyAutoGazeMode,
     pub top_k: usize,
@@ -185,6 +186,7 @@ impl Default for BevyBurnAutoGazeConfig {
             config_url: DEFAULT_CONFIG_URL.to_string(),
             weights_url: DEFAULT_WEIGHTS_URL.to_string(),
             load_model: true,
+            warmup_model: true,
             image_path: None,
             mode,
             top_k: default_top_k(mode),
@@ -197,7 +199,7 @@ impl Default for BevyBurnAutoGazeConfig {
             inference_width,
             inference_height,
             mask_cell_scale: 1.0,
-            mask_visualization_mode: AutoGazeMaskVisualizationMode::ScaleRows,
+            mask_visualization_mode: AutoGazeMaskVisualizationMode::Overlay,
             blend_alpha: DEFAULT_BLEND_ALPHA,
             visualization_mode: AutoGazeVisualizationMode::Interframe,
             keyframe_duration: DEFAULT_BIRDS_KEYFRAME_DURATION,
@@ -248,6 +250,10 @@ impl BevyBurnAutoGazeConfig {
             }
             "load-model" => {
                 self.load_model = parse_bool_option(&key, value)?;
+                Ok(())
+            }
+            "warmup-model" | "warm-model" | "model-warmup" => {
+                self.warmup_model = parse_bool_option(&key, value)?;
                 Ok(())
             }
             "image-path" => {
@@ -531,7 +537,7 @@ impl BevyBurnAutoGazeConfig {
             frames_per_clip: DEFAULT_BIRDS_FRAMES_PER_CLIP,
             inference_width: Some(DEFAULT_BIRDS_INFERENCE_WIDTH),
             inference_height: Some(DEFAULT_BIRDS_INFERENCE_HEIGHT),
-            mask_visualization_mode: AutoGazeMaskVisualizationMode::ScaleRows,
+            mask_visualization_mode: AutoGazeMaskVisualizationMode::Overlay,
             blend_alpha: DEFAULT_BIRDS_BLEND_ALPHA,
             keyframe_duration: DEFAULT_BIRDS_KEYFRAME_DURATION,
             display_transfer: BevyDisplayTransfer::Gpu,
@@ -764,6 +770,10 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         assert!(config.show_psnr);
 
+        let errors = config.apply_query_string("?warmup-model=false");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(!config.warmup_model);
+
         let errors = config.apply_query_string("?task-loss-requirement-db=20");
         assert!(errors.is_empty(), "{errors:?}");
         assert!((config.task_loss_requirement.expect("threshold") - 0.1).abs() < 1.0e-6);
@@ -819,7 +829,7 @@ mod tests {
         assert_eq!(config.blend_alpha, DEFAULT_BIRDS_BLEND_ALPHA);
         assert_eq!(
             config.mask_visualization_mode,
-            AutoGazeMaskVisualizationMode::ScaleRows
+            AutoGazeMaskVisualizationMode::Overlay
         );
         assert_eq!(config.keyframe_duration, DEFAULT_BIRDS_KEYFRAME_DURATION);
         assert_eq!(config.display_transfer, BevyDisplayTransfer::Gpu);

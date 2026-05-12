@@ -883,6 +883,7 @@ pub fn fixation_scale_rows_mask_rgba(
         if row_height == 0 {
             continue;
         }
+        let viewport = aspect_preserving_row_viewport(width, height, row_y0, row_y1);
         row_points.sort_by(|left, right| {
             right
                 .cell_width()
@@ -893,13 +894,13 @@ pub fn fixation_scale_rows_mask_rgba(
         for point in row_points {
             let color = scale_color_for_point(point);
             let bounds = point.scaled_bounds(cell_scale);
-            let (x0, x1) = pixel_range(bounds.x_min, bounds.x_max, width);
-            let (local_y0, local_y1) = pixel_range(bounds.y_min, bounds.y_max, row_height);
+            let (local_x0, local_x1) = pixel_range(bounds.x_min, bounds.x_max, viewport.width);
+            let (local_y0, local_y1) = pixel_range(bounds.y_min, bounds.y_max, viewport.height);
             let rect = FixationPixelRect {
-                x0,
-                x1,
-                y0: row_y0 + local_y0,
-                y1: row_y0 + local_y1,
+                x0: viewport.x0 + local_x0,
+                x1: viewport.x0 + local_x1,
+                y0: viewport.y0 + local_y0,
+                y1: viewport.y0 + local_y1,
             };
             fill_cell(&mut rgba, width, rect, color, 0.42);
             stroke_cell(&mut rgba, width, rect, color);
@@ -965,6 +966,37 @@ pub fn fixation_effective_scale_mask_rgba(
     }
 
     rgba
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MaskViewport {
+    x0: usize,
+    y0: usize,
+    width: usize,
+    height: usize,
+}
+
+fn aspect_preserving_row_viewport(
+    canvas_width: usize,
+    canvas_height: usize,
+    row_y0: usize,
+    row_y1: usize,
+) -> MaskViewport {
+    let canvas_width = canvas_width.max(1);
+    let canvas_height = canvas_height.max(1);
+    let row_y0 = row_y0.min(canvas_height.saturating_sub(1));
+    let row_y1 = row_y1.min(canvas_height).max(row_y0 + 1);
+    let row_height = row_y1 - row_y0;
+    let viewport_width = ((row_height as f64 * canvas_width as f64 / canvas_height as f64).round()
+        as usize)
+        .clamp(1, canvas_width);
+    let x0 = (canvas_width - viewport_width) / 2;
+    MaskViewport {
+        x0,
+        y0: row_y0,
+        width: viewport_width,
+        height: row_height,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1832,8 +1864,9 @@ mod tests {
         let fine = FixationPoint::with_grid_extent(0.875, 0.875, 0.25, 0.25, 1.0, 4);
         let rgba = fixation_scale_rows_mask_rgba(8, 8, &[fine, coarse], 1.0);
 
-        assert_eq!(&rgba[0..4], &[255, 180, 0, 255]);
-        let fine_offset = (3 * 8 + 7) * 4;
+        let coarse_offset = 3 * 4;
+        assert_eq!(&rgba[coarse_offset..coarse_offset + 4], &[255, 180, 0, 255]);
+        let fine_offset = (3 * 8 + 4) * 4;
         assert_eq!(&rgba[fine_offset..fine_offset + 4], &[60, 220, 120, 255]);
 
         let unused_scale_position = (7 * 8 + 7) * 4;
@@ -1841,6 +1874,21 @@ mod tests {
             &rgba[unused_scale_position..unused_scale_position + 4],
             &[0, 0, 0, 255]
         );
+    }
+
+    #[test]
+    fn scale_rows_mask_visualization_preserves_source_aspect_inside_rows() {
+        let coarse = FixationPoint::with_grid_extent(0.5, 0.5, 1.0, 1.0, 1.0, 2);
+        let fine = FixationPoint::with_grid_extent(0.875, 0.875, 0.25, 0.25, 1.0, 4);
+        let rgba = fixation_scale_rows_mask_rgba(16, 8, &[fine, coarse], 1.0);
+
+        assert_eq!(&rgba[0..4], &[0, 0, 0, 255]);
+        assert_eq!(&rgba[(6 * 4)..(6 * 4) + 4], &[255, 180, 0, 255]);
+
+        let right_margin = (7 * 16 + 15) * 4;
+        assert_eq!(&rgba[right_margin..right_margin + 4], &[0, 0, 0, 255]);
+        let fine_offset = (3 * 16 + 9) * 4;
+        assert_eq!(&rgba[fine_offset..fine_offset + 4], &[60, 220, 120, 255]);
     }
 
     #[test]

@@ -76,6 +76,8 @@ pub use config::{
 pub type AutoGazeBevyBackend = burn::backend::WebGpu<f32, i32>;
 pub type AutoGazeBevyDevice = burn::backend::wgpu::WgpuDevice;
 const AUTO_GAZE_BEVY_BACKEND_NAME: &str = "webgpu";
+const DEFAULT_REALTIME_MODEL_WARMUP_RUNS: usize = 3;
+const DEFAULT_TILED_MODEL_WARMUP_RUNS: usize = 1;
 const MAX_SPARE_CLIP_BUFFERS: usize = 2;
 const TIMING_LOG_INTERVAL_MS: f64 = 5_000.0;
 const UI_MARGIN_PX: f32 = 12.0;
@@ -437,6 +439,7 @@ struct InferenceRunConfigSummary {
     tensor_sparse_update_max_rects: usize,
     tensor_sparse_update_max_ratio: f64,
     show_psnr: bool,
+    warmup_model: bool,
     burn_backend: &'static str,
 }
 
@@ -464,6 +467,7 @@ impl From<&BevyBurnAutoGazeConfig> for InferenceRunConfigSummary {
             tensor_sparse_update_max_rects: config.tensor_sparse_update_max_rects,
             tensor_sparse_update_max_ratio: config.tensor_sparse_update_max_ratio,
             show_psnr: config.show_psnr,
+            warmup_model: config.warmup_model,
             burn_backend: AUTO_GAZE_BEVY_BACKEND_NAME,
         }
     }
@@ -773,6 +777,7 @@ fn insert_run_config_json_fields(
         config.tensor_sparse_update_max_ratio.into(),
     );
     fields.insert("show_psnr".to_string(), config.show_psnr.into());
+    fields.insert("warmup_model".to_string(), config.warmup_model.into());
     fields.insert("burn_backend".to_string(), config.burn_backend.into());
 }
 
@@ -1521,6 +1526,7 @@ async fn load_model(
     let mut pipeline = AutoGazePipeline::from_hf_dir(&config.model_dir, device)
         .map_err(|err| format!("{err:#}"))?;
     pipeline.apply_options(pipeline_options_from_config(&config));
+    warmup_pipeline_if_enabled(&config, &pipeline, device).await?;
     Ok(pipeline)
 }
 
@@ -1542,7 +1548,118 @@ async fn load_model(
     .map_err(|err| format!("{err:#}"))?;
     let mut pipeline = AutoGazePipeline::new(model);
     pipeline.apply_options(pipeline_options_from_config(&config));
+    warmup_pipeline_if_enabled(&config, &pipeline, device).await?;
     Ok(pipeline)
+}
+
+async fn warmup_pipeline_if_enabled(
+    config: &BevyBurnAutoGazeConfig,
+    pipeline: &AutoGazePipeline<AutoGazeBevyBackend>,
+    device: &AutoGazeBevyDevice,
+) -> Result<(), String> {
+    if !config.warmup_model {
+        return Ok(());
+    }
+
+    let warmup_start = timestamp_now();
+    let (width, height) = warmup_dimensions(config);
+    let frames_per_clip = config.frames_per_clip.max(1);
+    let use_streaming_cache = should_use_streaming_cache(
+        config.streaming_cache,
+        frames_per_clip,
+        config.mode.inference_mode(),
+    );
+    let clip_len = if use_streaming_cache {
+        1
+    } else {
+        frames_per_clip
+    };
+    let mut cache = AutoGazeStreamingCache::new(frames_per_clip);
+    let warmup_pipeline = pipeline.clone().with_task_loss_requirement(None);
+    for run_idx in 0..model_warmup_runs(config.mode) {
+        let rgba = warmup_rgba_clip(width, height, clip_len, run_idx)?;
+        let shape = AutoGazeRgbaClipShape::new(clip_len, height, width);
+        let prepared = prepare_rgba_clip_for_trace::<AutoGazeBevyBackend>(
+            &rgba,
+            shape,
+            config.mode.inference_mode(),
+            use_streaming_cache,
+            device,
+        )
+        .map_err(|err| format!("failed to prepare AutoGaze warmup input: {err:#}"))?;
+        let cache = use_streaming_cache.then_some(&mut cache);
+        warmup_pipeline
+            .readout_prepared_run_async(prepared, config.top_k.max(1), cache)
+            .await
+            .map_err(|err| format!("failed to warm AutoGaze model: {err:?}"))?;
+    }
+    <AutoGazeBevyBackend as burn::tensor::backend::Backend>::sync(device)
+        .map_err(|err| format!("failed to sync AutoGaze warmup: {err:?}"))?;
+    log(&format!(
+        "AutoGaze model warmup complete in {:.1} ms",
+        elapsed_ms(warmup_start)
+    ));
+    Ok(())
+}
+
+fn model_warmup_runs(mode: BevyAutoGazeMode) -> usize {
+    match mode {
+        BevyAutoGazeMode::Resize224 => DEFAULT_REALTIME_MODEL_WARMUP_RUNS,
+        BevyAutoGazeMode::Tile224 => DEFAULT_TILED_MODEL_WARMUP_RUNS,
+    }
+}
+
+fn warmup_dimensions(config: &BevyBurnAutoGazeConfig) -> (usize, usize) {
+    let (default_width, default_height) = default_inference_dimensions(config.mode);
+    let width = config
+        .inference_width
+        .or(default_width)
+        .unwrap_or(DEFAULT_REALTIME_INFERENCE_WIDTH)
+        .max(1) as usize;
+    let height = config
+        .inference_height
+        .or(default_height)
+        .unwrap_or_else(|| ((width as f64 * 9.0 / 16.0).round() as u32).max(1))
+        .max(1) as usize;
+    (width, height)
+}
+
+fn warmup_rgba_clip(
+    width: usize,
+    height: usize,
+    clip_len: usize,
+    seed: usize,
+) -> Result<Vec<u8>, String> {
+    let frame_bytes = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| "AutoGaze warmup byte length overflow".to_string())?;
+    let mut rgba = Vec::with_capacity(frame_bytes.saturating_mul(clip_len));
+    for frame_idx in 0..clip_len {
+        let frame = warmup_frame(width, height, seed + frame_idx)?;
+        rgba.extend_from_slice(frame.as_raw());
+    }
+    Ok(rgba)
+}
+
+fn warmup_frame(width: usize, height: usize, seed: usize) -> Result<RgbaImage, String> {
+    let pixels = width
+        .checked_mul(height)
+        .ok_or_else(|| "AutoGaze warmup dimensions overflow".to_string())?;
+    let bytes = pixels
+        .checked_mul(4)
+        .ok_or_else(|| "AutoGaze warmup byte length overflow".to_string())?;
+    let mut rgba = vec![0_u8; bytes];
+    for (idx, pixel) in rgba.chunks_exact_mut(4).enumerate() {
+        let x = idx % width;
+        let y = idx / width;
+        pixel[0] = ((x * 13 + y * 7 + seed * 29) & 0xff) as u8;
+        pixel[1] = ((x * 3 + y * 17 + seed * 31) & 0xff) as u8;
+        pixel[2] = (((x / 8 + y / 8 + seed) & 1) * 255) as u8;
+        pixel[3] = 255;
+    }
+    RgbaImage::from_raw(width as u32, height as u32, rgba)
+        .ok_or_else(|| "failed to build AutoGaze warmup frame".to_string())
 }
 
 fn pipeline_options_from_config(config: &BevyBurnAutoGazeConfig) -> AutoGazePipelineOptions {
@@ -2029,24 +2146,24 @@ fn visualize_rgba_tensor(
     );
     let cpu_psnr_start = timestamp_now();
     let psnr_db = if options.calculate_psnr {
-        let rgba_options = AutoGazeRgbaVisualizationOptions::new(
-            width,
-            height,
-            options.cell_scale,
-            options.blend_alpha,
-        )
-        .with_mask_visualization_mode(options.mask_visualization_mode);
-        let cpu_panels = visualization_state
-            .cpu
-            .visualize_rgba_panels_with_options(input.rgba, points, rgba_options)
-            .map_err(|err| format!("failed to mirror AutoGaze CPU PSNR output: {err:#}"))?;
-        debug_assert_eq!(
-            visualization_state.cpu.last_frame_was_keyframe(),
-            interframe_keyframe
-        );
         if interframe_keyframe {
             None
         } else {
+            let rgba_options = AutoGazeRgbaVisualizationOptions::new(
+                width,
+                height,
+                options.cell_scale,
+                options.blend_alpha,
+            )
+            .with_mask_visualization_mode(options.mask_visualization_mode);
+            let cpu_panels = visualization_state
+                .cpu
+                .visualize_rgba_panels_with_options(input.rgba, points, rgba_options)
+                .map_err(|err| format!("failed to mirror AutoGaze CPU PSNR output: {err:#}"))?;
+            debug_assert_eq!(
+                visualization_state.cpu.last_frame_was_keyframe(),
+                interframe_keyframe
+            );
             Some(
                 cpu_panels
                     .output_psnr_db(input.rgba)
@@ -2988,7 +3105,7 @@ mod tests {
         assert_eq!(config.inference_height, None);
         assert_eq!(
             config.mask_visualization_mode,
-            AutoGazeMaskVisualizationMode::ScaleRows
+            AutoGazeMaskVisualizationMode::Overlay
         );
         assert_eq!(config.blend_alpha, DEFAULT_BLEND_ALPHA);
         assert_eq!(config.keyframe_duration, DEFAULT_BIRDS_KEYFRAME_DURATION);
@@ -3983,7 +4100,7 @@ mod tests {
         );
         assert_eq!(summary["mode"], "tiled");
         assert_eq!(summary["visualization_mode"], "interframe");
-        assert_eq!(summary["mask_visualization_mode"], "scale-rows");
+        assert_eq!(summary["mask_visualization_mode"], "overlay");
         assert_eq!(summary["display_transfer"], "gpu");
         assert_eq!(summary["streaming_cache"], true);
         assert_eq!(summary["streaming_cache_effective"], false);
@@ -3998,6 +4115,7 @@ mod tests {
         assert_eq!(summary["tensor_sparse_update_max_rects"], 8);
         assert_eq!(summary["tensor_sparse_update_max_ratio"], 0.05);
         assert_eq!(summary["show_psnr"], true);
+        assert_eq!(summary["warmup_model"], true);
         assert_eq!(summary["burn_backend"], "webgpu");
         assert_eq!(summary["render_adapter_name"], "test adapter");
         assert_eq!(summary["render_adapter_vendor"], 1234);
@@ -4046,7 +4164,7 @@ mod tests {
         );
         assert_eq!(sample["mode"], "tiled");
         assert_eq!(sample["visualization_mode"], "interframe");
-        assert_eq!(sample["mask_visualization_mode"], "scale-rows");
+        assert_eq!(sample["mask_visualization_mode"], "overlay");
         assert_eq!(sample["display_transfer"], "gpu");
         assert_eq!(sample["streaming_cache"], true);
         assert_eq!(sample["streaming_cache_effective"], false);
@@ -4061,6 +4179,7 @@ mod tests {
         assert_eq!(sample["tensor_sparse_update_max_rects"], 8);
         assert_eq!(sample["tensor_sparse_update_max_ratio"], 0.05);
         assert_eq!(sample["show_psnr"], true);
+        assert_eq!(sample["warmup_model"], true);
         assert_eq!(sample["burn_backend"], "webgpu");
         assert_eq!(sample["render_adapter_name"], "test adapter");
         assert_eq!(sample["render_adapter_vendor"], 1234);

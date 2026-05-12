@@ -108,7 +108,7 @@ enum NativeMaskVisualizationMode {
         alias = "rows",
         alias = "per-scale",
         alias = "upstream",
-        help = "Render one diagnostic mask row per AutoGaze scale, matching the NVIDIA visualizer."
+        help = "Render one aspect-preserved diagnostic mask row per AutoGaze scale."
     )]
     ScaleRows,
     #[value(
@@ -262,6 +262,14 @@ struct NativeArgs {
 
     #[arg(
         long,
+        default_value_t = true,
+        action = ArgAction::Set,
+        help = "Run one synthetic inference during model load so WebGPU autotune does not stall the first displayed frame."
+    )]
+    warmup_model: bool,
+
+    #[arg(
+        long,
         value_enum,
         default_value_t = NativeInferenceMode::Realtime,
         help = "Inference path. Default is realtime for live throughput. Aliases: resize-224, fast, tile-224, full-res, anyres."
@@ -368,8 +376,8 @@ struct NativeArgs {
         alias = "mask-visualization-mode",
         alias = "mask-mode",
         value_enum,
-        default_value_t = NativeMaskVisualizationMode::ScaleRows,
-        help = "Mask panel display. scale-rows mirrors NVIDIA's per-scale mask view; overlay draws one combined full-frame mask."
+        default_value_t = NativeMaskVisualizationMode::Overlay,
+        help = "Mask panel display. overlay draws one full-frame mask matching output updates; scale-rows draws aspect-preserved diagnostic rows."
     )]
     mask_visualization_mode: NativeMaskVisualizationMode,
 
@@ -499,6 +507,7 @@ impl From<NativeArgs> for BevyBurnAutoGazeConfig {
             model_dir: args.model_dir,
             image_path: args.image_path,
             load_model: args.load_model && !args.no_load_model,
+            warmup_model: args.warmup_model,
             mode,
             top_k,
             max_gaze_tokens_each_frame,
@@ -754,6 +763,7 @@ mod tests {
         assert_eq!(config.inference_height, None);
         assert_eq!(config.display_transfer, BevyDisplayTransfer::Gpu);
         assert!(config.show_psnr);
+        assert!(config.warmup_model);
         assert_eq!(config.streaming_cache, DEFAULT_BEVY_STREAMING_CACHE);
     }
 
@@ -768,6 +778,7 @@ mod tests {
             image_path: None,
             load_model: true,
             no_load_model: false,
+            warmup_model: true,
             mode: NativeInferenceMode::Tiled,
             top_k: None,
             max_gaze_tokens_each_frame: None,
@@ -780,7 +791,7 @@ mod tests {
             inference_width: None,
             inference_height: None,
             mask_cell_scale: 1.0,
-            mask_visualization_mode: NativeMaskVisualizationMode::ScaleRows,
+            mask_visualization_mode: NativeMaskVisualizationMode::Overlay,
             blend_alpha: DEFAULT_BLEND_ALPHA,
             visualization_mode: NativeVisualizationMode::Interframe,
             keyframe_duration: DEFAULT_BIRDS_KEYFRAME_DURATION,
