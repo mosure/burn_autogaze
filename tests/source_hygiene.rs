@@ -166,6 +166,36 @@ fn bevy_wasm_timing_does_not_use_std_instant() {
 }
 
 #[test]
+fn bevy_wasm_model_warmup_does_not_block_on_backend_sync() {
+    let Some(source) = bevy_source() else {
+        return;
+    };
+    let production = source_before_tests(&source);
+    let warmup = function_body_after(
+        production,
+        "async fn warmup_pipeline_if_enabled",
+        "async fn warmup_pipeline_if_enabled",
+    );
+    assert!(
+        warmup.contains("sync_warmup_backend(device)?"),
+        "warmup should route backend sync through the platform-specific helper"
+    );
+    assert!(
+        !warmup.contains("Backend>::sync"),
+        "warmup must not call Backend::sync directly because wasm sync blocks on a condvar"
+    );
+
+    let wasm_sync = function_body_after(
+        production,
+        "#[cfg(target_arch = \"wasm32\")]\nfn sync_warmup_backend",
+        "fn sync_warmup_backend",
+    );
+    assert!(!wasm_sync.contains("Backend>::sync"));
+    assert!(!wasm_sync.contains(".sync("));
+    assert!(!wasm_sync.contains("block_on"));
+}
+
+#[test]
 fn bevy_realtime_default_uses_model_generation_budget() {
     let Some(source) = bevy_config_source() else {
         return;

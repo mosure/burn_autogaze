@@ -891,9 +891,9 @@ fn bevy_perf_matrix(root: PathBuf, args: BevyPerfMatrixArgs) -> Result<()> {
     let runner = Runner::new(root, &args.common, None);
     let static_source = ["--image-path".to_owned(), args.image.display().to_string()];
     let mut cases = vec![
-        ("default-static-gpu-interframe-psnr", vec![], true),
+        ("default-static-auto-interframe-psnr", vec![], true),
         (
-            "default-static-gpu-interframe-no-psnr",
+            "default-static-auto-interframe-no-psnr",
             vec!["--show-psnr=false"],
             true,
         ),
@@ -1322,14 +1322,26 @@ fn validate_summary(data: &Value, require_hardware_adapter: bool) -> Result<()> 
         &["full-blend", "interframe"],
         false,
     )?;
-    require_enum(data, "display_transfer", &["cpu", "gpu"], false)?;
+    require_enum(data, "display_transfer", &["auto", "cpu", "gpu"], false)?;
+    require_enum(
+        data,
+        "latest_effective_display_transfer",
+        &["cpu", "gpu"],
+        false,
+    )?;
     require_enum(data, "xtask_build_profile", &["release", "dev"], false)?;
     require_int(data, "xtask_case_timeout_seconds", 1, false)?;
     require_string(data, "xtask_cache_dir", false)?;
     require_nullable_enum(
         data,
         "latest_tensor_interframe_path",
-        &["keyframe", "dense-mask", "dense-tensor", "sparse-rects"],
+        &[
+            "keyframe",
+            "dense-mask",
+            "dense-tensor",
+            "sparse-rects",
+            "full-frame",
+        ],
     )?;
     require_enum(
         data,
@@ -1490,6 +1502,7 @@ fn validate_bevy_perf_summary_self_test() -> Result<()> {
         "mode": "resize-224",
         "visualization_mode": "interframe",
         "display_transfer": "gpu",
+        "latest_effective_display_transfer": "gpu",
         "xtask_build_profile": "release",
         "xtask_case_timeout_seconds": 600,
         "xtask_cache_dir": "target/autogaze-bevy-perf/cache",
@@ -2371,6 +2384,7 @@ mod tests {
             "mode": "resize-224",
             "visualization_mode": "interframe",
             "display_transfer": "gpu",
+            "latest_effective_display_transfer": "gpu",
             "latest_tensor_interframe_path": "sparse-rects",
             "display_residency": "gpu-tensor",
             "display_input_residency": "model-tensor-reuse",

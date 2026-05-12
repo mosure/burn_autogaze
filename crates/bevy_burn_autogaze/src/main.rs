@@ -144,6 +144,12 @@ impl From<NativeMaskVisualizationMode> for AutoGazeMaskVisualizationMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum NativeDisplayTransfer {
     #[value(
+        name = "auto",
+        alias = "adaptive",
+        help = "Use the fastest measured display path for the current frame size; this avoids full-resolution f32 tensor-panel upload when CPU u8 image panels are faster."
+    )]
+    Auto,
+    #[value(
         name = "gpu",
         alias = "device",
         alias = "interop",
@@ -163,6 +169,7 @@ enum NativeDisplayTransfer {
 impl From<NativeDisplayTransfer> for BevyDisplayTransfer {
     fn from(transfer: NativeDisplayTransfer) -> Self {
         match transfer {
+            NativeDisplayTransfer::Auto => Self::Auto,
             NativeDisplayTransfer::Gpu => Self::Gpu,
             NativeDisplayTransfer::Cpu => Self::Cpu,
         }
@@ -195,7 +202,7 @@ impl FromStr for TaskLossRequirementArg {
 #[command(
     about = "native Bevy viewer for burn_autogaze",
     version,
-    long_about = "Runs the burn_autogaze video pipeline with camera or static-image input and renders Input | Mask | Output through Bevy. The default path is a continuous realtime streaming configuration: 640px source resize, 16-frame rolling KV window, the model's configured generation budget, GPU display transfer, PSNR overlay, interframe output, and no periodic visualization keyframes. Use --streaming-cache=false for full-window comparison, or --mode tiled plus explicit 1080p/docs settings for full-resolution inspection."
+    long_about = "Runs the burn_autogaze video pipeline with camera or static-image input and renders Input | Mask | Output through Bevy. The default path is a continuous realtime streaming configuration: 640px source resize, 16-frame rolling KV window, the model's configured generation budget, adaptive display transfer, PSNR overlay, interframe output, and no periodic visualization keyframes. Use --display-transfer gpu to force Bevy/Burn tensor interop, --streaming-cache=false for full-window comparison, or --mode tiled plus explicit 1080p/docs settings for full-resolution inspection."
 )]
 struct NativeArgs {
     #[arg(
@@ -410,8 +417,8 @@ struct NativeArgs {
     #[arg(
         long,
         value_enum,
-        default_value_t = NativeDisplayTransfer::Gpu,
-        help = "Display transfer path. gpu uses Bevy/Burn shared-device texture interop; cpu reads RGBA visualization through host memory."
+        default_value_t = NativeDisplayTransfer::Auto,
+        help = "Display transfer path. auto uses the fastest measured path for the frame size; gpu forces Bevy/Burn shared-device texture interop; cpu writes u8 RGBA Bevy images."
     )]
     display_transfer: NativeDisplayTransfer,
 
@@ -434,6 +441,16 @@ struct NativeArgs {
         help = "Maximum selected-pixel ratio eligible for tensor-side sparse interframe updates."
     )]
     tensor_sparse_update_max_ratio: f64,
+
+    #[arg(
+        long,
+        alias = "full-frame-update-min-ratio",
+        value_name = "0..1",
+        value_parser = parse_ratio_f64,
+        default_value_t = bevy_burn_autogaze::DEFAULT_TENSOR_FULL_FRAME_UPDATE_MIN_RATIO,
+        help = "Selected-pixel ratio where tensor interframe output switches to a full-frame update. Use 0 to disable."
+    )]
+    tensor_full_frame_update_min_ratio: f64,
 
     #[arg(
         long,
@@ -526,6 +543,7 @@ impl From<NativeArgs> for BevyBurnAutoGazeConfig {
             display_transfer: args.display_transfer.into(),
             tensor_sparse_update_max_rects: args.tensor_sparse_update_max_rects,
             tensor_sparse_update_max_ratio: args.tensor_sparse_update_max_ratio,
+            tensor_full_frame_update_min_ratio: args.tensor_full_frame_update_min_ratio,
             streaming_cache: args.streaming_cache,
             require_hardware_adapter: args.require_hardware_adapter,
             log_pipeline_timing: args.log_pipeline_timing,
@@ -742,7 +760,7 @@ mod tests {
     }
 
     #[test]
-    fn native_cli_defaults_use_upstream_realtime_gpu_profile() {
+    fn native_cli_defaults_use_upstream_realtime_adaptive_display_profile() {
         let args = NativeArgs::parse_from(["bevy_burn_autogaze"]);
         let config = BevyBurnAutoGazeConfig::from(args);
 
@@ -761,7 +779,7 @@ mod tests {
             Some(DEFAULT_REALTIME_INFERENCE_WIDTH)
         );
         assert_eq!(config.inference_height, None);
-        assert_eq!(config.display_transfer, BevyDisplayTransfer::Gpu);
+        assert_eq!(config.display_transfer, BevyDisplayTransfer::Auto);
         assert!(config.show_psnr);
         assert!(config.warmup_model);
         assert_eq!(config.streaming_cache, DEFAULT_BEVY_STREAMING_CACHE);
@@ -795,11 +813,13 @@ mod tests {
             blend_alpha: DEFAULT_BLEND_ALPHA,
             visualization_mode: NativeVisualizationMode::Interframe,
             keyframe_duration: DEFAULT_BIRDS_KEYFRAME_DURATION,
-            display_transfer: NativeDisplayTransfer::Gpu,
+            display_transfer: NativeDisplayTransfer::Auto,
             tensor_sparse_update_max_rects:
                 bevy_burn_autogaze::DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RECTS,
             tensor_sparse_update_max_ratio:
                 bevy_burn_autogaze::DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RATIO,
+            tensor_full_frame_update_min_ratio:
+                bevy_burn_autogaze::DEFAULT_TENSOR_FULL_FRAME_UPDATE_MIN_RATIO,
             streaming_cache: DEFAULT_BEVY_STREAMING_CACHE,
             require_hardware_adapter: false,
             log_pipeline_timing: false,
@@ -824,7 +844,7 @@ mod tests {
         assert_eq!(config.inference_height, None);
         assert_eq!(config.blend_alpha, DEFAULT_BLEND_ALPHA);
         assert_eq!(config.keyframe_duration, DEFAULT_BIRDS_KEYFRAME_DURATION);
-        assert_eq!(config.display_transfer, BevyDisplayTransfer::Gpu);
+        assert_eq!(config.display_transfer, BevyDisplayTransfer::Auto);
         assert_eq!(
             config.tensor_sparse_update_max_rects,
             bevy_burn_autogaze::DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RECTS
@@ -832,6 +852,10 @@ mod tests {
         assert_eq!(
             config.tensor_sparse_update_max_ratio,
             bevy_burn_autogaze::DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RATIO
+        );
+        assert_eq!(
+            config.tensor_full_frame_update_min_ratio,
+            bevy_burn_autogaze::DEFAULT_TENSOR_FULL_FRAME_UPDATE_MIN_RATIO
         );
     }
 
@@ -887,10 +911,13 @@ mod tests {
             "8",
             "--tensor-sparse-update-max-ratio",
             "0.05",
+            "--tensor-full-frame-update-min-ratio",
+            "0.45",
         ]);
         let config = BevyBurnAutoGazeConfig::from(args);
 
         assert_eq!(config.tensor_sparse_update_max_rects, 8);
         assert_eq!(config.tensor_sparse_update_max_ratio, 0.05);
+        assert_eq!(config.tensor_full_frame_update_min_ratio, 0.45);
     }
 }

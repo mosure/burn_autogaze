@@ -74,11 +74,40 @@ impl TensorVisualizationLayout {
 }
 
 #[derive(Clone, Copy, Debug)]
+enum TensorUpdatePolicyCase {
+    AutoFullFrame,
+    NoFullFrame,
+}
+
+impl TensorUpdatePolicyCase {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::AutoFullFrame => "auto-full-frame",
+            Self::NoFullFrame => "no-full-frame",
+        }
+    }
+
+    fn options(
+        self,
+        width: usize,
+        height: usize,
+        blend_alpha: f32,
+    ) -> AutoGazeTensorVisualizationOptions {
+        let options = AutoGazeTensorVisualizationOptions::new(width, height, 1.0, blend_alpha);
+        match self {
+            Self::AutoFullFrame => options,
+            Self::NoFullFrame => options.with_full_frame_update_policy(0.0),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 enum TensorFixationCase {
     ModelDefault,
     TinySparse,
     CoarseDense,
     DenseGrid64,
+    DenseGrid128,
 }
 
 impl TensorFixationCase {
@@ -88,6 +117,7 @@ impl TensorFixationCase {
             Self::TinySparse => "tiny-sparse",
             Self::CoarseDense => "coarse-dense",
             Self::DenseGrid64 => "dense-grid-64",
+            Self::DenseGrid128 => "dense-grid-128",
         }
     }
 
@@ -106,6 +136,7 @@ impl TensorFixationCase {
                 0.25, 0.25, 0.5, 0.5, 1.0, 2,
             )],
             Self::DenseGrid64 => dense_grid_fixations(64),
+            Self::DenseGrid128 => dense_grid_fixations(128),
         }
     }
 }
@@ -213,11 +244,18 @@ const TENSOR_VISUALIZATION_LAYOUTS: &[TensorVisualizationLayout] = &[
     TensorVisualizationLayout::SideBySide,
     TensorVisualizationLayout::Panels,
 ];
+const TENSOR_UPDATE_POLICY_DEFAULT: &[TensorUpdatePolicyCase] =
+    &[TensorUpdatePolicyCase::AutoFullFrame];
+const TENSOR_UPDATE_POLICY_DELTA: &[TensorUpdatePolicyCase] = &[
+    TensorUpdatePolicyCase::AutoFullFrame,
+    TensorUpdatePolicyCase::NoFullFrame,
+];
 const TENSOR_FIXATION_CASES: &[TensorFixationCase] = &[
     TensorFixationCase::ModelDefault,
     TensorFixationCase::TinySparse,
     TensorFixationCase::CoarseDense,
     TensorFixationCase::DenseGrid64,
+    TensorFixationCase::DenseGrid128,
 ];
 const MODEL_INPUT_SIZE: usize = 224;
 const PATCH_SIZE: usize = 16;
@@ -1545,18 +1583,26 @@ fn register_tensor_visualization<B>(
             for &visualization in VISUALIZATION_CASES {
                 for &fixations in TENSOR_FIXATION_CASES {
                     for &layout in TENSOR_VISUALIZATION_LAYOUTS {
-                        bench_tensor_visualization_case::<B>(
-                            group,
-                            backend,
-                            TensorVisualizationBenchCase {
-                                video: case,
-                                model,
-                                visualization,
-                                fixations,
-                                layout,
-                            },
-                            device.clone(),
-                        );
+                        let update_policies = if visualization.force_delta_frame {
+                            TENSOR_UPDATE_POLICY_DELTA
+                        } else {
+                            TENSOR_UPDATE_POLICY_DEFAULT
+                        };
+                        for &update_policy in update_policies {
+                            bench_tensor_visualization_case::<B>(
+                                group,
+                                backend,
+                                TensorVisualizationBenchCase {
+                                    video: case,
+                                    model,
+                                    visualization,
+                                    fixations,
+                                    layout,
+                                    update_policy,
+                                },
+                                device.clone(),
+                            );
+                        }
                     }
                 }
             }
@@ -1571,6 +1617,7 @@ struct TensorVisualizationBenchCase {
     visualization: VisualizationCase,
     fixations: TensorFixationCase,
     layout: TensorVisualizationLayout,
+    update_policy: TensorUpdatePolicyCase,
 }
 
 fn bench_tensor_visualization_case<B>(
@@ -1590,11 +1637,12 @@ fn bench_tensor_visualization_case<B>(
     group.bench_with_input(
         BenchmarkId::new(
             format!(
-                "{backend}/{}/{}/{}/{}",
+                "{backend}/{}/{}/{}/{}/{}",
                 case.model.name,
                 case.visualization.name,
                 case.fixations.name(),
-                case.layout.name()
+                case.layout.name(),
+                case.update_policy.name()
             ),
             case.video.name,
         ),
@@ -1620,7 +1668,8 @@ fn bench_tensor_visualization_case<B>(
                                     case.video.height,
                                     1.0,
                                     BLEND_ALPHA,
-                                ),
+                                )
+                                .with_full_frame_update_policy(0.0),
                                 &device,
                             )
                             .expect("prime tensor interframe visualization state");
@@ -1634,10 +1683,9 @@ fn bench_tensor_visualization_case<B>(
                                 .visualize_normalized_rgb_clip(
                                     current.clone(),
                                     &points,
-                                    AutoGazeTensorVisualizationOptions::new(
+                                    case.update_policy.options(
                                         case.video.width,
                                         case.video.height,
-                                        1.0,
                                         BLEND_ALPHA,
                                     ),
                                     &device,
@@ -1653,10 +1701,9 @@ fn bench_tensor_visualization_case<B>(
                                 .visualize_normalized_rgb_clip_panels(
                                     current.clone(),
                                     &points,
-                                    AutoGazeTensorVisualizationOptions::new(
+                                    case.update_policy.options(
                                         case.video.width,
                                         case.video.height,
-                                        1.0,
                                         BLEND_ALPHA,
                                     ),
                                     &device,

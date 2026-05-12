@@ -5,9 +5,10 @@ use burn_autogaze::{
     AutoGazeInferenceMode, AutoGazeMaskVisualizationMode, AutoGazeRealtimePolicy,
     AutoGazeVisualizationMode, DEFAULT_BLEND_ALPHA, DEFAULT_MAX_IN_FLIGHT,
     DEFAULT_MODEL_GENERATION_BUDGET, DEFAULT_REALTIME_TOP_K,
-    DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RATIO, DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RECTS,
-    DEFAULT_TILED_FRAMES_PER_CLIP, DEFAULT_TILED_MAX_GAZE_TOKENS, DEFAULT_TILED_TILE_BATCH_SIZE,
-    DEFAULT_TILED_TOP_K, should_use_streaming_cache, task_loss_requirement_from_l1_db,
+    DEFAULT_TENSOR_FULL_FRAME_UPDATE_MIN_RATIO, DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RATIO,
+    DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RECTS, DEFAULT_TILED_FRAMES_PER_CLIP,
+    DEFAULT_TILED_MAX_GAZE_TOKENS, DEFAULT_TILED_TILE_BATCH_SIZE, DEFAULT_TILED_TOP_K,
+    should_use_streaming_cache, task_loss_requirement_from_l1_db,
 };
 
 pub const DEFAULT_NATIVE_MODEL_DIR: &str = "/home/mosure/.cache/huggingface/hub/models--nvidia--AutoGaze/snapshots/5100fae739ec1bf3f875914fa1b703846a18943a";
@@ -102,14 +103,16 @@ pub const DEFAULT_BEVY_MODE: BevyAutoGazeMode = BevyAutoGazeMode::Resize224;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum BevyDisplayTransfer {
-    Gpu,
     #[default]
+    Auto,
+    Gpu,
     Cpu,
 }
 
 impl BevyDisplayTransfer {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Auto => "auto",
             Self::Gpu => "gpu",
             Self::Cpu => "cpu",
         }
@@ -121,10 +124,11 @@ impl FromStr for BevyDisplayTransfer {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim().to_ascii_lowercase().as_str() {
+            "auto" | "adaptive" | "default" => Ok(Self::Auto),
             "gpu" | "device" | "burn-to-bevy" | "bevy-burn" | "interop" => Ok(Self::Gpu),
             "cpu" | "host" | "rgba" => Ok(Self::Cpu),
             other => Err(format!(
-                "unsupported display transfer `{other}`; expected gpu or cpu"
+                "unsupported display transfer `{other}`; expected auto, gpu, or cpu"
             )),
         }
     }
@@ -166,6 +170,7 @@ pub struct BevyBurnAutoGazeConfig {
     pub display_transfer: BevyDisplayTransfer,
     pub tensor_sparse_update_max_rects: usize,
     pub tensor_sparse_update_max_ratio: f64,
+    pub tensor_full_frame_update_min_ratio: f64,
     pub streaming_cache: bool,
     pub require_hardware_adapter: bool,
     pub log_pipeline_timing: bool,
@@ -203,9 +208,10 @@ impl Default for BevyBurnAutoGazeConfig {
             blend_alpha: DEFAULT_BLEND_ALPHA,
             visualization_mode: AutoGazeVisualizationMode::Interframe,
             keyframe_duration: DEFAULT_BIRDS_KEYFRAME_DURATION,
-            display_transfer: BevyDisplayTransfer::Gpu,
+            display_transfer: BevyDisplayTransfer::Auto,
             tensor_sparse_update_max_rects: DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RECTS,
             tensor_sparse_update_max_ratio: DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RATIO,
+            tensor_full_frame_update_min_ratio: DEFAULT_TENSOR_FULL_FRAME_UPDATE_MIN_RATIO,
             streaming_cache: DEFAULT_BEVY_STREAMING_CACHE,
             require_hardware_adapter: false,
             log_pipeline_timing: false,
@@ -359,6 +365,12 @@ impl BevyBurnAutoGazeConfig {
                 self.tensor_sparse_update_max_ratio = parse_f64_option(&key, value)?;
                 Ok(())
             }
+            "tensor-full-frame-update-min-ratio"
+            | "full-frame-update-min-ratio"
+            | "dense-update-full-frame-min-ratio" => {
+                self.tensor_full_frame_update_min_ratio = parse_f64_option(&key, value)?;
+                Ok(())
+            }
             "streaming-cache" | "kv-cache" | "stream-cache" => {
                 self.streaming_cache = parse_bool_option(&key, value)?;
                 Ok(())
@@ -499,6 +511,14 @@ impl BevyBurnAutoGazeConfig {
             self.tensor_sparse_update_max_ratio =
                 self.tensor_sparse_update_max_ratio.clamp(0.0, 1.0);
         }
+        if !self.tensor_full_frame_update_min_ratio.is_finite()
+            || self.tensor_full_frame_update_min_ratio < 0.0
+        {
+            self.tensor_full_frame_update_min_ratio = DEFAULT_TENSOR_FULL_FRAME_UPDATE_MIN_RATIO;
+        } else {
+            self.tensor_full_frame_update_min_ratio =
+                self.tensor_full_frame_update_min_ratio.clamp(0.0, 1.0);
+        }
         self.task_loss_requirement = self
             .task_loss_requirement
             .filter(|value| value.is_finite() && *value >= 0.0);
@@ -540,7 +560,7 @@ impl BevyBurnAutoGazeConfig {
             mask_visualization_mode: AutoGazeMaskVisualizationMode::Overlay,
             blend_alpha: DEFAULT_BIRDS_BLEND_ALPHA,
             keyframe_duration: DEFAULT_BIRDS_KEYFRAME_DURATION,
-            display_transfer: BevyDisplayTransfer::Gpu,
+            display_transfer: BevyDisplayTransfer::Auto,
             ..Self::default()
         }
     }
@@ -721,7 +741,7 @@ mod tests {
     fn applies_url_query_to_viewer_config() {
         let mut config = BevyBurnAutoGazeConfig::default();
         let errors = config.apply_query_string(
-            "?mode=full-res&top_k=2&frames-per-clip=3&max-in-flight=2&inference-width=1920&inference-height=1080&show-fps=false&show-psnr=false&task-loss-requirement=0.65&tile-batch-size=4&config-url=%2Fconfig.json&weights-url=%2Fmodel.safetensors&load-model=false&mask-cell-scale=2.5&mask-visualization=overlay&blend-alpha=0.5&visualization-mode=interframe&keyframe-duration=7&display-transfer=cpu&tensor-sparse-update-max-rects=8&tensor-sparse-update-max-ratio=0.05&streaming-cache=false&require-hardware-adapter=true&perf-summary-frames=5&perf-summary-path=target%2Fperf.json",
+            "?mode=full-res&top_k=2&frames-per-clip=3&max-in-flight=2&inference-width=1920&inference-height=1080&show-fps=false&show-psnr=false&task-loss-requirement=0.65&tile-batch-size=4&config-url=%2Fconfig.json&weights-url=%2Fmodel.safetensors&load-model=false&mask-cell-scale=2.5&mask-visualization=overlay&blend-alpha=0.5&visualization-mode=interframe&keyframe-duration=7&display-transfer=cpu&tensor-sparse-update-max-rects=8&tensor-sparse-update-max-ratio=0.05&tensor-full-frame-update-min-ratio=0.45&streaming-cache=false&require-hardware-adapter=true&perf-summary-frames=5&perf-summary-path=target%2Fperf.json",
         );
 
         assert!(errors.is_empty(), "{errors:?}");
@@ -754,6 +774,7 @@ mod tests {
         assert_eq!(config.display_transfer, BevyDisplayTransfer::Cpu);
         assert_eq!(config.tensor_sparse_update_max_rects, 8);
         assert_eq!(config.tensor_sparse_update_max_ratio, 0.05);
+        assert_eq!(config.tensor_full_frame_update_min_ratio, 0.45);
         assert!(!config.streaming_cache);
         assert!(config.require_hardware_adapter);
         assert_eq!(config.perf_summary_frames, Some(5));
@@ -832,7 +853,7 @@ mod tests {
             AutoGazeMaskVisualizationMode::Overlay
         );
         assert_eq!(config.keyframe_duration, DEFAULT_BIRDS_KEYFRAME_DURATION);
-        assert_eq!(config.display_transfer, BevyDisplayTransfer::Gpu);
+        assert_eq!(config.display_transfer, BevyDisplayTransfer::Auto);
         assert!(!should_use_streaming_cache(
             config.streaming_cache,
             config.frames_per_clip,

@@ -98,7 +98,7 @@ cargo run -p bevy_burn_autogaze -- --mode tiled --visualization-mode interframe
 ```
 
 The no-arg native default is the realtime profile: resize mode, 16-frame rolling
-KV window, model-config generation budget, GPU display transfer, interframe
+KV window, model-config generation budget, adaptive display transfer, interframe
 output, PSNR overlay, and no periodic visualization keyframes. The Bevy crate
 selects native or wasm dependencies by target, so platform features are not
 needed for normal runs.

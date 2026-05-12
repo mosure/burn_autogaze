@@ -13,15 +13,14 @@ cargo run -p bevy_burn_autogaze -- \
 Use `--image-path path/to/frame.png` to run from a static image instead of the
 native camera. The default path is a continuous realtime profile: `resize-224`,
 640px aspect-preserving input, 16-frame rolling KV window, the model-configured
-generation budget, GPU display transfer, PSNR overlay, interframe output, and no
+generation budget, adaptive display transfer, PSNR overlay, interframe output, and no
 periodic visualization keyframes. Common viewer/inference knobs include `--top-k`, `--frames-per-clip`,
 `--max-in-flight`, `--max-gaze-tokens-each-frame`, `--inference-width`,
 `--inference-height`, `--task-loss-requirement`, `--disable-task-loss-requirement`,
 `--task-loss-requirement-db`, `--mask-cell-scale`, `--blend-alpha`, and `--show-fps`. `--show-gaze-ratio`
 toggles the text overlay for per-frame and EMA output update ratio.
 `--show-psnr=false` hides PSNR in dB between the current input and rendered
-output; the pixel comparison is skipped when this overlay is disabled. GPU
-display transfer remains active when PSNR is enabled.
+output; the pixel comparison is skipped when this overlay is disabled.
 `--task-loss-requirement-db 28` expresses the upstream L1 reconstruction-loss
 threshold as `10^(-28 / 20)`, which is more PSNR-like but is not the same value
 as the rendered output PSNR overlay.
@@ -68,8 +67,12 @@ aspect-preserving source frame, `--top-k 2`, 24 generated tokens per tile, and
 a tile batch size of 64. Pass explicit `--top-k`, `--tile-batch-size`,
 `--inference-width`, and `--inference-height` values for fixed full-resolution
 inspection.
-`--display-transfer gpu` exercises the shared Bevy/Burn WebGPU texture bridge;
-it is the default display path for live runs.
+`--display-transfer auto` is the default display path. It keeps model-sized
+frames on the Bevy/Burn tensor bridge and uses the faster u8 Bevy image panel
+path for full-resolution displays, avoiding full-frame f32 tensor-panel uploads
+when many cells are active. `--display-transfer gpu` forces the shared
+Bevy/Burn WebGPU texture bridge for interop benchmarking, and
+`--display-transfer cpu` forces the u8 image path.
 For GPU interframe display, `--tensor-sparse-update-max-rects` and
 `--tensor-sparse-update-max-ratio` choose when the tensor compositor uses sparse
 rectangle copies instead of the dense mask path; use `0` rects to force dense

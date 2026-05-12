@@ -5,6 +5,8 @@ const wasmPanicNeedles = [
   "Failed to read tensor data synchronously",
   "time not implemented on this platform",
   "std::time::Instant",
+  "condvar wait not supported",
+  "cannot recursively acquire mutex",
 ];
 
 function combinedOutput(consoleLines, pageErrors) {
@@ -296,6 +298,7 @@ test("runs optional real wasm inference smoke when model assets are available", 
   expect(perf.mode).toBe("realtime");
   expect(perf.visualization_mode).toBe("interframe");
   expect(perf.display_transfer).toBe("gpu");
+  expect(perf.latest_effective_display_transfer).toBe("gpu");
   expect(perf.streaming_cache).toBe(false);
   expect(perf.streaming_cache_effective).toBe(false);
   expect(perf.show_psnr).toBe(false);
@@ -314,7 +317,9 @@ test("runs optional real wasm inference smoke when model assets are available", 
   expect(perf.tensor_sparse_update_max_rects).toBeGreaterThanOrEqual(0);
   expect(perf.tensor_sparse_update_max_ratio).toBeGreaterThanOrEqual(0);
   expect(perf.tensor_sparse_update_max_ratio).toBeLessThanOrEqual(1);
-  expect(["sparse-rects", "dense-mask"]).toContain(
+  expect(perf.tensor_full_frame_update_min_ratio).toBeGreaterThanOrEqual(0);
+  expect(perf.tensor_full_frame_update_min_ratio).toBeLessThanOrEqual(1);
+  expect(["sparse-rects", "dense-mask", "full-frame"]).toContain(
     perf.latest_tensor_interframe_path,
   );
   expect(typeof perf.render_adapter_name).toBe("string");
@@ -327,7 +332,7 @@ test("runs optional real wasm inference smoke when model assets are available", 
   );
   expect(perfSummary).not.toBeNull();
   expect(perfSummary.processed_frames).toBeGreaterThanOrEqual(2);
-  expect(["sparse-rects", "dense-mask"]).toContain(
+  expect(["sparse-rects", "dense-mask", "full-frame"]).toContain(
     perfSummary.latest_tensor_interframe_path,
   );
   expect(perfSummary.render_adapter_name).toBe(perf.render_adapter_name);
@@ -335,6 +340,9 @@ test("runs optional real wasm inference smoke when model assets are available", 
   expect(perfSummary.mode).toBe(perf.mode);
   expect(perfSummary.visualization_mode).toBe(perf.visualization_mode);
   expect(perfSummary.display_transfer).toBe(perf.display_transfer);
+  expect(perfSummary.latest_effective_display_transfer).toBe(
+    perf.latest_effective_display_transfer,
+  );
   expect(perfSummary.streaming_cache).toBe(perf.streaming_cache);
   expect(perfSummary.streaming_cache_effective).toBe(
     perf.streaming_cache_effective,
@@ -363,6 +371,9 @@ test("runs optional real wasm inference smoke when model assets are available", 
   );
   expect(perfSummary.tensor_sparse_update_max_ratio).toBe(
     perf.tensor_sparse_update_max_ratio,
+  );
+  expect(perfSummary.tensor_full_frame_update_min_ratio).toBe(
+    perf.tensor_full_frame_update_min_ratio,
   );
   expect(perfSummary.latest_width).toBe(224);
   expect(perfSummary.latest_height).toBe(224);
