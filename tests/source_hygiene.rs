@@ -36,6 +36,24 @@ fn bevy_config_source() -> Option<String> {
     }
 }
 
+fn bevy_display_source() -> Option<String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("crates")
+        .join("bevy_burn_autogaze")
+        .join("src")
+        .join("display.rs");
+    match std::fs::read_to_string(&path) {
+        Ok(source) => Some(source),
+        Err(err) => {
+            eprintln!(
+                "skipping Bevy display hygiene check: failed to read {}: {err}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
 fn function_body_after<'a>(source: &'a str, marker: &str, fn_name: &str) -> &'a str {
     let marker_start = source.find(marker).expect("marker should exist");
     let search = &source[marker_start..];
@@ -278,6 +296,11 @@ fn production_pipeline_surfaces_avoid_unrecoverable_panics() {
             .join("crates")
             .join("bevy_burn_autogaze")
             .join("src")
+            .join("display.rs"),
+        manifest
+            .join("crates")
+            .join("bevy_burn_autogaze")
+            .join("src")
             .join("main.rs"),
         manifest
             .join("crates")
@@ -361,7 +384,11 @@ fn bevy_gpu_display_path_is_tensor_backed_bevy_burn_interop() {
     let Some(source) = bevy_source() else {
         return;
     };
+    let Some(display_source) = bevy_display_source() else {
+        return;
+    };
     let production = source_before_tests(&source);
+    let display_production = source_before_tests(&display_source);
 
     assert!(
         production.contains("BevyBurnBridgePlugin::<AutoGazeBevyBackend>::default()"),
@@ -369,7 +396,7 @@ fn bevy_gpu_display_path_is_tensor_backed_bevy_burn_interop() {
     );
 
     let panel_upload = function_body_after(
-        production,
+        display_production,
         "fn set_gpu_panel_upload_handle",
         "fn set_gpu_panel_upload_handle",
     );
@@ -465,7 +492,11 @@ fn bevy_gpu_display_upload_flag_is_one_shot() {
     let Some(source) = bevy_source() else {
         return;
     };
+    let Some(display_source) = bevy_display_source() else {
+        return;
+    };
     let production = source_before_tests(&source);
+    let display_production = source_before_tests(&display_source);
 
     let clear = function_body_after(
         production,
@@ -478,7 +509,7 @@ fn bevy_gpu_display_upload_flag_is_one_shot() {
     );
 
     let set = function_body_after(
-        production,
+        display_production,
         "fn set_gpu_panel_upload_handle",
         "fn set_gpu_panel_upload_handle",
     );

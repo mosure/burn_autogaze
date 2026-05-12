@@ -1803,26 +1803,7 @@ fn nearest_scale_grid(point: FixationPoint) -> usize {
 }
 
 fn scale_row_grids(by_grid: &BTreeMap<usize, Vec<FixationPoint>>) -> Vec<usize> {
-    let mut grids = if by_grid
-        .keys()
-        .any(|grid| DEFAULT_AUTOGAZE_SCALE_GRIDS.contains(grid))
-    {
-        DEFAULT_AUTOGAZE_SCALE_GRIDS.to_vec()
-    } else {
-        by_grid.keys().copied().collect::<Vec<_>>()
-    };
-
-    for grid in by_grid.keys().copied() {
-        if !grids.contains(&grid) {
-            grids.push(grid);
-        }
-    }
-
-    if grids.is_empty() {
-        grids.extend(DEFAULT_AUTOGAZE_SCALE_GRIDS);
-    }
-
-    grids
+    by_grid.keys().copied().collect()
 }
 
 fn partition_range(index: usize, parts: usize, extent: usize) -> (usize, usize) {
@@ -1979,7 +1960,7 @@ mod tests {
 
         let coarse_offset = 3 * 4;
         assert_eq!(&rgba[coarse_offset..coarse_offset + 4], &[255, 180, 0, 255]);
-        let fine_offset = (3 * 8 + 4) * 4;
+        let fine_offset = (7 * 8 + 5) * 4;
         assert_eq!(&rgba[fine_offset..fine_offset + 4], &[60, 220, 120, 255]);
 
         let unused_scale_position = (7 * 8 + 7) * 4;
@@ -1996,12 +1977,24 @@ mod tests {
         let rgba = fixation_scale_rows_mask_rgba(16, 8, &[fine, coarse], 1.0);
 
         assert_eq!(&rgba[0..4], &[0, 0, 0, 255]);
-        assert_eq!(&rgba[(6 * 4)..(6 * 4) + 4], &[255, 180, 0, 255]);
+        assert_eq!(&rgba[(4 * 4)..(4 * 4) + 4], &[255, 180, 0, 255]);
 
         let right_margin = (7 * 16 + 15) * 4;
         assert_eq!(&rgba[right_margin..right_margin + 4], &[0, 0, 0, 255]);
-        let fine_offset = (3 * 16 + 9) * 4;
+        let fine_offset = (7 * 16 + 11) * 4;
         assert_eq!(&rgba[fine_offset..fine_offset + 4], &[60, 220, 120, 255]);
+    }
+
+    #[test]
+    fn scale_rows_mask_visualization_does_not_reserve_empty_default_rows() {
+        let coarse = FixationPoint::with_grid_extent(0.5, 0.5, 1.0, 1.0, 1.0, 2);
+        let rgba = fixation_scale_rows_mask_rgba(16, 8, &[coarse], 1.0);
+
+        assert_eq!(&rgba[0..4], &[255, 180, 0, 255]);
+        assert_eq!(
+            &rgba[((7 * 16 + 15) * 4)..((7 * 16 + 15) * 4) + 4],
+            &[255, 180, 0, 255]
+        );
     }
 
     #[test]
