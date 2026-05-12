@@ -95,7 +95,7 @@ environment-bound checks for `burn_autogaze`.
 |---|---|---|
 | Upstream AutoGaze parity | `cargo test -p burn_autogaze --features ndarray --test native_autogaze_generate_parity -- --nocapture` plus embedding parity fixtures; `upstream_generated_masks_decode_without_model_snapshot` decodes the checked-in official, birds, seeded 224px, and 448px upstream AnyRes-style `gazing_pos` fixtures into per-scale masks without requiring local model weights and rejects malformed fixture metadata, mask shapes/sums, non-padded token coverage, or out-of-frame token ids | Covered for checked-in fixtures |
 | RGBA preprocessing and channel order | Core RGBA clip tests and birds Python fixture tests exercise RGBA packing, processor resize, and tensor layout | Covered |
-| Multi-scale mask decoding | Unit coverage for per-scale token grids, 1080p AnyRes stitching, native mask drawing, effective update footprint, and high-res birds fixture visualization/interframe output against upstream scale masks | Covered |
+| Multi-scale mask decoding | Unit coverage for per-scale token grids, 1080p AnyRes stitching, native mask drawing, projected codec footprints, and high-res birds fixture visualization/interframe output against upstream scale masks | Covered |
 | Interframe output | `AutoGazeVisualizationState` tests cover sparse accumulation, keyframe refresh, PSNR, and update ratios | Covered |
 | Bevy wrapper thinness | Bevy tests cover delegation to core runtime defaults, core RGBA prep, stale-result rejection, perf JSON samples, and source hygiene against local generated-output decoding in Bevy `lib.rs`, `main.rs`, and `platform.rs`; source hygiene also asserts Bevy production visualization calls `AutoGazeVisualizationState` / `AutoGazeTensorVisualizationState` helpers and Bevy metrics wrap `AutoGazeGazeRatioStats` / `AutoGazePsnrStats` instead of carrying local mask, interframe, PSNR, gaze-ratio, or EMA math | Covered at logic level |
 | Panic hygiene | `production_pipeline_surfaces_avoid_unrecoverable_panics` checks production source before test modules across core and Bevy wrapper files, keeping panic/unwrap/expect usage confined to tests and preventing wasm/native runtime regressions from unrecoverable local assumptions | Covered |
@@ -740,13 +740,13 @@ cargo test --features ndarray readout -- --nocapture
 ```
 
 Additional high-resolution visualization parity coverage passed on 2026-05-10
-after fixing the effective-grid update footprint to pixelize known source-grid
-cells with integer grid math instead of converting exact AutoGaze cells back
-through floating-point bounds. The new fixture-only test loads the committed
-1080p birds upstream fixture, verifies decoded fixation points reproduce the
-upstream native per-scale masks, verifies the visible mask panel keeps native
-multi-scale cells, and verifies interframe output copies only the effective
-masked cells from the second frame:
+after fixing the projected codec footprint to pixelize known source-grid cells
+with integer grid math instead of converting exact AutoGaze cells back through
+floating-point bounds. The fixture-only test loads the committed 1080p birds
+upstream fixture, verifies decoded fixation points reproduce the upstream native
+per-scale masks, verifies the visible mask panel keeps native multi-scale cells,
+and verifies interframe output copies the same native cells from the second
+frame:
 
 ```sh
 cargo test -p burn_autogaze --features ndarray --test native_autogaze_generate_parity upstream_birds_visualization_matches_fixture_masks_without_model_snapshot -- --nocapture

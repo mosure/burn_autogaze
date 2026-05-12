@@ -17,8 +17,8 @@ pub mod camera {
     };
     use once_cell::sync::OnceCell;
 
-    const CAMERA_WIDTH: u32 = 1280;
-    const CAMERA_HEIGHT: u32 = 720;
+    const CAMERA_WIDTH: u32 = crate::DEFAULT_REALTIME_INFERENCE_WIDTH;
+    const CAMERA_HEIGHT: u32 = 360;
     const CAMERA_FPS: u32 = 30;
 
     #[derive(Clone, Copy, Debug)]

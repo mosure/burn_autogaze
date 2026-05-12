@@ -152,7 +152,7 @@ impl WasmAutoGaze {
     }
 
     pub fn set_keyframe_duration(&mut self, duration: usize) {
-        self.keyframe_duration = duration.max(1);
+        self.keyframe_duration = duration;
         self.visualization_state
             .configure(self.visualization_mode, self.keyframe_duration);
     }

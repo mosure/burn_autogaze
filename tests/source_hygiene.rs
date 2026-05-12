@@ -85,10 +85,7 @@ fn source_before_first_test_module(source: &str) -> String {
         };
         let cfg_idx = if idx > 0 && is_test_cfg(lines[idx - 1]) {
             Some(idx - 1)
-        } else if idx > 1
-            && lines[idx - 1].trim().is_empty()
-            && is_test_cfg(lines[idx - 2])
-        {
+        } else if idx > 1 && lines[idx - 1].trim().is_empty() && is_test_cfg(lines[idx - 2]) {
             Some(idx - 2)
         } else {
             None
@@ -103,20 +100,20 @@ fn source_before_first_test_module(source: &str) -> String {
 }
 
 #[test]
-fn bevy_wasm_readout_uses_async_tensor_data_path() {
+fn bevy_readout_uses_async_tensor_data_path() {
     let Some(source) = bevy_source() else {
         return;
     };
     let body = function_body_after(
         &source,
-        "#[cfg(target_arch = \"wasm32\")]\nasync fn run_autogaze_readout",
+        "async fn run_autogaze_readout",
         "async fn run_autogaze_readout",
     );
     assert!(body.contains("readout_prepared_run_async"));
     assert!(body.contains("into_data_async") || body.contains("readout_prepared_run_async"));
     assert!(
         !body.contains("readout_prepared_run(trace_input"),
-        "wasm Bevy readout must not call the synchronous prepared readout API"
+        "Bevy readout must not call the synchronous prepared readout API"
     );
 }
 
@@ -151,6 +148,20 @@ fn bevy_wasm_timing_does_not_use_std_instant() {
 }
 
 #[test]
+fn bevy_realtime_default_uses_model_generation_budget() {
+    let Some(source) = bevy_source() else {
+        return;
+    };
+
+    assert!(
+        source.contains(
+            "pub const DEFAULT_REALTIME_MAX_GAZE_TOKENS: usize = DEFAULT_MODEL_GENERATION_BUDGET;"
+        ),
+        "Bevy realtime defaults should not silently cap the upstream model budget"
+    );
+}
+
+#[test]
 fn public_wasm_api_uses_async_trace_and_no_sync_tensor_readback() {
     let source = include_str!("../src/wasm.rs");
     assert!(source.contains("trace_rgba_clip_with_mode_async"));
@@ -167,11 +178,24 @@ fn model_async_greedy_selection_uses_async_readback_only() {
         "async fn greedy_select_multi_tokens_async",
         "async fn greedy_select_multi_tokens_async",
     );
-    assert!(body.contains("greedy_step_tensor"));
+    assert!(body.contains("pack_greedy_logits_task"));
     assert!(body.contains(".into_data_async()"));
     assert!(
         !body.contains(".into_data()"),
         "async greedy selection must not synchronously read tensor data"
+    );
+}
+
+#[test]
+fn greedy_selection_reads_logits_once_per_decoder_step() {
+    let source = include_str!("../src/model.rs");
+    assert!(
+        !source.contains("fn greedy_step_tensor"),
+        "greedy selection should not launch/read back one tensor per multi-token slot"
+    );
+    assert!(
+        source.contains("fn pack_greedy_logits_task"),
+        "greedy selection should pack logits and task loss for one readback per decoder step"
     );
 }
 
@@ -280,6 +304,189 @@ fn bevy_visualization_delegates_to_core_visualization_helpers() {
 }
 
 #[test]
+fn bevy_gpu_display_path_is_tensor_backed_bevy_burn_interop() {
+    let Some(source) = bevy_source() else {
+        return;
+    };
+    let production = source_before_tests(&source);
+
+    assert!(
+        production.contains("BevyBurnBridgePlugin::<AutoGazeBevyBackend>::default()"),
+        "Bevy app should initialize the bevy_burn bridge so Burn tensors use Bevy's render device"
+    );
+
+    let panel_upload = function_body_after(
+        production,
+        "fn set_gpu_panel_upload_handle",
+        "fn set_gpu_panel_upload_handle",
+    );
+    for expected in [
+        "BevyBurnHandle::<AutoGazeBevyBackend>",
+        "BindingDirection::BurnToBevy",
+        "TransferKind::Gpu",
+    ] {
+        assert!(
+            panel_upload.contains(expected),
+            "GPU display upload should be tensor-backed through bevy_burn; missing {expected}"
+        );
+    }
+
+    let tensor_body = function_body_after(
+        production,
+        "fn visualize_rgba_tensor",
+        "fn visualize_rgba_tensor",
+    );
+    assert!(
+        tensor_body.contains("output_rgba_bytes: 0"),
+        "GPU visualization should not emit host RGBA for display"
+    );
+    assert!(
+        tensor_body.contains("output_tensor_bytes"),
+        "GPU visualization should report tensor-resident output bytes"
+    );
+}
+
+#[test]
+fn bevy_runtime_backend_is_webgpu_and_avoids_readback_input_bridge() {
+    let Some(source) = bevy_source() else {
+        return;
+    };
+    let production = source_before_tests(&source);
+
+    assert!(
+        production.contains("pub type AutoGazeBevyBackend = burn::backend::WebGpu<f32, i32>;"),
+        "bevy_burn_autogaze should run the model on Burn WebGPU, not a CPU backend"
+    );
+    assert!(
+        production.contains("const AUTO_GAZE_BEVY_BACKEND_NAME: &str = \"webgpu\";"),
+        "perf summaries should expose the Bevy Burn backend explicitly"
+    );
+    assert!(
+        !production.contains("NdArray"),
+        "Bevy production source should not instantiate the ndarray CPU backend"
+    );
+    assert!(
+        !production.contains("BindingDirection::BevyToBurn"),
+        "the current bevy_burn BevyToBurn path stages through a CPU readback; Bevy input should use the core RGBA-to-tensor upload path until a true texture-to-tensor GPU path exists"
+    );
+}
+
+#[test]
+fn bevy_gpu_display_input_reuses_prepared_model_tensor_when_valid() {
+    let Some(source) = bevy_source() else {
+        return;
+    };
+    let production = source_before_tests(&source);
+
+    let helper = function_body_after(
+        production,
+        "fn display_tensor_from_prepared_trace",
+        "fn display_tensor_from_prepared_trace",
+    );
+    for expected in [
+        "trace_input.video.shape().dims::<5>()",
+        "dims[3] == clip.height()",
+        "dims[4] == clip.width()",
+        "video_frame_tensor(trace_input.video.clone(), trace_input.frame_index)",
+        "DisplayInputResidency::ModelTensorReuse",
+        "display_tensor_from_clip(clip, options, device)?",
+        "DisplayInputResidency::HostRgbaUpload",
+    ] {
+        assert!(
+            helper.contains(expected),
+            "display input preparation should reuse full-resolution model tensors when possible and report host-upload fallbacks; missing {expected}"
+        );
+    }
+
+    let clip_fallback = function_body_after(
+        production,
+        "fn display_tensor_from_clip",
+        "fn display_tensor_from_clip",
+    );
+    assert!(clip_fallback.contains("clip.last_frame_rgba()?"));
+    assert!(clip_fallback.contains("rgba_clip_to_tensor::<AutoGazeBevyBackend>"));
+}
+
+#[test]
+fn bevy_gpu_display_upload_flag_is_one_shot() {
+    let Some(source) = bevy_source() else {
+        return;
+    };
+    let production = source_before_tests(&source);
+
+    let clear = function_body_after(
+        production,
+        "fn clear_completed_gpu_uploads",
+        "fn clear_completed_gpu_uploads",
+    );
+    assert!(
+        clear.contains("handle.upload = false"),
+        "completed Burn-to-Bevy uploads should be marked idle so unchanged tensors are not copied every render frame"
+    );
+
+    let set = function_body_after(
+        production,
+        "fn set_gpu_panel_upload_handle",
+        "fn set_gpu_panel_upload_handle",
+    );
+    assert!(set.contains("handle.upload = true"));
+    assert!(set.contains("entity.insert(OneShotGpuUpload)"));
+}
+
+#[test]
+fn bevy_ui_text_uses_reserved_rows_not_image_overlays() {
+    let Some(source) = bevy_source() else {
+        return;
+    };
+    let production = source_before_tests(&source);
+
+    let setup = function_body_after(production, "fn setup_ui", "fn setup_ui");
+    assert!(
+        setup.contains("GridTrack::px(PANEL_LABEL_ROW_HEIGHT)")
+            && setup.contains("grid_row: GridPlacement::start(2)")
+            && setup.contains("Text(label.to_string())")
+            && setup.contains("padding: UiRect::horizontal"),
+        "panel labels should live in a reserved grid row above the image textures"
+    );
+    assert!(
+        !setup.contains(
+            "position_type: PositionType::Absolute,\n                    top: Val::Px(10.0)"
+        ),
+        "panel labels must not be absolutely overlaid on the image textures"
+    );
+
+    let fit = function_body_after(
+        production,
+        "fn fit_visualization_node",
+        "fn fit_visualization_node",
+    );
+    assert!(
+        fit.contains("metric_panel_top_reserved_height(&config)")
+            && fit.contains("available_image_height")
+            && fit.contains("PANEL_LABEL_ROW_HEIGHT")
+            && fit.contains("node.top = Val::Px(reserved_top"),
+        "visualization fitting should reserve vertical UI space above the image rows"
+    );
+
+    for metric_setup in [
+        ("fn fps_display_setup", "metric_overlay_top(0)"),
+        (
+            "fn gaze_ratio_display_setup",
+            "metric_overlay_top(usize::from(config.show_fps))",
+        ),
+        ("fn psnr_display_setup", "metric_overlay_top(row)"),
+    ] {
+        let body = function_body_after(production, metric_setup.0, metric_setup.0);
+        assert!(body.contains(metric_setup.1));
+        assert!(
+            !body.contains("bottom: Val::Px"),
+            "{} should use the reserved top metric band, not bottom image overlay",
+            metric_setup.0
+        );
+    }
+}
+
+#[test]
 fn bevy_metrics_delegate_to_core_metric_helpers() {
     let Some(source) = bevy_source() else {
         return;
@@ -293,18 +500,19 @@ fn bevy_metrics_delegate_to_core_metric_helpers() {
     let psnr_stats = function_body_after(production, "impl PsnrStats", "fn record");
     assert!(psnr_stats.contains("self.0.record(psnr_db)"));
 
+    let fps_text = function_body_after(production, "fn fps_update_system", "fn fps_update_system");
+    assert!(fps_text.contains("format_fps(timing.e2e_fps())"));
+    assert!(fps_text.contains("format_fps(value)"));
+
     let gaze_text = function_body_after(
         production,
-        "fn gaze_ratio_update_system",
-        "fn gaze_ratio_update_system",
+        "fn stable_gaze_ratio_text",
+        "fn stable_gaze_ratio_text",
     );
-    assert!(gaze_text.contains("format_gaze_ratio_percent(stats.0.current())"));
-    assert!(gaze_text.contains("format_gaze_ratio_percent(stats.0.ema())"));
+    assert!(gaze_text.contains("format_gaze_ratio_percent"));
 
-    let psnr_text =
-        function_body_after(production, "fn psnr_update_system", "fn psnr_update_system");
-    assert!(psnr_text.contains("format_psnr_db(stats.0.current())"));
-    assert!(psnr_text.contains("format_psnr_db(stats.0.ema())"));
+    let psnr_text = function_body_after(production, "fn stable_psnr_text", "fn stable_psnr_text");
+    assert!(psnr_text.contains("format_psnr_db"));
 
     for forbidden in [
         "sanitize_gaze_ratio",
@@ -446,7 +654,9 @@ fn bevy_platform_selection_is_target_cfg_not_feature_flags() {
         return;
     };
 
-    let features_start = source.find("[features]").expect("features section should exist");
+    let features_start = source
+        .find("[features]")
+        .expect("features section should exist");
     let features_section = source[features_start..]
         .split("\n[dependencies]")
         .next()

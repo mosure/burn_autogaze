@@ -114,6 +114,7 @@ pub struct AutoGazeVisualizationState {
     interframe_output_rgba: Vec<u8>,
     interframe_width: usize,
     interframe_height: usize,
+    last_keyframe: bool,
 }
 
 impl Default for AutoGazeVisualizationState {
@@ -129,11 +130,12 @@ impl AutoGazeVisualizationState {
     pub fn new(mode: AutoGazeVisualizationMode, keyframe_duration: usize) -> Self {
         Self {
             mode,
-            keyframe_duration: keyframe_duration.max(1),
+            keyframe_duration,
             frame_index: 0,
             interframe_output_rgba: Vec::new(),
             interframe_width: 0,
             interframe_height: 0,
+            last_keyframe: false,
         }
     }
 
@@ -145,12 +147,16 @@ impl AutoGazeVisualizationState {
         self.keyframe_duration
     }
 
+    pub fn last_frame_was_keyframe(&self) -> bool {
+        self.last_keyframe
+    }
+
     pub fn configure(&mut self, mode: AutoGazeVisualizationMode, keyframe_duration: usize) {
         if self.mode != mode {
             self.reset();
         }
         self.mode = mode;
-        self.keyframe_duration = keyframe_duration.max(1);
+        self.keyframe_duration = keyframe_duration;
     }
 
     pub fn reset(&mut self) {
@@ -158,6 +164,7 @@ impl AutoGazeVisualizationState {
         self.interframe_output_rgba.clear();
         self.interframe_width = 0;
         self.interframe_height = 0;
+        self.last_keyframe = false;
     }
 
     pub fn visualize_rgba(
@@ -185,6 +192,7 @@ impl AutoGazeVisualizationState {
         let _ = validate_rgba_dimensions(rgba, width, height)?;
         let (mask_rgba, output_rgba, mask_pixel_count, updated_pixel_count) = match self.mode {
             AutoGazeVisualizationMode::FullBlend => {
+                self.last_keyframe = false;
                 let mask = mask_rgba_and_rects(rgba, width, height, points, cell_scale)?;
                 let output_rgba =
                     blend_masked_rects_rgba(rgba, width, height, &mask.plan.rects, blend_alpha)?;
@@ -229,7 +237,9 @@ impl AutoGazeVisualizationState {
         let keyframe = dimensions_changed
             || self.interframe_output_rgba.len() != pixels * 4
             || self.frame_index == 0
-            || self.frame_index.is_multiple_of(self.keyframe_duration);
+            || (self.keyframe_duration > 0
+                && self.frame_index.is_multiple_of(self.keyframe_duration));
+        self.last_keyframe = keyframe;
         let updated_pixel_count = if keyframe { pixels } else { plan.pixel_count };
 
         if keyframe {
@@ -378,7 +388,7 @@ impl<B: Backend> AutoGazeTensorVisualizationState<B> {
     pub fn new(mode: AutoGazeVisualizationMode, keyframe_duration: usize) -> Self {
         Self {
             mode,
-            keyframe_duration: keyframe_duration.max(1),
+            keyframe_duration,
             frame_index: 0,
             width: 0,
             height: 0,
@@ -404,7 +414,7 @@ impl<B: Backend> AutoGazeTensorVisualizationState<B> {
             self.reset();
         }
         self.mode = mode;
-        self.keyframe_duration = keyframe_duration.max(1);
+        self.keyframe_duration = keyframe_duration;
     }
 
     pub fn reset(&mut self) {
@@ -442,12 +452,7 @@ impl<B: Backend> AutoGazeTensorVisualizationState<B> {
         let mut interframe_path = None;
         let (output, mask_pixel_count, updated_pixel_count) = match self.mode {
             AutoGazeVisualizationMode::FullBlend => {
-                let plan = fixation_effective_sparse_update_plan(
-                    width,
-                    height,
-                    points,
-                    options.cell_scale,
-                )?;
+                let plan = fixation_sparse_update_plan(width, height, points, options.cell_scale)?;
                 let alpha = alpha_mask_from_rects(width, height, &plan.rects);
                 let mask_pixel_count = plan.pixel_count;
                 let alpha = alpha_u8_to_unit_tensor(&alpha, width, height, device)?;
@@ -460,12 +465,7 @@ impl<B: Backend> AutoGazeTensorVisualizationState<B> {
                 )
             }
             AutoGazeVisualizationMode::Interframe => {
-                let plan = fixation_effective_sparse_update_plan(
-                    width,
-                    height,
-                    points,
-                    options.cell_scale,
-                )?;
+                let plan = fixation_sparse_update_plan(width, height, points, options.cell_scale)?;
                 let keyframe = self.is_keyframe(width, height);
                 let use_sparse = !keyframe
                     && should_use_sparse_tensor_update_rects(
@@ -525,7 +525,8 @@ impl<B: Backend> AutoGazeTensorVisualizationState<B> {
             || self.height != height
             || self.interframe_output_rgba.is_none()
             || self.frame_index == 0
-            || self.frame_index.is_multiple_of(self.keyframe_duration)
+            || (self.keyframe_duration > 0
+                && self.frame_index.is_multiple_of(self.keyframe_duration))
     }
 
     fn advance(&mut self, width: usize, height: usize, output: Tensor<B, 3>) {
@@ -660,14 +661,13 @@ fn alpha_mask_from_rects(width: usize, height: usize, rects: &[FixationPixelRect
     alpha
 }
 
-/// Build the sparse output/update footprint from multi-scale gaze tokens.
+/// Build a projected sparse footprint from multi-scale gaze tokens.
 ///
 /// AutoGaze predicts tokens from a multi-scale image pyramid. A coarse 2x2
-/// token is useful to draw in the mask panel at its native pyramid scale, but it
-/// is too broad for output reconstruction and codec-style update metrics. This
-/// helper projects every selected token onto the finest active display grid so
-/// gaze ratio and interframe output measure selected token cells rather than
-/// coarse full-frame overlays.
+/// token is drawn in the default visualization at its native pyramid scale so
+/// the mask panel and interframe output agree. Downstream codec experiments can
+/// use this helper to project selected tokens onto the finest active display
+/// grid when they want selected token cells rather than native pyramid cells.
 pub fn fixation_effective_alpha_mask(
     width: usize,
     height: usize,
@@ -908,49 +908,74 @@ pub fn fixation_effective_cell_rects(
         .collect()
 }
 
-fn effective_display_grid(points: &[FixationPoint]) -> usize {
-    points
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EffectiveDisplayGrid {
+    cols: usize,
+    rows: usize,
+}
+
+impl EffectiveDisplayGrid {
+    fn new(cols: usize, rows: usize) -> Self {
+        Self {
+            cols: cols.max(1),
+            rows: rows.max(1),
+        }
+    }
+}
+
+fn effective_display_grid(points: &[FixationPoint]) -> EffectiveDisplayGrid {
+    let (cols, rows) = points
         .iter()
         .copied()
         .filter(|point| point.confidence > 0.0)
         .map(|point| {
-            point
-                .cell_grid()
-                .unwrap_or_else(|| nearest_scale_grid(point))
+            let cols = (1.0 / point.cell_width().max(1.0e-6)).round();
+            let rows = (1.0 / point.cell_height().max(1.0e-6)).round();
+            (
+                finite_grid_extent(cols).unwrap_or_else(|| nearest_scale_grid(point)),
+                finite_grid_extent(rows).unwrap_or_else(|| nearest_scale_grid(point)),
+            )
         })
-        .max()
-        .unwrap_or(14)
-        .max(14)
+        .fold((14usize, 14usize), |(max_cols, max_rows), (cols, rows)| {
+            (max_cols.max(cols), max_rows.max(rows))
+        });
+    EffectiveDisplayGrid::new(cols, rows)
+}
+
+fn finite_grid_extent(value: f32) -> Option<usize> {
+    value.is_finite().then_some(value.max(1.0) as usize)
 }
 
 fn effective_point_pixel_rect(
     width: usize,
     height: usize,
     point: FixationPoint,
-    target_grid: usize,
+    target_grid: EffectiveDisplayGrid,
     cell_scale: f32,
 ) -> FixationPixelRect {
     let (row, col) = project_point_to_grid_cell(point, target_grid);
     if (cell_scale - 1.0).abs() <= f32::EPSILON {
-        let (x0, x1) = grid_cell_pixel_range(col, target_grid, width);
-        let (y0, y1) = grid_cell_pixel_range(row, target_grid, height);
+        let (x0, x1) = grid_cell_pixel_range(col, target_grid.cols, width);
+        let (y0, y1) = grid_cell_pixel_range(row, target_grid.rows, height);
         return FixationPixelRect { x0, x1, y0, y1 };
     }
 
-    let target_grid = target_grid.max(1);
-    let grid = target_grid as f64;
-    let extent = (cell_scale.max(1.0e-6) as f64 / grid).clamp(1.0e-6, 1.0);
-    let center_x = (col as f64 + 0.5) / grid;
-    let center_y = (row as f64 + 0.5) / grid;
-    let half = extent * 0.5;
+    let cols = target_grid.cols.max(1) as f64;
+    let rows = target_grid.rows.max(1) as f64;
+    let extent_x = (cell_scale.max(1.0e-6) as f64 / cols).clamp(1.0e-6, 1.0);
+    let extent_y = (cell_scale.max(1.0e-6) as f64 / rows).clamp(1.0e-6, 1.0);
+    let center_x = (col as f64 + 0.5) / cols;
+    let center_y = (row as f64 + 0.5) / rows;
+    let half_x = extent_x * 0.5;
+    let half_y = extent_y * 0.5;
     let (x0, x1) = pixel_range_f64(
-        (center_x - half).clamp(0.0, 1.0),
-        (center_x + half).clamp(0.0, 1.0),
+        (center_x - half_x).clamp(0.0, 1.0),
+        (center_x + half_x).clamp(0.0, 1.0),
         width,
     );
     let (y0, y1) = pixel_range_f64(
-        (center_y - half).clamp(0.0, 1.0),
-        (center_y + half).clamp(0.0, 1.0),
+        (center_y - half_y).clamp(0.0, 1.0),
+        (center_y + half_y).clamp(0.0, 1.0),
         height,
     );
     FixationPixelRect { x0, x1, y0, y1 }
@@ -1021,26 +1046,13 @@ fn merged_rect_row_spans(
     merged
 }
 
-fn project_point_to_grid_cell(point: FixationPoint, target_grid: usize) -> (usize, usize) {
-    let target_grid = target_grid.max(1);
-    if let Some(source_grid) = point.cell_grid() {
-        let source_grid = source_grid.max(1);
-        let source_col = ((point.x.clamp(0.0, 1.0 - f32::EPSILON) as f64 * source_grid as f64)
-            .floor() as usize)
-            .min(source_grid - 1);
-        let source_row = ((point.y.clamp(0.0, 1.0 - f32::EPSILON) as f64 * source_grid as f64)
-            .floor() as usize)
-            .min(source_grid - 1);
-        let col = ((2 * source_col + 1) * target_grid / (2 * source_grid)).min(target_grid - 1);
-        let row = ((2 * source_row + 1) * target_grid / (2 * source_grid)).min(target_grid - 1);
-        (row, col)
-    } else {
-        let grid = target_grid as f32;
-        (
-            (point.y.clamp(0.0, 1.0 - f32::EPSILON) * grid).floor() as usize,
-            (point.x.clamp(0.0, 1.0 - f32::EPSILON) * grid).floor() as usize,
-        )
-    }
+fn project_point_to_grid_cell(
+    point: FixationPoint,
+    target_grid: EffectiveDisplayGrid,
+) -> (usize, usize) {
+    let col = (point.x.clamp(0.0, 1.0 - f32::EPSILON) * target_grid.cols as f32).floor() as usize;
+    let row = (point.y.clamp(0.0, 1.0 - f32::EPSILON) * target_grid.rows as f32).floor() as usize;
+    (row.min(target_grid.rows - 1), col.min(target_grid.cols - 1))
 }
 
 fn grid_cell_pixel_range(index: usize, grid: usize, extent: usize) -> (usize, usize) {
@@ -1254,7 +1266,7 @@ fn mask_rgba_and_rects(
     cell_scale: f32,
 ) -> Result<MaskRgbaAndRects> {
     let _ = validate_rgba_dimensions(rgba, width, height)?;
-    let plan = fixation_effective_sparse_update_plan(width, height, points, cell_scale)?;
+    let plan = fixation_sparse_update_plan(width, height, points, cell_scale)?;
     let mask_rgba = fixation_scale_mask_rgba(width, height, points, cell_scale);
 
     Ok(MaskRgbaAndRects { mask_rgba, plan })
@@ -1491,7 +1503,7 @@ mod tests {
     }
 
     #[test]
-    fn visualization_draws_native_mask_but_updates_effective_footprint() {
+    fn visualization_uses_native_multiscale_cells_for_mask_and_output() {
         let points = [
             FixationPoint::with_grid_extent(0.25, 0.25, 0.5, 0.5, 1.0, 2),
             FixationPoint::with_grid_extent(0.75, 0.25, 0.5, 0.5, 1.0, 2),
@@ -1512,10 +1524,10 @@ mod tests {
             .filter(|pixel| pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0)
             .count();
 
-        assert_eq!(visualization.mask_pixel_count, 16);
-        assert_eq!(white_pixels, 16);
+        assert_eq!(visualization.mask_pixel_count, 28 * 28);
+        assert_eq!(white_pixels, 28 * 28);
         assert_eq!(colored_mask_pixels, 28 * 28);
-        assert_eq!(visualization.mask_ratio(), 16.0 / (28.0 * 28.0));
+        assert_eq!(visualization.mask_ratio(), 1.0);
     }
 
     #[test]
@@ -1691,6 +1703,7 @@ mod tests {
         let first_visualization = state
             .visualize_rgba(&first, 2, 1, &[point], 1.0, 1.0)
             .expect("first visualization");
+        assert!(state.last_frame_was_keyframe());
         assert_eq!(&first_visualization.blend_rgba[0..4], &[10, 0, 0, 255]);
         assert_eq!(&first_visualization.blend_rgba[4..8], &[20, 0, 0, 255]);
         assert_eq!(first_visualization.mask_ratio(), 0.5);
@@ -1700,6 +1713,7 @@ mod tests {
         let second_visualization = state
             .visualize_rgba(&second, 2, 1, &[point], 1.0, 1.0)
             .expect("second visualization");
+        assert!(!state.last_frame_was_keyframe());
         assert_eq!(
             &second_visualization.blend_rgba[0..8],
             &[30, 0, 0, 255, 20, 0, 0, 255]
@@ -1711,6 +1725,7 @@ mod tests {
         let third_visualization = state
             .visualize_rgba(&third, 2, 1, &[], 1.0, 1.0)
             .expect("third visualization");
+        assert!(!state.last_frame_was_keyframe());
         assert_eq!(
             &third_visualization.blend_rgba[0..8],
             &[30, 0, 0, 255, 20, 0, 0, 255]
@@ -1722,12 +1737,34 @@ mod tests {
         let fourth_visualization = state
             .visualize_rgba(&fourth, 2, 1, &[], 1.0, 1.0)
             .expect("fourth visualization");
+        assert!(state.last_frame_was_keyframe());
         assert_eq!(
             &fourth_visualization.blend_rgba[0..8],
             &[70, 0, 0, 255, 80, 0, 0, 255]
         );
         assert_eq!(fourth_visualization.mask_ratio(), 0.0);
         assert_eq!(fourth_visualization.update_ratio(), 1.0);
+    }
+
+    #[test]
+    fn zero_keyframe_duration_disables_periodic_interframe_keyframes() {
+        let point = FixationPoint::with_extent(0.25, 0.5, 0.5, 1.0, 1.0);
+        let mut state = AutoGazeVisualizationState::new(AutoGazeVisualizationMode::Interframe, 0);
+
+        let first = [10, 0, 0, 255, 20, 0, 0, 255];
+        state
+            .visualize_rgba(&first, 2, 1, &[point], 1.0, 1.0)
+            .expect("first visualization");
+        assert!(state.last_frame_was_keyframe());
+
+        for frame_idx in 1..8 {
+            let value = (30 + frame_idx) as u8;
+            let frame = [value, 0, 0, 255, value + 1, 0, 0, 255];
+            state
+                .visualize_rgba(&frame, 2, 1, &[point], 1.0, 1.0)
+                .expect("interframe visualization");
+            assert!(!state.last_frame_was_keyframe());
+        }
     }
 
     #[test]
@@ -1952,10 +1989,10 @@ mod tests {
         )];
         let many = [
             FixationPoint::with_grid_extent(0.02, 0.02, 0.04, 0.04, 1.0, 100),
-            FixationPoint::with_grid_extent(0.08, 0.02, 0.04, 0.04, 1.0, 100),
-            FixationPoint::with_grid_extent(0.14, 0.02, 0.04, 0.04, 1.0, 100),
-            FixationPoint::with_grid_extent(0.20, 0.02, 0.04, 0.04, 1.0, 100),
-            FixationPoint::with_grid_extent(0.26, 0.02, 0.04, 0.04, 1.0, 100),
+            FixationPoint::with_grid_extent(0.08, 0.14, 0.04, 0.04, 1.0, 100),
+            FixationPoint::with_grid_extent(0.14, 0.26, 0.04, 0.04, 1.0, 100),
+            FixationPoint::with_grid_extent(0.20, 0.38, 0.04, 0.04, 1.0, 100),
+            FixationPoint::with_grid_extent(0.26, 0.50, 0.04, 0.04, 1.0, 100),
         ];
         let mut state = AutoGazeTensorVisualizationState::<TestBackend>::new(
             AutoGazeVisualizationMode::Interframe,
@@ -2067,6 +2104,41 @@ mod tests {
             "native coarse cells should cover more pixels than finest-grid projected cells"
         );
         assert_eq!(effective.rects.len(), 2);
+    }
+
+    #[test]
+    fn effective_sparse_update_plan_uses_global_anyres_grid_extents() {
+        let width = 1920;
+        let height = 1080;
+        let coarse =
+            FixationPoint::with_grid_extent(0.5 / 18.0, 0.5 / 10.0, 1.0 / 18.0, 1.0 / 10.0, 1.0, 2);
+        let fine = FixationPoint::with_grid_extent(
+            125.5 / 126.0,
+            69.5 / 70.0,
+            1.0 / 126.0,
+            1.0 / 70.0,
+            1.0,
+            14,
+        );
+
+        let plan = fixation_effective_sparse_update_plan(width, height, &[coarse, fine], 1.0)
+            .expect("effective AnyRes update plan");
+
+        assert_eq!(plan.rects.len(), 2);
+        for rect in &plan.rects {
+            assert!(
+                rect.x1 - rect.x0 <= 16,
+                "AnyRes effective update rect should use the global 126-column grid, got {rect:?}"
+            );
+            assert!(
+                rect.y1 - rect.y0 <= 16,
+                "AnyRes effective update rect should use the global 70-row grid, got {rect:?}"
+            );
+        }
+        assert!(
+            plan.pixel_count <= 512,
+            "AnyRes effective output footprint should not fall back to the local 14x14 grid"
+        );
     }
 
     #[test]

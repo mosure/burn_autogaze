@@ -1379,12 +1379,12 @@ fn upstream_birds_visualization_matches_fixture_masks_without_model_snapshot() {
         }
         assert_eq!(
             panels.mask_pixel_count,
-            alpha_pixel_count(&effective_expected),
-            "fixture frame {frame_idx}: effective output/update footprint drifted"
+            alpha_pixel_count(&native_expected),
+            "fixture frame {frame_idx}: visualization output/update footprint drifted from native-scale upstream mask cells"
         );
         assert_eq!(
             panels.updated_pixel_count, panels.mask_pixel_count,
-            "full-blend output should update exactly the effective mask footprint"
+            "full-blend output should update exactly the visible native-scale mask footprint"
         );
     }
 
@@ -1403,15 +1403,15 @@ fn upstream_birds_visualization_matches_fixture_masks_without_model_snapshot() {
     );
     assert_eq!(first_panels.updated_pixel_count, width * height);
 
-    let second_effective = fixture_expected_alpha_from_scale_masks(
+    let second_native = fixture_expected_alpha_from_scale_masks(
         &tensors,
         width,
         height,
         1,
-        FixtureMaskProjection::EffectiveUpdate,
+        FixtureMaskProjection::NativeScale,
     );
     let mut expected_second = first.to_vec();
-    copy_expected_interframe_update(second, &mut expected_second, &second_effective);
+    copy_expected_interframe_update(second, &mut expected_second, &second_native);
     let second_panels = interframe_state
         .visualize_rgba_panels(
             second,
@@ -1424,11 +1424,11 @@ fn upstream_birds_visualization_matches_fixture_masks_without_model_snapshot() {
         .expect("visualize second interframe fixture frame");
     assert_eq!(
         second_panels.blend_rgba, expected_second,
-        "second interframe output must update only effective masked cells"
+        "second interframe output must update only visible native-scale masked cells"
     );
     assert_eq!(
         second_panels.updated_pixel_count,
-        alpha_pixel_count(&second_effective)
+        alpha_pixel_count(&second_native)
     );
 }
 

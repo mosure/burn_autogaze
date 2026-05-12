@@ -129,6 +129,46 @@ test("boots bevy wasm with static frames and no webcam", async ({ page }) => {
   expectNoKnownWasmPanic(consoleLines, pageErrors);
 });
 
+test("static wasm source defaults to live realtime dimensions", async ({ page }) => {
+  const consoleLines = [];
+  const pageErrors = [];
+
+  page.on("console", (message) => {
+    consoleLines.push(`${message.type()}: ${message.text()}`);
+  });
+  page.on("pageerror", (error) => {
+    pageErrors.push(error.message);
+  });
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: {
+        getUserMedia: async () => {
+          throw new Error("webcam should not be requested in static-source mode");
+        },
+      },
+    });
+  });
+
+  await page.goto("/?source=static&load-model=false&static-fps=1", {
+    waitUntil: "domcontentloaded",
+  });
+
+  await expect
+    .poll(
+      async () => page.evaluate(() => window.__autogazeFrameStats?.count || 0),
+      {
+        timeout: 60_000,
+      },
+    )
+    .toBeGreaterThanOrEqual(1);
+  const frameStats = await page.evaluate(() => window.__autogazeFrameStats);
+  expect(frameStats.lastWidth).toBe(640);
+  expect(frameStats.lastHeight).toBe(360);
+  expect(pageErrors).toEqual([]);
+  expectNoKnownWasmPanic(consoleLines, pageErrors);
+});
+
 test("starts wasm model load through async wgpu setup", async ({ page }) => {
   const consoleLines = [];
   const pageErrors = [];

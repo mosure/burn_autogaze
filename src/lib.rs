@@ -18,7 +18,8 @@ pub use config::{
 };
 pub use metrics::{
     AutoGazeEmaMetric, AutoGazeGazeRatioStats, AutoGazePsnrStats, DEFAULT_METRIC_EMA_ALPHA,
-    ema_metric, format_gaze_ratio_percent, format_psnr_db, fps_from_millis, sanitize_gaze_ratio,
+    ema_metric, format_fps, format_gaze_ratio_percent, format_psnr_db, fps_from_millis,
+    sanitize_gaze_ratio,
 };
 pub use model::{
     AutoGazeCausalLmOutput, AutoGazeGazingModel, AutoGazeGenerateOutput, AutoGazeLoadOptions,

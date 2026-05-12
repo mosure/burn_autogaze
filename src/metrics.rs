@@ -113,6 +113,10 @@ pub fn fps_from_millis(ms: f64) -> f64 {
     if ms > 0.0 { 1_000.0 / ms } else { 0.0 }
 }
 
+pub fn format_fps(value: f64) -> String {
+    format_fixed_one_decimal(value, 999.9, "---.-")
+}
+
 pub fn sanitize_gaze_ratio(ratio: f64) -> f64 {
     if ratio.is_finite() {
         ratio.clamp(0.0, 1.0)
@@ -123,19 +127,27 @@ pub fn sanitize_gaze_ratio(ratio: f64) -> f64 {
 
 pub fn format_gaze_ratio_percent(value: f64) -> String {
     if value.is_finite() {
-        format!("{:.1}%", sanitize_gaze_ratio(value) * 100.0)
+        format!("{:05.1}%", sanitize_gaze_ratio(value) * 100.0)
     } else {
-        "--.-%".to_string()
+        "---.-%".to_string()
     }
 }
 
 pub fn format_psnr_db(value: f64) -> String {
     if value.is_infinite() && value.is_sign_positive() {
-        "inf".to_string()
+        "999.9".to_string()
     } else if value.is_finite() {
-        format!("{value:.1}")
+        format_fixed_one_decimal(value, 999.9, "---.-")
     } else {
-        "--.-".to_string()
+        "---.-".to_string()
+    }
+}
+
+fn format_fixed_one_decimal(value: f64, max: f64, invalid: &str) -> String {
+    if value.is_finite() {
+        format!("{:05.1}", value.clamp(0.0, max))
+    } else {
+        invalid.to_string()
     }
 }
 
@@ -158,8 +170,8 @@ mod tests {
 
         stats.record(f64::NAN);
         assert_eq!(stats.current(), 0.0);
-        assert_eq!(format_gaze_ratio_percent(stats.current()), "0.0%");
-        assert_eq!(format_gaze_ratio_percent(f64::NAN), "--.-%");
+        assert_eq!(format_gaze_ratio_percent(stats.current()), "000.0%");
+        assert_eq!(format_gaze_ratio_percent(f64::NAN), "---.-%");
     }
 
     #[test]
@@ -169,22 +181,33 @@ mod tests {
         stats.record(f64::INFINITY);
         assert!(stats.is_initialized());
         assert!(stats.current().is_infinite());
-        assert_eq!(format_psnr_db(stats.current()), "inf");
+        assert_eq!(format_psnr_db(stats.current()), "999.9");
 
         stats.record(42.25);
         assert_eq!(stats.current(), 42.25);
         assert_eq!(stats.ema(), 42.25);
-        assert_eq!(format_psnr_db(stats.current()), "42.2");
+        assert_eq!(format_psnr_db(stats.current()), "042.2");
 
         stats.record(f64::NAN);
         assert_eq!(stats.current(), 42.25);
         assert_eq!(stats.ema(), 42.25);
-        assert_eq!(format_psnr_db(f64::NAN), "--.-");
+        assert_eq!(format_psnr_db(f64::NAN), "---.-");
     }
 
     #[test]
     fn fps_from_millis_handles_zero_and_positive_values() {
         assert_eq!(fps_from_millis(0.0), 0.0);
         assert_eq!(fps_from_millis(20.0), 50.0);
+    }
+
+    #[test]
+    fn display_metric_formatters_keep_fixed_width() {
+        for value in [0.0, 7.5, 51.25, 999.9, 1000.0, f64::NAN] {
+            assert_eq!(format_fps(value).len(), 5);
+            assert_eq!(format_gaze_ratio_percent(value / 100.0).len(), 6);
+        }
+        for value in [0.0, 7.5, 42.25, 100.0, 1000.0, f64::INFINITY, f64::NAN] {
+            assert_eq!(format_psnr_db(value).len(), 5);
+        }
     }
 }

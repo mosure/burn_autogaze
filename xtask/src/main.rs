@@ -889,14 +889,16 @@ fn bevy_perf_matrix(root: PathBuf, args: BevyPerfMatrixArgs) -> Result<()> {
         "--case-timeout-seconds must be greater than zero"
     );
     let runner = Runner::new(root, &args.common, None);
-    let common_static = [
-        "--image-path".to_owned(),
-        args.image.display().to_string(),
-        "--show-psnr=false".to_owned(),
-    ];
+    let static_source = ["--image-path".to_owned(), args.image.display().to_string()];
     let mut cases = vec![
+        ("default-static-gpu-interframe-psnr", vec![], true),
         (
-            "realtime-static-cpu",
+            "default-static-gpu-interframe-no-psnr",
+            vec!["--show-psnr=false"],
+            true,
+        ),
+        (
+            "realtime-static-cpu-fullblend-no-psnr",
             vec![
                 "--mode",
                 "realtime",
@@ -904,11 +906,12 @@ fn bevy_perf_matrix(root: PathBuf, args: BevyPerfMatrixArgs) -> Result<()> {
                 "cpu",
                 "--visualization-mode",
                 "full-blend",
+                "--show-psnr=false",
             ],
             true,
         ),
         (
-            "realtime-static-gpu",
+            "realtime-static-gpu-fullblend-no-psnr",
             vec![
                 "--mode",
                 "realtime",
@@ -916,11 +919,12 @@ fn bevy_perf_matrix(root: PathBuf, args: BevyPerfMatrixArgs) -> Result<()> {
                 "gpu",
                 "--visualization-mode",
                 "full-blend",
+                "--show-psnr=false",
             ],
             true,
         ),
         (
-            "realtime-static-interframe",
+            "realtime-static-cpu-interframe-no-psnr",
             vec![
                 "--mode",
                 "realtime",
@@ -928,18 +932,33 @@ fn bevy_perf_matrix(root: PathBuf, args: BevyPerfMatrixArgs) -> Result<()> {
                 "cpu",
                 "--visualization-mode",
                 "interframe",
+                "--show-psnr=false",
             ],
             true,
         ),
         (
-            "tiled-static-interframe",
+            "realtime-static-gpu-interframe-no-psnr",
+            vec![
+                "--mode",
+                "realtime",
+                "--display-transfer",
+                "gpu",
+                "--visualization-mode",
+                "interframe",
+                "--show-psnr=false",
+            ],
+            true,
+        ),
+        (
+            "tiled-static-gpu-interframe-no-psnr",
             vec![
                 "--mode",
                 "tiled",
                 "--display-transfer",
-                "cpu",
+                "gpu",
                 "--visualization-mode",
                 "interframe",
+                "--show-psnr=false",
             ],
             true,
         ),
@@ -947,24 +966,24 @@ fn bevy_perf_matrix(root: PathBuf, args: BevyPerfMatrixArgs) -> Result<()> {
     if args.camera {
         cases.extend([
             (
-                "realtime-camera",
+                "realtime-camera-gpu-interframe",
                 vec![
                     "--mode",
                     "realtime",
                     "--display-transfer",
-                    "cpu",
+                    "gpu",
                     "--visualization-mode",
-                    "full-blend",
+                    "interframe",
                 ],
                 false,
             ),
             (
-                "tiled-camera-interframe",
+                "tiled-camera-gpu-interframe",
                 vec![
                     "--mode",
                     "tiled",
                     "--display-transfer",
-                    "cpu",
+                    "gpu",
                     "--visualization-mode",
                     "interframe",
                 ],
@@ -980,7 +999,7 @@ fn bevy_perf_matrix(root: PathBuf, args: BevyPerfMatrixArgs) -> Result<()> {
     for (name, case_args, include_static) in cases {
         let mut app_args = Vec::<OsString>::new();
         if include_static {
-            app_args.extend(common_static.iter().cloned().map(OsString::from));
+            app_args.extend(static_source.iter().cloned().map(OsString::from));
         }
         app_args.extend(case_args.into_iter().map(OsString::from));
         app_args.extend([
@@ -1248,11 +1267,14 @@ fn validate_summary(data: &Value, require_hardware_adapter: bool) -> Result<()> 
         "p50_total_ms",
         "avg_model_ms",
         "avg_input_ms",
+        "avg_display_input_ms",
         "avg_pack_ms",
         "avg_visualize_ms",
         "avg_visualize_cpu_ms",
         "avg_tensor_ms",
         "avg_display_ms",
+        "avg_output_rgba_bytes",
+        "avg_output_tensor_bytes",
     ] {
         require_number(data, field, 0.0, None, false)?;
     }
@@ -1272,9 +1294,12 @@ fn validate_summary(data: &Value, require_hardware_adapter: bool) -> Result<()> 
         "processed_model_frames",
         "latest_trace_points",
         "latest_sequence",
+        "latest_output_rgba_bytes",
+        "latest_output_tensor_bytes",
     ] {
         require_int(data, field, 0, true)?;
     }
+    require_number(data, "latest_display_input_ms", 0.0, None, false)?;
     if let Some(target_frames) = require_int(data, "target_frames", 1, false)? {
         let processed = require_required_int(data, "processed_frames", 1)?;
         ensure!(
@@ -1290,7 +1315,7 @@ fn validate_summary(data: &Value, require_hardware_adapter: bool) -> Result<()> 
             "`p95_total_ms` must be >= `p50_total_ms`: {p95} < {p50}"
         );
     }
-    require_enum(data, "mode", &["resize-224", "tiled"], true)?;
+    require_enum(data, "mode", &["realtime", "resize-224", "tiled"], true)?;
     require_enum(
         data,
         "visualization_mode",
@@ -1304,8 +1329,21 @@ fn validate_summary(data: &Value, require_hardware_adapter: bool) -> Result<()> 
     require_nullable_enum(
         data,
         "latest_tensor_interframe_path",
-        &["dense-tensor", "sparse-rects"],
+        &["keyframe", "dense-mask", "dense-tensor", "sparse-rects"],
     )?;
+    require_enum(
+        data,
+        "display_residency",
+        &["gpu-tensor", "cpu-rgba", "mixed", "none"],
+        false,
+    )?;
+    require_enum(
+        data,
+        "display_input_residency",
+        &["none", "host-rgba-upload", "model-tensor-reuse"],
+        false,
+    )?;
+    require_enum(data, "burn_backend", &["webgpu"], false)?;
     for field in ["streaming_cache", "streaming_cache_effective"] {
         require_bool(data, field, false)?;
     }
@@ -1322,7 +1360,8 @@ fn validate_summary(data: &Value, require_hardware_adapter: bool) -> Result<()> 
         !(ema_inf && ema_psnr.is_some()),
         "`ema_psnr_db` must be null when `ema_psnr_db_infinite` is true"
     );
-    if show_psnr {
+    let psnr_samples = require_int(data, "psnr_samples", 0, false)?.unwrap_or(0);
+    if show_psnr && psnr_samples > 0 {
         ensure!(
             latest_psnr.is_some() || latest_inf,
             "PSNR is enabled but latest PSNR is neither finite nor infinite"
@@ -1331,6 +1370,11 @@ fn validate_summary(data: &Value, require_hardware_adapter: bool) -> Result<()> 
             ema_psnr.is_some() || ema_inf,
             "PSNR is enabled but EMA PSNR is neither finite nor infinite"
         );
+    } else if show_psnr {
+        ensure!(
+            latest_psnr.is_none() && !latest_inf && ema_psnr.is_none() && !ema_inf,
+            "PSNR has no non-keyframe samples yet, so latest/EMA PSNR must stay null"
+        );
     }
     for field in [
         "configured_max_in_flight",
@@ -1338,10 +1382,11 @@ fn validate_summary(data: &Value, require_hardware_adapter: bool) -> Result<()> 
         "frames_per_clip",
         "top_k",
         "tile_batch_size",
-        "inference_width",
-        "inference_height",
     ] {
         require_int(data, field, 1, false)?;
+    }
+    for field in ["inference_width", "inference_height"] {
+        require_nullable_int(data, field, 1, false)?;
     }
     require_int(data, "max_gaze_tokens_each_frame", 0, false)?;
     require_int(data, "tensor_sparse_update_max_rects", 0, false)?;
@@ -1420,11 +1465,14 @@ fn validate_bevy_perf_summary_self_test() -> Result<()> {
         "p95_total_ms": 19.0,
         "avg_model_ms": 6.0,
         "avg_input_ms": 1.0,
+        "avg_display_input_ms": 0.1,
         "avg_pack_ms": 1.0,
         "avg_visualize_ms": 2.0,
         "avg_visualize_cpu_ms": 1.0,
         "avg_tensor_ms": 1.0,
         "avg_display_ms": 1.0,
+        "avg_output_rgba_bytes": 0.0,
+        "avg_output_tensor_bytes": 11059200.0,
         "avg_gaze_update_ratio": 0.25,
         "latest_gaze_update_ratio": 0.2,
         "processed_frames": 4,
@@ -1435,6 +1483,9 @@ fn validate_bevy_perf_summary_self_test() -> Result<()> {
         "latest_height": 360,
         "latest_trace_points": 12,
         "latest_sequence": 3,
+        "latest_output_rgba_bytes": 0,
+        "latest_output_tensor_bytes": 11059200,
+        "latest_display_input_ms": 0.1,
         "target_frames": 4,
         "mode": "resize-224",
         "visualization_mode": "interframe",
@@ -1443,8 +1494,12 @@ fn validate_bevy_perf_summary_self_test() -> Result<()> {
         "xtask_case_timeout_seconds": 600,
         "xtask_cache_dir": "target/autogaze-bevy-perf/cache",
         "latest_tensor_interframe_path": "sparse-rects",
+        "display_residency": "gpu-tensor",
+        "display_input_residency": "model-tensor-reuse",
+        "burn_backend": "webgpu",
         "streaming_cache": true,
         "streaming_cache_effective": true,
+        "psnr_samples": 4,
         "latest_psnr_db": 35.0,
         "latest_psnr_db_infinite": false,
         "ema_psnr_db": 34.0,
@@ -1543,6 +1598,22 @@ fn require_required_int(data: &Value, field: &str, minimum: u64) -> Result<u64> 
         .ok_or_else(|| anyhow!("missing required integer field `{field}`"))
 }
 
+fn require_nullable_int(
+    data: &Value,
+    field: &str,
+    minimum: u64,
+    required: bool,
+) -> Result<Option<u64>> {
+    let Some(value) = data.get(field) else {
+        ensure!(!required, "missing required integer field `{field}`");
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    require_int(data, field, minimum, true)
+}
+
 fn require_bool(data: &Value, field: &str, required: bool) -> Result<Option<bool>> {
     let Some(value) = data.get(field) else {
         ensure!(!required, "missing required boolean field `{field}`");
@@ -1631,6 +1702,10 @@ fn print_perf_row(row: &Value) -> Result<()> {
         .get("avg_model_ms")
         .and_then(Value::as_f64)
         .unwrap_or(0.0);
+    let display_input = row
+        .get("avg_display_input_ms")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
     let gaze = row
         .get("avg_gaze_update_ratio")
         .and_then(Value::as_f64)
@@ -1639,6 +1714,24 @@ fn print_perf_row(row: &Value) -> Result<()> {
         .get("render_adapter_name")
         .and_then(Value::as_str)
         .unwrap_or("unknown adapter");
+    let residency = row
+        .get("display_residency")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let input_residency = row
+        .get("display_input_residency")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let output_rgba_mib = row
+        .get("avg_output_rgba_bytes")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0)
+        / (1024.0 * 1024.0);
+    let output_tensor_mib = row
+        .get("avg_output_tensor_bytes")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0)
+        / (1024.0 * 1024.0);
     let psnr = if row
         .get("latest_psnr_db_infinite")
         .and_then(Value::as_bool)
@@ -1651,7 +1744,7 @@ fn print_perf_row(row: &Value) -> Result<()> {
         "n/a".to_owned()
     };
     println!(
-        "  {case}: {fps:.2} output fps, total={total:.2} ms, model={model:.2} ms, gaze={:.2}%, psnr={psnr} dB, adapter={adapter}",
+        "  {case}: {fps:.2} output fps, total={total:.2} ms, model={model:.2} ms, display_input={display_input:.2} ms/{input_residency}, gaze={:.2}%, psnr={psnr} dB, residency={residency}, output={output_rgba_mib:.1} MiB rgba/{output_tensor_mib:.1} MiB tensor, adapter={adapter}",
         gaze * 100.0
     );
     Ok(())
@@ -2253,11 +2346,14 @@ mod tests {
             "p95_total_ms": 19.0,
             "avg_model_ms": 6.0,
             "avg_input_ms": 1.0,
+            "avg_display_input_ms": 0.1,
             "avg_pack_ms": 1.0,
             "avg_visualize_ms": 2.0,
             "avg_visualize_cpu_ms": 1.0,
             "avg_tensor_ms": 1.0,
             "avg_display_ms": 1.0,
+            "avg_output_rgba_bytes": 0.0,
+            "avg_output_tensor_bytes": 11059200.0,
             "avg_gaze_update_ratio": 0.25,
             "latest_gaze_update_ratio": 0.2,
             "processed_frames": 4,
@@ -2268,13 +2364,20 @@ mod tests {
             "latest_height": 360,
             "latest_trace_points": 12,
             "latest_sequence": 3,
+            "latest_output_rgba_bytes": 0,
+            "latest_output_tensor_bytes": 11059200,
+            "latest_display_input_ms": 0.1,
             "target_frames": 4,
             "mode": "resize-224",
             "visualization_mode": "interframe",
             "display_transfer": "gpu",
             "latest_tensor_interframe_path": "sparse-rects",
+            "display_residency": "gpu-tensor",
+            "display_input_residency": "model-tensor-reuse",
+            "burn_backend": "webgpu",
             "streaming_cache": true,
             "streaming_cache_effective": true,
+            "psnr_samples": 4,
             "latest_psnr_db": 35.0,
             "latest_psnr_db_infinite": false,
             "ema_psnr_db": 34.0,

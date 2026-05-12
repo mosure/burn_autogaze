@@ -1,9 +1,10 @@
 use bevy::app::AppExit;
 #[cfg(not(target_arch = "wasm32"))]
 use bevy_burn_autogaze::{
-    BevyAutoGazeMode, BevyDisplayTransfer, DEFAULT_TILED_INFERENCE_WIDTH, default_frames_per_clip,
-    default_inference_dimensions, default_max_gaze_tokens_each_frame, default_tile_batch_size,
-    default_top_k,
+    BevyAutoGazeMode, BevyDisplayTransfer, DEFAULT_BEVY_STREAMING_CACHE,
+    DEFAULT_BIRDS_KEYFRAME_DURATION, DEFAULT_BLEND_ALPHA, DEFAULT_TILED_INFERENCE_WIDTH,
+    default_frames_per_clip, default_inference_dimensions, default_max_gaze_tokens_each_frame,
+    default_tile_batch_size, default_top_k,
 };
 use bevy_burn_autogaze::{BevyBurnAutoGazeConfig, run_app};
 #[cfg(not(target_arch = "wasm32"))]
@@ -23,7 +24,7 @@ enum NativeInferenceMode {
         alias = "resize-224",
         alias = "resize-to-model",
         alias = "fast",
-        help = "Resize frames before the model pass; fastest and default."
+        help = "Resize frames before the model pass; fastest."
     )]
     Realtime,
     #[value(
@@ -152,7 +153,7 @@ impl FromStr for TaskLossRequirementArg {
 #[command(
     about = "native Bevy viewer for burn_autogaze",
     version,
-    long_about = "Runs the burn_autogaze video pipeline with camera or static-image input and renders Input | Mask | Output through Bevy. The default realtime mode requests a 640px-wide stream before the model's internal 224px pass; tiled mode is higher fidelity and slower."
+    long_about = "Runs the burn_autogaze video pipeline with camera or static-image input and renders Input | Mask | Output through Bevy. The default path is a continuous realtime streaming configuration: 640px source resize, 16-frame rolling KV window, the model's configured generation budget, GPU display transfer, PSNR overlay, interframe output, and no periodic visualization keyframes. Use --streaming-cache=false for full-window comparison, or --mode tiled plus explicit 1080p/docs settings for full-resolution inspection."
 )]
 struct NativeArgs {
     #[arg(
@@ -181,7 +182,7 @@ struct NativeArgs {
 
     #[arg(
         long,
-        default_value_t = false,
+        default_value_t = true,
         action = ArgAction::Set,
         help = "Show PSNR between the input frame and rendered output."
     )]
@@ -221,7 +222,7 @@ struct NativeArgs {
         long,
         value_enum,
         default_value_t = NativeInferenceMode::Realtime,
-        help = "Inference path. Aliases: resize-224, fast, tile-224, full-res, anyres."
+        help = "Inference path. Default is realtime for live throughput. Aliases: resize-224, fast, tile-224, full-res, anyres."
     )]
     mode: NativeInferenceMode,
 
@@ -237,7 +238,7 @@ struct NativeArgs {
         long,
         value_name = "COUNT",
         value_parser = parse_usize,
-        help = "Model-side generated-token cap. Defaults to 8 in realtime and 24 per tile in tiled mode; pass 0 to use the model's configured inference budget."
+        help = "Model-side generated-token cap. Defaults to the model's configured inference budget in realtime and 24 in tiled mode; 0 also uses the model budget."
     )]
     max_gaze_tokens_each_frame: Option<usize>,
 
@@ -245,7 +246,7 @@ struct NativeArgs {
         long,
         value_name = "COUNT",
         value_parser = parse_nonzero_usize,
-        help = "Number of 224px tiles traced together in tiled mode. Defaults to 64 so 720p is one tile batch."
+        help = "Number of 224px tiles traced together in tiled mode. Defaults to 64 so 720p fits in one model batch."
     )]
     tile_batch_size: Option<usize>,
 
@@ -267,7 +268,7 @@ struct NativeArgs {
         long,
         value_name = "COUNT",
         value_parser = parse_nonzero_usize,
-        help = "Decoder context horizon in frames. Defaults to 2. Realtime mode advances this as a streaming KV cache by default; larger values increase WebGPU attention memory."
+        help = "Decoder context horizon in frames. Defaults to 16 in realtime and 2 in tiled mode. Realtime mode advances this as a streaming KV cache by default; larger values increase WebGPU attention memory."
     )]
     frames_per_clip: Option<usize>,
 
@@ -285,7 +286,7 @@ struct NativeArgs {
         alias = "width",
         value_name = "PX",
         value_parser = parse_positive_u32,
-        help = "Frame width before inference. Defaults to 640 in realtime and 1280 in tiled mode. If only height is set, width preserves input aspect."
+        help = "Frame width before inference. Defaults to 1280 in tiled mode and 640 in realtime. If only height is set, width preserves input aspect."
     )]
     inference_width: Option<u32>,
 
@@ -312,7 +313,7 @@ struct NativeArgs {
         long,
         value_name = "0..1",
         value_parser = parse_alpha,
-        default_value_t = bevy_burn_autogaze::DEFAULT_BLEND_ALPHA,
+        default_value_t = DEFAULT_BLEND_ALPHA,
         help = "Alpha used when blending gaze-selected regions with the input."
     )]
     blend_alpha: f32,
@@ -328,17 +329,17 @@ struct NativeArgs {
     #[arg(
         long,
         value_name = "FRAMES",
-        value_parser = parse_nonzero_usize,
-        default_value_t = bevy_burn_autogaze::DEFAULT_KEYFRAME_DURATION,
-        help = "Interframe mode keyframe interval."
+        value_parser = parse_usize,
+        default_value_t = DEFAULT_BIRDS_KEYFRAME_DURATION,
+        help = "Interframe mode periodic keyframe interval. 0 disables periodic keyframes; the first frame and dimension changes still reset state."
     )]
     keyframe_duration: usize,
 
     #[arg(
         long,
         value_enum,
-        default_value_t = NativeDisplayTransfer::Cpu,
-        help = "Display transfer path. cpu is the current fastest app path; gpu exercises Bevy/Burn shared-device texture interop."
+        default_value_t = NativeDisplayTransfer::Gpu,
+        help = "Display transfer path. gpu uses Bevy/Burn shared-device texture interop; cpu reads RGBA visualization through host memory."
     )]
     display_transfer: NativeDisplayTransfer,
 
@@ -364,9 +365,9 @@ struct NativeArgs {
 
     #[arg(
         long,
-        default_value_t = true,
+        default_value_t = DEFAULT_BEVY_STREAMING_CACHE,
         action = ArgAction::Set,
-        help = "Use a streaming decoder KV cache for realtime mode so each inference advances only the newest frame."
+        help = "Use the continuous rolling decoder KV cache in realtime mode so each inference advances only the newest frame. Disable for full-window comparison."
     )]
     streaming_cache: bool,
 
@@ -630,8 +631,10 @@ fn runtime_config() -> BevyBurnAutoGazeConfig {
 mod tests {
     use super::*;
     use bevy_burn_autogaze::{
-        DEFAULT_REALTIME_INFERENCE_WIDTH, DEFAULT_TILED_INFERENCE_WIDTH,
-        DEFAULT_TILED_MAX_GAZE_TOKENS, DEFAULT_TILED_TILE_BATCH_SIZE, DEFAULT_TILED_TOP_K,
+        DEFAULT_BEVY_REALTIME_FRAMES_PER_CLIP, DEFAULT_BEVY_TILED_TOP_K,
+        DEFAULT_REALTIME_INFERENCE_WIDTH, DEFAULT_REALTIME_MAX_GAZE_TOKENS, DEFAULT_REALTIME_TOP_K,
+        DEFAULT_TILED_FRAMES_PER_CLIP, DEFAULT_TILED_INFERENCE_WIDTH,
+        DEFAULT_TILED_MAX_GAZE_TOKENS, DEFAULT_TILED_TILE_BATCH_SIZE,
     };
     use clap::CommandFactory;
 
@@ -657,7 +660,32 @@ mod tests {
     }
 
     #[test]
-    fn native_cli_uses_performant_tiled_defaults() {
+    fn native_cli_defaults_use_upstream_realtime_gpu_profile() {
+        let args = NativeArgs::parse_from(["bevy_burn_autogaze"]);
+        let config = BevyBurnAutoGazeConfig::from(args);
+
+        assert_eq!(config.mode, BevyAutoGazeMode::Resize224);
+        assert_eq!(config.top_k, DEFAULT_REALTIME_TOP_K);
+        assert_eq!(
+            config.max_gaze_tokens_each_frame,
+            DEFAULT_REALTIME_MAX_GAZE_TOKENS
+        );
+        assert_eq!(
+            config.frames_per_clip,
+            DEFAULT_BEVY_REALTIME_FRAMES_PER_CLIP
+        );
+        assert_eq!(
+            config.inference_width,
+            Some(DEFAULT_REALTIME_INFERENCE_WIDTH)
+        );
+        assert_eq!(config.inference_height, None);
+        assert_eq!(config.display_transfer, BevyDisplayTransfer::Gpu);
+        assert!(config.show_psnr);
+        assert_eq!(config.streaming_cache, DEFAULT_BEVY_STREAMING_CACHE);
+    }
+
+    #[test]
+    fn native_cli_tiled_defaults_use_bounded_generation_budget() {
         let args = NativeArgs {
             press_esc_to_close: true,
             show_fps: true,
@@ -678,15 +706,15 @@ mod tests {
             inference_width: None,
             inference_height: None,
             mask_cell_scale: 1.0,
-            blend_alpha: bevy_burn_autogaze::DEFAULT_BLEND_ALPHA,
+            blend_alpha: DEFAULT_BLEND_ALPHA,
             visualization_mode: NativeVisualizationMode::Interframe,
-            keyframe_duration: bevy_burn_autogaze::DEFAULT_KEYFRAME_DURATION,
-            display_transfer: NativeDisplayTransfer::Cpu,
+            keyframe_duration: DEFAULT_BIRDS_KEYFRAME_DURATION,
+            display_transfer: NativeDisplayTransfer::Gpu,
             tensor_sparse_update_max_rects:
                 bevy_burn_autogaze::DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RECTS,
             tensor_sparse_update_max_ratio:
                 bevy_burn_autogaze::DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RATIO,
-            streaming_cache: true,
+            streaming_cache: DEFAULT_BEVY_STREAMING_CACHE,
             require_hardware_adapter: false,
             log_pipeline_timing: false,
             perf_summary_frames: None,
@@ -695,22 +723,22 @@ mod tests {
         let config = BevyBurnAutoGazeConfig::from(args);
 
         assert_eq!(config.mode, BevyAutoGazeMode::Tile224);
-        assert_eq!(config.top_k, DEFAULT_TILED_TOP_K);
+        assert_eq!(config.top_k, DEFAULT_BEVY_TILED_TOP_K);
         assert_eq!(
             config.max_gaze_tokens_each_frame,
             DEFAULT_TILED_MAX_GAZE_TOKENS
         );
         assert_eq!(config.tile_batch_size, DEFAULT_TILED_TILE_BATCH_SIZE);
-        assert_eq!(
-            config.frames_per_clip,
-            bevy_burn_autogaze::DEFAULT_TILED_FRAMES_PER_CLIP
-        );
+        assert_eq!(config.frames_per_clip, DEFAULT_TILED_FRAMES_PER_CLIP);
         assert_eq!(
             config.max_in_flight,
             bevy_burn_autogaze::DEFAULT_MAX_IN_FLIGHT
         );
         assert_eq!(config.inference_width, Some(DEFAULT_TILED_INFERENCE_WIDTH));
         assert_eq!(config.inference_height, None);
+        assert_eq!(config.blend_alpha, DEFAULT_BLEND_ALPHA);
+        assert_eq!(config.keyframe_duration, DEFAULT_BIRDS_KEYFRAME_DURATION);
+        assert_eq!(config.display_transfer, BevyDisplayTransfer::Gpu);
         assert_eq!(
             config.tensor_sparse_update_max_rects,
             bevy_burn_autogaze::DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RECTS

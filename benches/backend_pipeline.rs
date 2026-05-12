@@ -263,6 +263,27 @@ const REAL_CACHE_CASES: &[CacheCase] = &[
         max_tokens: 10,
     },
     CacheCase {
+        name: "realtime-640x360-16f-max2",
+        width: 640,
+        height: 360,
+        frames: 16,
+        max_tokens: 2,
+    },
+    CacheCase {
+        name: "realtime-640x360-16f-max10",
+        width: 640,
+        height: 360,
+        frames: 16,
+        max_tokens: 10,
+    },
+    CacheCase {
+        name: "realtime-640x360-16f-max12",
+        width: 640,
+        height: 360,
+        frames: 16,
+        max_tokens: 12,
+    },
+    CacheCase {
         name: "720p-2f-max2",
         width: 1280,
         height: 720,

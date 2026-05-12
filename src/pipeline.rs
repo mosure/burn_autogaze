@@ -284,18 +284,20 @@ pub fn rgba_clip_to_tensor<B: Backend>(
         rgba.len()
     );
 
-    let mut values = Vec::with_capacity(shape.clip_len * 3 * pixels_per_frame);
+    let mut values = vec![0.0; shape.clip_len * 3 * pixels_per_frame];
     // The upstream processor emits RGB video as [batch, time, channel, height, width].
     // Alpha is intentionally ignored.
     for frame in 0..shape.clip_len {
         let frame_offset = frame * pixels_per_frame * 4;
-        for channel in 0..3 {
-            for pixel in 0..pixels_per_frame {
-                values.push(autogaze_processor_value(
-                    rgba[frame_offset + pixel * 4 + channel],
-                    channel,
-                ));
-            }
+        let output_offset = frame * 3 * pixels_per_frame;
+        let red_offset = output_offset;
+        let green_offset = output_offset + pixels_per_frame;
+        let blue_offset = output_offset + 2 * pixels_per_frame;
+        let frame_rgba = &rgba[frame_offset..frame_offset + pixels_per_frame * 4];
+        for (pixel, channels) in frame_rgba.chunks_exact(4).enumerate() {
+            values[red_offset + pixel] = autogaze_processor_value(channels[0], 0);
+            values[green_offset + pixel] = autogaze_processor_value(channels[1], 1);
+            values[blue_offset + pixel] = autogaze_processor_value(channels[2], 2);
         }
     }
 

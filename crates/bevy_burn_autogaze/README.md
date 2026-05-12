@@ -7,19 +7,21 @@ and UI layer; platform code only supplies frames and model bytes.
 
 ```sh
 cargo run -p bevy_burn_autogaze -- \
-  --model-dir /home/mosure/.cache/huggingface/hub/models--nvidia--AutoGaze/snapshots/5100fae739ec1bf3f875914fa1b703846a18943a \
-  --mode realtime
+  --model-dir /home/mosure/.cache/huggingface/hub/models--nvidia--AutoGaze/snapshots/5100fae739ec1bf3f875914fa1b703846a18943a
 ```
 
 Use `--image-path path/to/frame.png` to run from a static image instead of the
-native camera. `--mode tiled` runs the tiled full-resolution path. Common
-viewer/inference knobs include `--top-k`, `--frames-per-clip`,
+native camera. The default path is a continuous realtime profile: `resize-224`,
+640px aspect-preserving input, 16-frame rolling KV window, the model-configured
+generation budget, GPU display transfer, PSNR overlay, interframe output, and no
+periodic visualization keyframes. Common viewer/inference knobs include `--top-k`, `--frames-per-clip`,
 `--max-in-flight`, `--max-gaze-tokens-each-frame`, `--inference-width`,
 `--inference-height`, `--task-loss-requirement`, `--disable-task-loss-requirement`,
 `--mask-cell-scale`, `--blend-alpha`, and `--show-fps`. `--show-gaze-ratio`
 toggles the text overlay for per-frame and EMA output update ratio.
-`--show-psnr=true` toggles PSNR in dB between the current input and rendered
-output; the pixel comparison is skipped when this overlay is disabled.
+`--show-psnr=false` hides PSNR in dB between the current input and rendered
+output; the pixel comparison is skipped when this overlay is disabled. GPU
+display transfer remains active when PSNR is enabled.
 `--help` lists the accepted values and aliases for mode-like options.
 `--log-pipeline-timing` prints source capture, resize/prep, pack, input
 upload/preprocess, model, visualization, and Bevy texture-update timing every
@@ -31,28 +33,37 @@ Use `--perf-summary-frames N` with `--image-path` or another deterministic
 source to process `N` inference outputs, print a JSON FPS/timing summary, and
 exit. Add `--perf-summary-path target/autogaze-bevy-perf/run.json` to write the
 same summary as a JSON artifact for hardware throughput reports.
-The viewer display default is `--visualization-mode interframe`, `--top-k 10`,
-`--max-gaze-tokens-each-frame 8`, and `--frames-per-clip 2` for realtime use.
-In `tiled` mode the defaults are `--top-k 2`,
-`--max-gaze-tokens-each-frame 24`, `--frames-per-clip 2`, and
-`--tile-batch-size 64`. Leave `--streaming-cache=true` enabled in realtime mode
-so the decoder advances one new frame through the KV cache per inference.
+The docs birds asset profile remains available explicitly:
+
+```sh
+cargo run -p bevy_burn_autogaze -- \
+  --mode tiled --visualization-mode interframe \
+  --max-gaze-tokens-each-frame 0 --frames-per-clip 16 \
+  --tile-batch-size 4 --inference-width 1920 --inference-height 1080 \
+  --blend-alpha 0.55 --keyframe-duration 0
+```
+
+Realtime mode uses `--streaming-cache=true` by default. The cache advances one
+new frame at a time and evicts the oldest completed frame span from its rolling
+KV window instead of cold-starting at the horizon. Pass
+`--streaming-cache=false` for full-window comparison runs that reprocess the
+whole clip each inference.
 `--max-in-flight 1` is the default camera admission policy: if inference is busy,
 new camera frames refresh the buffered input window but do not queue stale model
-jobs. Realtime streaming-cache mode is always kept to one in-flight task so KV
-state advances in order; values above `1` apply to tiled or
-`--streaming-cache=false` experiments. Use `--streaming-cache=false` for
-full-window comparison. A max-gaze value of `0` uses the upstream model default,
-which is `198` for the NVIDIA config. The maximum frame budget is
+jobs. Realtime streaming-cache mode is always kept to one in-flight task when
+enabled so KV state advances in order; values above `1` apply to tiled or
+full-window non-streaming experiments. A max-gaze value of `0` uses the upstream
+model default, which is `198` for the NVIDIA config and is also the realtime
+default. The maximum frame budget is
 `max-gaze-tokens-each-frame * tile-count`, before task-loss stopping and
-confidence filtering. The native CLI defaults to a 640px-wide
-aspect-preserving source frame in `realtime` mode and 1280px-wide source frames
-in `tiled` mode. The native camera path requests a matching 16:9 stream when
-height is omitted. Pass explicit `--top-k`, `--tile-batch-size`,
+confidence filtering. `--mode realtime` defaults to a 640px-wide
+aspect-preserving source frame. `--mode tiled` defaults to a bounded 1280px-wide
+aspect-preserving source frame, `--top-k 2`, 24 generated tokens per tile, and
+a tile batch size of 64. Pass explicit `--top-k`, `--tile-batch-size`,
 `--inference-width`, and `--inference-height` values for fixed full-resolution
 inspection.
 `--display-transfer gpu` exercises the shared Bevy/Burn WebGPU texture bridge;
-the default CPU transfer is currently the fastest measured app path.
+it is the default display path for live runs.
 For GPU interframe display, `--tensor-sparse-update-max-rects` and
 `--tensor-sparse-update-max-ratio` choose when the tensor compositor uses sparse
 rectangle copies instead of the dense mask path; use `0` rects to force dense
@@ -71,21 +82,21 @@ command path. Use `--case-timeout-seconds N` to override the default per-case
 timeout for slow first-build or driver-tuning hosts.
 
 `--visualization-mode full-blend` renders the current frame's alpha-blended
-mask. The default `--blend-alpha` is intentionally subtle so the output panel
-keeps the input frame readable; raise it when you want a stronger white update
-overlay. The center mask panel colors the decoded multi-scale AutoGaze cells by
-scale and draws crisp cell bounds. `--visualization-mode interframe
---keyframe-duration 30` preserves the previous output outside masked cells,
-updates masked cells to the current input, and redraws a full keyframe every 30
-processed frames. The gaze-ratio overlay reports the percentage of output pixels
-updated on the current frame plus an EMA across processed frames. The PSNR
-overlay reports current-frame and EMA dB for the output column compared to the
-current input frame.
+mask. The default `--blend-alpha 0.38` keeps live overlays readable; the docs
+birds profile uses `0.55`. The center mask panel colors the decoded multi-scale
+AutoGaze cells by scale and draws crisp cell bounds. `--visualization-mode
+interframe --keyframe-duration 0` preserves the previous output outside masked
+cells and updates masked cells to the current input without periodic full-frame
+refreshes. Positive keyframe durations remain available for debugging. The
+gaze-ratio overlay reports the percentage of output pixels updated on the
+current frame plus an EMA across processed frames. The PSNR overlay reports
+current-frame and EMA dB for the output column compared to the current input
+frame.
 
 In `full-blend` mode the update ratio reports selected effective mask coverage
-as a percentage of the full source frame. In `interframe` mode keyframes are
-`100%`; intermediate frames report masked-cell coverage as a percentage of the
-full source frame.
+as a percentage of the full source frame. In `interframe` mode scheduled
+keyframes are excluded from the UI metric samples; intermediate frames report
+masked-cell coverage as a percentage of the full source frame.
 When the model is ready and inference is busy, camera frames continue to be
 buffered for the next clip but the displayed texture is not replaced by raw live
 preview frames; this keeps processed output monotonic and avoids apparent
@@ -108,7 +119,7 @@ UI is rendered by Bevy into the `#bevy` canvas, matching the native path. Pass
 the same viewer/inference knobs as query parameters:
 
 ```text
-http://localhost:8080/?mode=tiled&visualization-mode=interframe&keyframe-duration=12&frames-per-clip=2&inference-width=1920&inference-height=1080&task-loss-requirement=0.7&tile-batch-size=4&show-fps=true&show-gaze-ratio=true&show-psnr=true
+http://localhost:8080/?mode=tiled&visualization-mode=interframe&keyframe-duration=0&frames-per-clip=16&inference-width=1920&inference-height=1080&tile-batch-size=4&show-fps=true&show-gaze-ratio=true&show-psnr=true
 ```
 
 Use `?source=static` for a generated static frame, or `?image-url=./frame.png`

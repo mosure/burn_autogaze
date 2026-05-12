@@ -280,9 +280,9 @@ camera frontends to drop late model results instead of rendering frames out of
 order.
 `AutoGazeRealtimePolicy` captures the default one-in-flight frame admission and
 preview behavior used by realtime wrappers; Bevy exposes this as
-`--max-in-flight` / `max-in-flight`. Realtime streaming-cache mode keeps the
-effective policy to one in-flight task so KV state advances in order; higher
-limits are for tiled or full-window non-streaming runs.
+`--max-in-flight` / `max-in-flight`. Default realtime streaming-cache mode keeps
+the effective policy to one in-flight task so KV state advances in order;
+higher limits are for tiled or full-window non-streaming runs.
 `should_use_streaming_cache` centralizes the rule that streaming KV cache is only
 used for multi-frame resize-mode realtime inference.
 
@@ -343,17 +343,18 @@ and returns binary token-cell mask, visualization output, and `input | mask |
 output` RGBA buffers (`output_rgba()` is the preferred accessor, with
 `blend_rgba()` kept for compatibility). outputs also expose mask/update pixel
 counts, ratios, and output PSNR in dB against the latest input frame. The
-low-level wasm defaults mirror the realtime viewer display defaults:
+low-level wasm defaults remain resize-oriented:
 `top_k=10`, model-config generation budget, `tile_batch_size=64`, and
-`blend_alpha=0.38`. use `set_visualization_mode("interframe")` and
+`blend_alpha=0.38`. use `set_anyres_tiled_mode(224)`,
+`set_visualization_mode("interframe")`, and
 `set_keyframe_duration(n)` to enable stateful interframe output-stream updates.
 this is the low-level wasm-bindgen api demo.
 
 ## bevy
 
 ```sh
+cargo run -p bevy_burn_autogaze
 cargo run -p bevy_burn_autogaze -- --mode realtime
-cargo run -p bevy_burn_autogaze -- --mode realtime --visualization-mode full-blend
 cargo run -p bevy_burn_autogaze -- --mode tiled --visualization-mode interframe
 
 cd crates/bevy_burn_autogaze
@@ -367,41 +368,41 @@ I/O (`nokhwa` or `--image-path` natively, browser camera plus `frame_input` on
 wasm). both modes show the same bevy-rendered `input | mask | output`
 visualization plus toggleable FPS, gaze/update-ratio, and output-PSNR overlays.
 
-Set `--show-fps=false` or `--show-gaze-ratio=false` to hide the default text
-overlays, or `--show-psnr=true` to enable output PSNR. Set
+Set `--show-fps=false`, `--show-gaze-ratio=false`, or `--show-psnr=false` to
+hide the default text overlays. Set
 `--log-pipeline-timing` to print source capture, resize/prep, pack, input
-upload/preprocess, model, visualization, display, and total timing. The native CLI
-defaults to `--top-k 10`, `--max-gaze-tokens-each-frame 8`,
-`--frames-per-clip 2`, and a 640px-wide
-aspect-preserving source resize for realtime use. `--mode tiled`
-defaults to a 1280px-wide source frame, `--top-k 2`,
-`--max-gaze-tokens-each-frame 24`, `--frames-per-clip 2`, and
-`--tile-batch-size 64`. In realtime mode `--streaming-cache=true`
-keeps decoder KV state across frames and advances one new frame per inference.
-Pass `--streaming-cache=false` for direct full-window comparison. Pass
-`--max-gaze-tokens-each-frame 0` for upstream-budget inspection, or pass
-explicit `--max-gaze-tokens-each-frame`,
+upload/preprocess, model, visualization, display, and total timing. The native
+CLI default is the live realtime profile: `--mode realtime`,
+`--visualization-mode interframe`, `--top-k 10`,
+`--max-gaze-tokens-each-frame 0` (the upstream model budget, 198 tokens for
+NVIDIA AutoGaze), `--frames-per-clip 16`, 640px aspect-preserving input,
+`--display-transfer gpu`, PSNR overlay, `--blend-alpha 0.38`,
+`--keyframe-duration 0`, and `--streaming-cache=true` for a continuous rolling
+KV window. Pass `--streaming-cache=false` for a full-window comparison that
+reprocesses the whole clip each inference. Pass explicit
+`--max-gaze-tokens-each-frame`,
 `--top-k`, `--tile-batch-size`, `--inference-width`, and
 `--inference-height` values for fixed full-resolution inspection. Native
 `realtime` requests a 640x360 camera stream when height is omitted so camera
-decode does not dominate the realtime path.
+decode does not dominate the realtime path. `--mode tiled` defaults to a bounded
+1280px-wide aspect-preserving input, `--top-k 2`, 24 generated tokens per tile,
+and tile batch size 64.
 `--display-transfer gpu` enables the Bevy/Burn shared-device texture bridge;
-the default CPU transfer is currently faster in the measured viewer path.
+it is the default display path for live runs.
 For GPU display-transfer interframe runs, `--tensor-sparse-update-max-rects`
 and `--tensor-sparse-update-max-ratio` control when the tensor compositor uses a
 sparse rectangle copy instead of the dense mask path; pass `0` rects to force
 dense tensor updates.
 Use `--require-hardware-adapter=true` for throughput runs that should fail fast
 instead of reporting CPU/software render-adapter numbers.
-The output panel uses a subtle `--blend-alpha` default, and processed inference
-frames are not overwritten by raw camera previews while a model task is in
+Processed inference frames are not overwritten by raw camera previews while a model task is in
 flight; this keeps wasm output monotonic and makes interframe accumulation
 easier to inspect.
 Use `--perf-summary-frames N` (or `perf-summary-frames=N` on wasm) for a
 deterministic static-source perf run: native prints a JSON summary and exits,
 while wasm exposes live samples on `window.__autogazePerf` and the final summary
 on `window.__autogazePerfSummary`. Both include the latest frame dimensions,
-FPS, gaze ratio, PSNR fields when enabled, frame counts, tensor interframe path,
+FPS, gaze ratio, PSNR fields, frame counts, tensor interframe path,
 render adapter metadata, and the configured/effective realtime admission
 policy, including the tensor sparse-update policy. Native runs can also pass
 `--perf-summary-path target/perf.json` to write the same summary directly as a
@@ -413,14 +414,18 @@ The native app accepts CLI flags; the wasm app accepts the same viewer/inference
 knobs through query parameters:
 
 ```text
-http://localhost:8080/?mode=tiled&visualization-mode=interframe&keyframe-duration=12&frames-per-clip=2&inference-width=1920&inference-height=1080&task-loss-requirement=0.7&tile-batch-size=4&show-fps=true&show-gaze-ratio=true&show-psnr=true
+http://localhost:8080/?mode=tiled&visualization-mode=interframe&keyframe-duration=0&frames-per-clip=16&inference-width=1920&inference-height=1080&tile-batch-size=4&show-fps=true&show-gaze-ratio=true&show-psnr=true
 ```
+
+That query matches the full-resolution docs birds asset profile. The no-arg
+native and web paths use the realtime default above.
 
 For headless browsers or machines without a webcam, run the same Bevy UI from a
 static source:
 
 ```text
-http://localhost:8080/?source=static&frames-per-clip=1&inference-width=1920&inference-height=1080
+http://localhost:8080/?source=static&frames-per-clip=1
+http://localhost:8080/?source=static&mode=tiled&frames-per-clip=16&inference-width=1920&inference-height=1080
 http://localhost:8080/?image-url=./frame.png&frames-per-clip=1
 ```
 

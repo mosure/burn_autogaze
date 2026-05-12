@@ -105,10 +105,23 @@
         );
       }
 
+      function defaultSourceDimensions() {
+        const mode = params.get("mode")?.toLowerCase() || "";
+        const tiled =
+          mode === "tiled" ||
+          mode === "tile" ||
+          mode === "tile-224" ||
+          mode === "full-res" ||
+          mode === "fullres" ||
+          mode === "anyres";
+        return tiled ? { width: 1280, height: 720 } : { width: 640, height: 360 };
+      }
+
       async function startCameraSource() {
         try {
-          const width = queryNumber(["camera-width", "inference-width", "width"], 64, 3840, 1280);
-          const height = queryNumber(["camera-height", "inference-height", "height"], 64, 2160, 720);
+          const defaults = defaultSourceDimensions();
+          const width = queryNumber(["camera-width", "inference-width", "width"], 64, 3840, defaults.width);
+          const height = queryNumber(["camera-height", "inference-height", "height"], 64, 2160, defaults.height);
           const stream = await navigator.mediaDevices.getUserMedia({
             video: {
               width: { ideal: width },
@@ -162,8 +175,9 @@
           return loadImageFrame(imageUrl);
         }
 
-        const width = queryNumber(["static-width", "inference-width", "width"], 64, 3840, 1280);
-        const height = queryNumber(["static-height", "inference-height", "height"], 64, 2160, 720);
+        const defaults = defaultSourceDimensions();
+        const width = queryNumber(["static-width", "inference-width", "width"], 64, 3840, defaults.width);
+        const height = queryNumber(["static-height", "inference-height", "height"], 64, 2160, defaults.height);
         return generatedFrame(width, height);
       }
 
