@@ -1,7 +1,7 @@
 use bevy::app::AppExit;
 #[cfg(not(target_arch = "wasm32"))]
 use bevy_burn_autogaze::{
-    BevyAutoGazeMode, BevyDisplayTransfer, DEFAULT_BEVY_STREAMING_CACHE,
+    BevyAutoGazeMode, BevyDisplayTransfer, BevyFrameSource, DEFAULT_BEVY_STREAMING_CACHE,
     DEFAULT_BIRDS_KEYFRAME_DURATION, DEFAULT_BLEND_ALPHA, DEFAULT_TILED_INFERENCE_WIDTH,
     default_frames_per_clip, default_inference_dimensions, default_max_gaze_tokens_each_frame,
     default_tile_batch_size, default_top_k,
@@ -9,7 +9,8 @@ use bevy_burn_autogaze::{
 use bevy_burn_autogaze::{BevyBurnAutoGazeConfig, run_app};
 #[cfg(not(target_arch = "wasm32"))]
 use burn_autogaze::{
-    AutoGazeMaskVisualizationMode, AutoGazeVisualizationMode, task_loss_requirement_from_l1_db,
+    AutoGazeMaskGeometryMode, AutoGazeMaskVisualizationMode, AutoGazeVisualizationMode,
+    task_loss_requirement_from_l1_db,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -163,6 +164,109 @@ impl From<NativeMaskVisualizationMode> for AutoGazeMaskVisualizationMode {
 
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum NativeMaskGeometryMode {
+    #[value(
+        name = "deduplicated",
+        alias = "dedup",
+        alias = "union",
+        alias = "union-dedup",
+        help = "Drop selected cells fully covered by larger native-scale cells; preserves the native update union while reducing redundant high-motion draw work."
+    )]
+    Deduplicated,
+    #[value(
+        name = "native",
+        alias = "raw",
+        alias = "multiscale",
+        help = "Draw and update every native AutoGaze scale cell exactly as decoded."
+    )]
+    Native,
+    #[value(
+        name = "effective",
+        alias = "projected",
+        alias = "finest-grid",
+        help = "Project selected tokens to the finest active grid for a compact sparse-token footprint."
+    )]
+    Effective,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl fmt::Display for NativeMaskGeometryMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Deduplicated => "deduplicated",
+            Self::Native => "native",
+            Self::Effective => "effective",
+        })
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<NativeMaskGeometryMode> for AutoGazeMaskGeometryMode {
+    fn from(mode: NativeMaskGeometryMode) -> Self {
+        match mode {
+            NativeMaskGeometryMode::Deduplicated => Self::Deduplicated,
+            NativeMaskGeometryMode::Native => Self::Native,
+            NativeMaskGeometryMode::Effective => Self::Effective,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<AutoGazeMaskGeometryMode> for NativeMaskGeometryMode {
+    fn from(mode: AutoGazeMaskGeometryMode) -> Self {
+        match mode {
+            AutoGazeMaskGeometryMode::Native => Self::Native,
+            AutoGazeMaskGeometryMode::Deduplicated => Self::Deduplicated,
+            AutoGazeMaskGeometryMode::Effective => Self::Effective,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+const DEFAULT_NATIVE_MASK_GEOMETRY_MODE: NativeMaskGeometryMode =
+    NativeMaskGeometryMode::Deduplicated;
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum NativeFrameSource {
+    #[value(
+        name = "camera",
+        alias = "webcam",
+        alias = "live",
+        help = "Use the native camera stream."
+    )]
+    Camera,
+    #[value(
+        name = "static",
+        alias = "image",
+        alias = "file",
+        help = "Use --image-path as a repeated source frame."
+    )]
+    StaticImage,
+    #[value(
+        name = "synthetic-pan",
+        alias = "synthetic",
+        alias = "pan",
+        alias = "camera-pan",
+        alias = "full-frame-motion",
+        help = "Generate deterministic full-frame motion for repeatable high-motion perf runs."
+    )]
+    SyntheticPan,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<NativeFrameSource> for BevyFrameSource {
+    fn from(source: NativeFrameSource) -> Self {
+        match source {
+            NativeFrameSource::Camera => Self::Camera,
+            NativeFrameSource::StaticImage => Self::StaticImage,
+            NativeFrameSource::SyntheticPan => Self::SyntheticPan,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum NativeDisplayTransfer {
     #[value(
         name = "auto",
@@ -223,7 +327,7 @@ impl FromStr for TaskLossRequirementArg {
 #[command(
     about = "native Bevy viewer for burn_autogaze",
     version,
-    long_about = "Runs the burn_autogaze video pipeline with camera or static-image input and renders Input | Mask | Output through Bevy. The default path is a continuous realtime streaming configuration: 640px source resize, 16-frame rolling KV window, the model's configured generation budget, adaptive display transfer, PSNR overlay, interframe output, and no periodic visualization keyframes. Use --display-transfer gpu to force Bevy/Burn tensor interop, --streaming-cache=false for full-window comparison, or --mode tiled plus explicit 1080p/docs settings for full-resolution inspection."
+    long_about = "Runs the burn_autogaze video pipeline with camera or static-image input and renders Input | Mask | Output through Bevy. The default path is a continuous realtime streaming configuration: 640px source resize, 16-frame rolling KV window, the model's configured generation budget, deduplicated native mask geometry, adaptive display transfer, PSNR overlay, interframe output, and no periodic visualization keyframes. Use --mask-geometry native for exact decoded-cell diagnostics, --display-transfer gpu to force Bevy/Burn tensor interop, --streaming-cache=false for full-window comparison, or --mode tiled plus explicit 1080p/docs settings for full-resolution inspection."
 )]
 struct NativeArgs {
     #[arg(
@@ -272,6 +376,13 @@ struct NativeArgs {
         help = "Use a static PNG/JPEG frame instead of the native camera."
     )]
     image_path: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_enum,
+        help = "Input source. Defaults to camera, or static when --image-path is supplied. synthetic-pan is deterministic full-frame motion for perf tests."
+    )]
+    source: Option<NativeFrameSource>,
 
     #[arg(
         long,
@@ -410,6 +521,17 @@ struct NativeArgs {
     mask_visualization_mode: NativeMaskVisualizationMode,
 
     #[arg(
+        long = "mask-geometry",
+        alias = "mask-geometry-mode",
+        alias = "mask-update-mode",
+        alias = "mask-scale-policy",
+        value_enum,
+        default_value_t = DEFAULT_NATIVE_MASK_GEOMETRY_MODE,
+        help = "Mask cell geometry policy. deduplicated preserves the native update union while removing fully covered overlapping cells; native draws every decoded scale cell; effective projects to the finest active grid."
+    )]
+    mask_geometry_mode: NativeMaskGeometryMode,
+
+    #[arg(
         long,
         value_name = "0..1",
         value_parser = parse_alpha,
@@ -543,6 +665,13 @@ impl From<NativeArgs> for BevyBurnAutoGazeConfig {
             show_gaze_ratio: args.show_gaze_ratio,
             show_psnr: args.show_psnr,
             model_dir: args.model_dir,
+            source: args.source.map(BevyFrameSource::from).unwrap_or(
+                if args.image_path.is_some() {
+                    BevyFrameSource::StaticImage
+                } else {
+                    BevyFrameSource::Camera
+                },
+            ),
             image_path: args.image_path,
             load_model: args.load_model && !args.no_load_model,
             warmup_model: args.warmup_model,
@@ -558,6 +687,7 @@ impl From<NativeArgs> for BevyBurnAutoGazeConfig {
             inference_height: inference_height.or(defaults.inference_height),
             mask_cell_scale: args.mask_cell_scale,
             mask_visualization_mode: args.mask_visualization_mode.into(),
+            mask_geometry_mode: args.mask_geometry_mode.into(),
             blend_alpha: args.blend_alpha,
             visualization_mode,
             keyframe_duration: args.keyframe_duration,
@@ -683,7 +813,7 @@ fn main() -> AppExit {
 
     #[cfg(not(target_arch = "wasm32"))]
     {
-        if config.image_path.is_none() {
+        if config.source == BevyFrameSource::Camera {
             let request = camera_request_for_config(&config);
             std::thread::spawn(move || {
                 bevy_burn_autogaze::platform::camera::native_camera_thread_with_request(request);
@@ -786,6 +916,7 @@ mod tests {
         let config = BevyBurnAutoGazeConfig::from(args);
 
         assert_eq!(config.mode, BevyAutoGazeMode::Resize224);
+        assert_eq!(config.source, BevyFrameSource::Camera);
         assert_eq!(config.top_k, DEFAULT_REALTIME_TOP_K);
         assert_eq!(
             config.max_gaze_tokens_each_frame,
@@ -801,6 +932,10 @@ mod tests {
         );
         assert_eq!(config.inference_height, None);
         assert_eq!(config.display_transfer, BevyDisplayTransfer::Auto);
+        assert_eq!(
+            config.mask_geometry_mode,
+            AutoGazeMaskGeometryMode::Deduplicated
+        );
         assert!(config.show_psnr);
         assert!(config.warmup_model);
         assert_eq!(config.streaming_cache, DEFAULT_BEVY_STREAMING_CACHE);
@@ -815,6 +950,7 @@ mod tests {
             show_psnr: false,
             model_dir: bevy_burn_autogaze::DEFAULT_NATIVE_MODEL_DIR.into(),
             image_path: None,
+            source: None,
             load_model: true,
             no_load_model: false,
             warmup_model: true,
@@ -831,6 +967,7 @@ mod tests {
             inference_height: None,
             mask_cell_scale: 1.0,
             mask_visualization_mode: NativeMaskVisualizationMode::ImageMaskOnly,
+            mask_geometry_mode: DEFAULT_NATIVE_MASK_GEOMETRY_MODE,
             blend_alpha: DEFAULT_BLEND_ALPHA,
             visualization_mode: NativeVisualizationMode::Interframe,
             keyframe_duration: DEFAULT_BIRDS_KEYFRAME_DURATION,
@@ -878,6 +1015,22 @@ mod tests {
             config.tensor_full_frame_update_min_ratio,
             bevy_burn_autogaze::DEFAULT_TENSOR_FULL_FRAME_UPDATE_MIN_RATIO
         );
+    }
+
+    #[test]
+    fn native_cli_image_path_defaults_to_static_source() {
+        let args = NativeArgs::parse_from(["bevy_burn_autogaze", "--image-path", "frame.png"]);
+        let config = BevyBurnAutoGazeConfig::from(args);
+
+        assert_eq!(config.source, BevyFrameSource::StaticImage);
+    }
+
+    #[test]
+    fn native_cli_accepts_synthetic_pan_source() {
+        let args = NativeArgs::parse_from(["bevy_burn_autogaze", "--source", "synthetic-pan"]);
+        let config = BevyBurnAutoGazeConfig::from(args);
+
+        assert_eq!(config.source, BevyFrameSource::SyntheticPan);
     }
 
     #[test]
@@ -940,5 +1093,22 @@ mod tests {
         assert_eq!(config.tensor_sparse_update_max_rects, 8);
         assert_eq!(config.tensor_sparse_update_max_ratio, 0.05);
         assert_eq!(config.tensor_full_frame_update_min_ratio, 0.45);
+    }
+
+    #[test]
+    fn native_cli_exposes_mask_geometry_policy() {
+        let args = NativeArgs::parse_from(["bevy_burn_autogaze", "--mask-geometry", "native"]);
+        let config = BevyBurnAutoGazeConfig::from(args);
+
+        assert_eq!(config.mask_geometry_mode, AutoGazeMaskGeometryMode::Native);
+
+        let args =
+            NativeArgs::parse_from(["bevy_burn_autogaze", "--mask-update-mode", "effective"]);
+        let config = BevyBurnAutoGazeConfig::from(args);
+
+        assert_eq!(
+            config.mask_geometry_mode,
+            AutoGazeMaskGeometryMode::Effective
+        );
     }
 }

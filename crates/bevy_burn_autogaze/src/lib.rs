@@ -30,11 +30,11 @@ use burn::tensor::Tensor;
 use burn_autogaze::{AutoGazeConfig, AutoGazeLoadOptions, NativeAutoGazeModel};
 use burn_autogaze::{
     AutoGazeGazeRatioStats, AutoGazeInferenceMode, AutoGazeInferenceSequencer,
-    AutoGazeMaskPlanStats, AutoGazeMaskVisualizationMode, AutoGazePipeline,
-    AutoGazePipelineOptions, AutoGazePreparedRun as CoreAutoGazePreparedRun, AutoGazePsnrStats,
-    AutoGazeReadoutRunOutput, AutoGazeRgbaClipShape, AutoGazeRgbaFrameClip, AutoGazeRgbaFrameQueue,
-    AutoGazeRgbaVisualizationBuffers, AutoGazeRgbaVisualizationOptions, AutoGazeStreamingCache,
-    AutoGazeTensorInterframePath, AutoGazeTensorVisualizationOptions,
+    AutoGazeMaskGeometryMode, AutoGazeMaskPlanStats, AutoGazeMaskVisualizationMode,
+    AutoGazePipeline, AutoGazePipelineOptions, AutoGazePreparedRun as CoreAutoGazePreparedRun,
+    AutoGazePsnrStats, AutoGazeReadoutRunOutput, AutoGazeRgbaClipShape, AutoGazeRgbaFrameClip,
+    AutoGazeRgbaFrameQueue, AutoGazeRgbaVisualizationBuffers, AutoGazeRgbaVisualizationOptions,
+    AutoGazeStreamingCache, AutoGazeTensorInterframePath, AutoGazeTensorVisualizationOptions,
     AutoGazeTensorVisualizationState, AutoGazeVisualizationMode, AutoGazeVisualizationState,
     FixationPoint, format_fps, format_gaze_ratio_percent, format_psnr_db, fps_from_millis,
     prepare_rgba_clip_for_trace, resize_rgba_frame_to_dimensions, rgba_clip_to_tensor,
@@ -60,12 +60,13 @@ pub mod platform;
 #[cfg(test)]
 use config::MODEL_INPUT_SIZE;
 pub use config::{
-    BevyAutoGazeMode, BevyBurnAutoGazeConfig, BevyDisplayTransfer, DEFAULT_BEVY_MODE,
-    DEFAULT_BEVY_REALTIME_FRAMES_PER_CLIP, DEFAULT_BEVY_STREAMING_CACHE, DEFAULT_BEVY_TILED_TOP_K,
-    DEFAULT_BIRDS_BLEND_ALPHA, DEFAULT_BIRDS_FRAMES_PER_CLIP, DEFAULT_BIRDS_INFERENCE_HEIGHT,
-    DEFAULT_BIRDS_INFERENCE_WIDTH, DEFAULT_BIRDS_KEYFRAME_DURATION, DEFAULT_BIRDS_MAX_GAZE_TOKENS,
-    DEFAULT_BIRDS_TILE_BATCH_SIZE, DEFAULT_BIRDS_TOP_K, DEFAULT_CONFIG_URL,
-    DEFAULT_NATIVE_MODEL_DIR, DEFAULT_REALTIME_INFERENCE_WIDTH, DEFAULT_REALTIME_MAX_GAZE_TOKENS,
+    BevyAutoGazeMode, BevyBurnAutoGazeConfig, BevyDisplayTransfer, BevyFrameSource,
+    DEFAULT_BEVY_MASK_GEOMETRY_MODE, DEFAULT_BEVY_MODE, DEFAULT_BEVY_REALTIME_FRAMES_PER_CLIP,
+    DEFAULT_BEVY_STREAMING_CACHE, DEFAULT_BEVY_TILED_TOP_K, DEFAULT_BIRDS_BLEND_ALPHA,
+    DEFAULT_BIRDS_FRAMES_PER_CLIP, DEFAULT_BIRDS_INFERENCE_HEIGHT, DEFAULT_BIRDS_INFERENCE_WIDTH,
+    DEFAULT_BIRDS_KEYFRAME_DURATION, DEFAULT_BIRDS_MAX_GAZE_TOKENS, DEFAULT_BIRDS_TILE_BATCH_SIZE,
+    DEFAULT_BIRDS_TOP_K, DEFAULT_CONFIG_URL, DEFAULT_NATIVE_MODEL_DIR,
+    DEFAULT_REALTIME_INFERENCE_WIDTH, DEFAULT_REALTIME_MAX_GAZE_TOKENS,
     DEFAULT_TILED_INFERENCE_WIDTH, DEFAULT_WEIGHTS_URL, ImplicitModeDefaults,
     default_frames_per_clip, default_inference_dimensions, default_max_gaze_tokens_each_frame,
     default_tile_batch_size, default_top_k, realtime_policy_from_config,
@@ -249,6 +250,20 @@ impl BevyStreamingGenerationState {
 #[derive(Resource, Default, Clone)]
 struct StaticFrame(Option<Arc<RgbaImage>>);
 
+#[derive(Resource, Clone, Debug, Default)]
+struct SyntheticFrameSource {
+    frame_index: u64,
+}
+
+impl SyntheticFrameSource {
+    fn next_frame(&mut self, config: &BevyBurnAutoGazeConfig) -> RgbaImage {
+        let (width, height) = synthetic_source_dimensions(config);
+        let frame = synthetic_pan_frame(width, height, self.frame_index);
+        self.frame_index = self.frame_index.wrapping_add(1);
+        frame
+    }
+}
+
 #[derive(Resource, Default, Clone, Debug)]
 struct InferenceSequencer(AutoGazeInferenceSequencer);
 
@@ -311,6 +326,7 @@ struct InferenceTiming {
     clip_frames: usize,
     model_frames: usize,
     trace_points: usize,
+    active_trace_points: usize,
     width: usize,
     height: usize,
     source_ms: f64,
@@ -366,6 +382,7 @@ struct InferenceTimingStats {
     model_ms: f64,
     model_frames: usize,
     trace_points: usize,
+    active_trace_points: usize,
     input_ms: f64,
     display_input_ms: f64,
     pack_ms: f64,
@@ -391,9 +408,11 @@ struct InferenceTimingStats {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct InferenceRunConfigSummary {
+    source: &'static str,
     mode: &'static str,
     visualization_mode: &'static str,
     mask_visualization_mode: &'static str,
+    mask_geometry_mode: &'static str,
     display_transfer: &'static str,
     streaming_cache: bool,
     streaming_cache_effective: bool,
@@ -416,9 +435,11 @@ struct InferenceRunConfigSummary {
 impl From<&BevyBurnAutoGazeConfig> for InferenceRunConfigSummary {
     fn from(config: &BevyBurnAutoGazeConfig) -> Self {
         Self {
+            source: config.source.as_str(),
             mode: config.mode.as_str(),
             visualization_mode: config.visualization_mode.as_str(),
             mask_visualization_mode: config.mask_visualization_mode.as_str(),
+            mask_geometry_mode: config.mask_geometry_mode.as_str(),
             display_transfer: config.display_transfer.as_str(),
             streaming_cache: config.streaming_cache,
             streaming_cache_effective: should_use_streaming_cache(
@@ -485,6 +506,7 @@ impl InferenceTimingStats {
         self.model_ms += timing.model_ms;
         self.model_frames += timing.model_frames;
         self.trace_points += timing.trace_points;
+        self.active_trace_points += timing.active_trace_points;
         self.input_ms += timing.input_ms;
         self.display_input_ms += timing.display_input_ms;
         self.pack_ms += timing.pack_ms;
@@ -536,12 +558,13 @@ impl InferenceTimingStats {
 
         self.last_log = Some(now);
         log(&format!(
-            "AutoGaze timing: {:.1} output fps / {:.1} model-frame fps ({:.1} ms) clip={} model_frames={} points={} rects={} spans={} gaze={:.2}% {}x{}, source={:.1} ms, prepare={:.1} ms, pack={:.1} ms, input={:.1} ms, display_input={:.1} ms ({}) model={:.1} ms, trace={:.1} ms, sync={:.1} ms, visualize_cpu={:.1} ms, psnr={:.1} ms, tensor={:.1} ms, display_transfer={}, tensor_path={}, visualize={:.1} ms, display={:.1} ms, output={:.1} MiB rgba/{:.1} MiB f32",
+            "AutoGaze timing: {:.1} output fps / {:.1} model-frame fps ({:.1} ms) clip={} model_frames={} points={}/{} rects={} spans={} gaze={:.2}% {}x{}, source={:.1} ms, prepare={:.1} ms, pack={:.1} ms, input={:.1} ms, display_input={:.1} ms ({}) model={:.1} ms, trace={:.1} ms, sync={:.1} ms, visualize_cpu={:.1} ms, psnr={:.1} ms, tensor={:.1} ms, display_transfer={}, tensor_path={}, visualize={:.1} ms, display={:.1} ms, output={:.1} MiB rgba/{:.1} MiB f32",
             timing.e2e_fps(),
             timing.model_frame_fps(),
             timing.total_ms,
             timing.clip_frames,
             timing.model_frames,
+            timing.active_trace_points,
             timing.trace_points,
             timing.mask_plan_stats.rect_count,
             timing.mask_plan_stats.row_span_count,
@@ -600,6 +623,8 @@ impl InferenceTimingStats {
             0.0
         };
         let avg_trace_points = mean_or_zero(self.trace_points as f64, processed_frames);
+        let avg_active_trace_points =
+            mean_or_zero(self.active_trace_points as f64, processed_frames);
         let avg_mask_rects = mean_or_zero(self.mask_rects as f64, processed_frames);
         let avg_mask_row_spans = mean_or_zero(self.mask_row_spans as f64, processed_frames);
         let avg_mask_pixels = mean_or_zero(self.mask_pixels as f64, processed_frames);
@@ -629,6 +654,7 @@ impl InferenceTimingStats {
             "p50_model_ms": p50_model_ms,
             "p95_model_ms": p95_model_ms,
             "avg_trace_points": avg_trace_points,
+            "avg_active_trace_points": avg_active_trace_points,
             "avg_mask_rects": avg_mask_rects,
             "avg_mask_row_spans": avg_mask_row_spans,
             "avg_mask_pixels": avg_mask_pixels,
@@ -657,6 +683,7 @@ impl InferenceTimingStats {
             "latest_clip_frames": latest_clip_frames,
             "latest_model_frames": latest_model_frames,
             "latest_trace_points": self.latest.map(|timing| timing.trace_points).unwrap_or_default(),
+            "latest_active_trace_points": self.latest.map(|timing| timing.active_trace_points).unwrap_or_default(),
             "latest_mask_rects": self.latest.map(|timing| timing.mask_plan_stats.rect_count).unwrap_or_default(),
             "latest_mask_row_spans": self.latest.map(|timing| timing.mask_plan_stats.row_span_count).unwrap_or_default(),
             "latest_mask_pixels": self.latest.map(|timing| timing.mask_plan_stats.pixel_count).unwrap_or_default(),
@@ -728,6 +755,7 @@ fn insert_run_config_json_fields(
         return;
     };
     fields.insert("mode".to_string(), config.mode.into());
+    fields.insert("source".to_string(), config.source.into());
     fields.insert(
         "visualization_mode".to_string(),
         config.visualization_mode.into(),
@@ -735,6 +763,10 @@ fn insert_run_config_json_fields(
     fields.insert(
         "mask_visualization_mode".to_string(),
         config.mask_visualization_mode.into(),
+    );
+    fields.insert(
+        "mask_geometry_mode".to_string(),
+        config.mask_geometry_mode.into(),
     );
     fields.insert(
         "display_transfer".to_string(),
@@ -821,6 +853,8 @@ fn perf_sample_json(stats: &InferenceTimingStats) -> Option<String> {
         0.0
     };
     let avg_trace_points = mean_or_zero(stats.trace_points as f64, stats.processed_frames());
+    let avg_active_trace_points =
+        mean_or_zero(stats.active_trace_points as f64, stats.processed_frames());
     let avg_mask_rects = mean_or_zero(stats.mask_rects as f64, stats.processed_frames());
     let avg_mask_row_spans = mean_or_zero(stats.mask_row_spans as f64, stats.processed_frames());
     let avg_mask_pixels = mean_or_zero(stats.mask_pixels as f64, stats.processed_frames());
@@ -835,6 +869,7 @@ fn perf_sample_json(stats: &InferenceTimingStats) -> Option<String> {
         "latest_display_ms": latest.display_ms,
         "latest_display_input_ms": latest.display_input_ms,
         "latest_trace_points": latest.trace_points,
+        "latest_active_trace_points": latest.active_trace_points,
         "latest_mask_rects": latest.mask_plan_stats.rect_count,
         "latest_mask_row_spans": latest.mask_plan_stats.row_span_count,
         "latest_mask_pixels": latest.mask_plan_stats.pixel_count,
@@ -857,6 +892,7 @@ fn perf_sample_json(stats: &InferenceTimingStats) -> Option<String> {
         "avg_model_frame_fps": avg_model_frame_fps,
         "avg_input_fps": avg_input_fps,
         "avg_trace_points": avg_trace_points,
+        "avg_active_trace_points": avg_active_trace_points,
         "avg_mask_rects": avg_mask_rects,
         "avg_mask_row_spans": avg_mask_row_spans,
         "avg_mask_pixels": avg_mask_pixels,
@@ -899,6 +935,7 @@ fn publish_wasm_perf_sample(_stats: &InferenceTimingStats) {}
 struct FrameInputParams<'w> {
     config: Res<'w, BevyBurnAutoGazeConfig>,
     static_frame: Res<'w, StaticFrame>,
+    synthetic_source: ResMut<'w, SyntheticFrameSource>,
     frame_queue: ResMut<'w, FrameQueue>,
     inference_sequencer: ResMut<'w, InferenceSequencer>,
     visualization_state: ResMut<'w, BevyVisualizationState>,
@@ -955,6 +992,7 @@ pub fn viewer_app(mut config: BevyBurnAutoGazeConfig) -> App {
         load_task: None,
     });
     app.insert_resource(load_static_frame(config.image_path.as_deref(), &config));
+    app.insert_resource(SyntheticFrameSource::default());
 
     app.add_plugins(
         DefaultPlugins
@@ -1247,19 +1285,11 @@ fn process_frames(
         return;
     }
 
-    let source_start = timestamp_now();
-    let frame = if let Some(frame) = frame_input.static_frame.0.as_ref() {
-        Some((Arc::clone(frame), 0.0, 0.0))
-    } else {
-        let frame = receive_frame();
-        let source_ms = elapsed_ms(source_start);
-        frame.map(|frame| {
-            let prepare_start = timestamp_now();
-            let frame = prepare_frame_for_inference(frame, &frame_input.config);
-            (Arc::new(frame), source_ms, elapsed_ms(prepare_start))
-        })
-    };
-
+    let frame = next_source_frame(
+        &frame_input.config,
+        &frame_input.static_frame,
+        &mut frame_input.synthetic_source,
+    );
     let Some((frame, source_ms, prepare_ms)) = frame else {
         return;
     };
@@ -1306,6 +1336,7 @@ fn process_frames(
     )
     .with_full_frame_update_policy(frame_input.config.tensor_full_frame_update_min_ratio)
     .with_mask_visualization_mode(frame_input.config.mask_visualization_mode)
+    .with_mask_geometry_mode(frame_input.config.mask_geometry_mode)
     .with_cpu_panels();
     let run_config = InferenceRunConfigSummary::from(frame_input.config.as_ref());
     frame_input.visualization_state.configure(
@@ -1452,12 +1483,12 @@ fn preview_frames(
         return;
     }
 
-    let frame = if let Some(frame) = frame_input.static_frame.0.as_ref() {
-        Some(Arc::clone(frame))
-    } else {
-        receive_frame()
-            .map(|frame| Arc::new(prepare_frame_for_inference(frame, &frame_input.config)))
-    };
+    let frame = next_source_frame(
+        &frame_input.config,
+        &frame_input.static_frame,
+        &mut frame_input.synthetic_source,
+    )
+    .map(|(frame, _, _)| frame);
 
     let Some(frame) = frame else {
         return;
@@ -1693,6 +1724,10 @@ fn pipeline_options_from_config(config: &BevyBurnAutoGazeConfig) -> AutoGazePipe
     } else if let Some(task_loss_requirement) = config.task_loss_requirement {
         options = options.with_task_loss_requirement(task_loss_requirement);
     }
+    if matches!(config.visualization_mode, AutoGazeVisualizationMode::Interframe) {
+        options =
+            options.with_generation_coverage_stop_ratio(config.tensor_full_frame_update_min_ratio);
+    }
     options
 }
 
@@ -1813,6 +1848,7 @@ async fn finish_autogaze_visualization(
         .and_then(|frames| frames.get(frame_index))
         .cloned()
         .unwrap_or_default();
+    let active_trace_points = points.iter().filter(|point| point.confidence > 0.0).count();
     let calculate_psnr = visualization_options.calculate_psnr;
     let visualize_start = timestamp_now();
     let mut visualization = visualize_frame_rgba(
@@ -1833,6 +1869,7 @@ async fn finish_autogaze_visualization(
         clip_frames: context_frames,
         model_frames,
         trace_points: points.len(),
+        active_trace_points,
         width,
         height,
         source_ms: clip.source_ms,
@@ -1946,6 +1983,7 @@ struct VisualizationOptions {
     cell_scale: f32,
     blend_alpha: f32,
     mask_visualization_mode: AutoGazeMaskVisualizationMode,
+    mask_geometry_mode: AutoGazeMaskGeometryMode,
     calculate_psnr: bool,
     display_transfer: BevyDisplayTransfer,
     sparse_update_max_rects: usize,
@@ -1965,6 +2003,7 @@ impl VisualizationOptions {
             cell_scale,
             blend_alpha,
             mask_visualization_mode: AutoGazeMaskVisualizationMode::ImageMaskOnly,
+            mask_geometry_mode: DEFAULT_BEVY_MASK_GEOMETRY_MODE,
             calculate_psnr,
             display_transfer,
             sparse_update_max_rects: DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RECTS,
@@ -1987,6 +2026,11 @@ impl VisualizationOptions {
 
     fn with_mask_visualization_mode(mut self, mode: AutoGazeMaskVisualizationMode) -> Self {
         self.mask_visualization_mode = mode;
+        self
+    }
+
+    fn with_mask_geometry_mode(mut self, mode: AutoGazeMaskGeometryMode) -> Self {
+        self.mask_geometry_mode = mode;
         self
     }
 
@@ -2184,6 +2228,7 @@ fn visualize_rgba_tensor(
                 options.blend_alpha,
             )
             .with_mask_visualization_mode(options.mask_visualization_mode)
+            .with_mask_geometry_mode(options.mask_geometry_mode)
             .with_sparse_update_policy(
                 options.sparse_update_max_rects,
                 options.sparse_update_max_ratio,
@@ -2276,7 +2321,9 @@ fn visualize_rgba_bytes(
         options.cell_scale,
         options.blend_alpha,
     )
-    .with_mask_visualization_mode(options.mask_visualization_mode);
+    .with_mask_visualization_mode(options.mask_visualization_mode)
+    .with_mask_geometry_mode(options.mask_geometry_mode)
+    .with_full_frame_update_policy(options.full_frame_update_min_ratio);
     match options.cpu_layout {
         CpuVisualizationLayout::SideBySide => {
             let visualization = visualization_state
@@ -2393,15 +2440,11 @@ fn live_preview_visualization(
     calculate_psnr: bool,
 ) -> Result<Visualization, String> {
     let mut state = BevyVisualizationState::new(AutoGazeVisualizationMode::FullBlend, 1);
-    let mut visualization = visualize_points(
-        rgba,
-        &[],
-        VisualizationOptions::new(1.0, 0.0, false, BevyDisplayTransfer::Cpu),
-        &mut state,
-    )?;
+    let visualization_options =
+        VisualizationOptions::new(1.0, 0.0, calculate_psnr, BevyDisplayTransfer::Cpu)
+            .with_cpu_panels();
+    let mut visualization = visualize_points(rgba, &[], visualization_options, &mut state)?;
     visualization.gaze_update_ratio = 0.0;
-    let _ = calculate_psnr;
-    visualization.psnr_db = None;
     Ok(visualization)
 }
 
@@ -2433,6 +2476,36 @@ fn receive_frame() -> Option<RgbaImage> {
     platform::camera::receive_image()
 }
 
+fn next_source_frame(
+    config: &BevyBurnAutoGazeConfig,
+    static_frame: &StaticFrame,
+    synthetic_source: &mut SyntheticFrameSource,
+) -> Option<(Arc<RgbaImage>, f64, f64)> {
+    match config.source {
+        BevyFrameSource::StaticImage => static_frame
+            .0
+            .as_ref()
+            .map(|frame| (Arc::clone(frame), 0.0, 0.0)),
+        BevyFrameSource::SyntheticPan => {
+            let source_start = timestamp_now();
+            let frame = synthetic_source.next_frame(config);
+            let source_ms = elapsed_ms(source_start);
+            let prepare_start = timestamp_now();
+            let frame = prepare_frame_for_inference(frame, config);
+            Some((Arc::new(frame), source_ms, elapsed_ms(prepare_start)))
+        }
+        BevyFrameSource::Camera => {
+            let source_start = timestamp_now();
+            receive_frame().map(|frame| {
+                let source_ms = elapsed_ms(source_start);
+                let prepare_start = timestamp_now();
+                let frame = prepare_frame_for_inference(frame, config);
+                (Arc::new(frame), source_ms, elapsed_ms(prepare_start))
+            })
+        }
+    }
+}
+
 fn load_static_frame(path: Option<&Path>, config: &BevyBurnAutoGazeConfig) -> StaticFrame {
     let Some(path) = path else {
         return StaticFrame(None);
@@ -2454,6 +2527,72 @@ fn load_static_frame(path: Option<&Path>, config: &BevyBurnAutoGazeConfig) -> St
 
 fn prepare_frame_for_inference(frame: RgbaImage, config: &BevyBurnAutoGazeConfig) -> RgbaImage {
     resize_rgba_frame_to_dimensions(frame, config.inference_width, config.inference_height)
+}
+
+fn synthetic_source_dimensions(config: &BevyBurnAutoGazeConfig) -> (u32, u32) {
+    match (config.inference_width, config.inference_height) {
+        (Some(width), Some(height)) => (width.max(1), height.max(1)),
+        (Some(width), None) => (
+            width.max(1),
+            ((width as f32 * 9.0 / 16.0).round() as u32).max(1),
+        ),
+        (None, Some(height)) => (
+            ((height as f32 * 16.0 / 9.0).round() as u32).max(1),
+            height.max(1),
+        ),
+        (None, None) => match config.mode {
+            BevyAutoGazeMode::Resize224 => (DEFAULT_REALTIME_INFERENCE_WIDTH, 360),
+            BevyAutoGazeMode::Tile224 => (DEFAULT_TILED_INFERENCE_WIDTH, 720),
+        },
+    }
+}
+
+fn synthetic_pan_frame(width: u32, height: u32, frame_index: u64) -> RgbaImage {
+    let width = width.max(1);
+    let height = height.max(1);
+    let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+    let phase_x = (frame_index as u32).wrapping_mul(9);
+    let phase_y = (frame_index as u32).wrapping_mul(5);
+    let square = (width.min(height) / 5).max(24);
+    let square_x =
+        ((frame_index as u32).wrapping_mul(13) % (width + square)) as i32 - square as i32;
+    let square_y =
+        ((frame_index as u32).wrapping_mul(7) % (height + square)) as i32 - square as i32;
+    let circle_radius = (width.min(height) / 8).max(12) as i32;
+    let circle_x = ((frame_index as u32).wrapping_mul(5) % width) as i32;
+    let circle_y = ((height / 2) as i32)
+        + (((frame_index as f32) * 0.17).sin() * height as f32 * 0.25).round() as i32;
+
+    for y in 0..height {
+        for x in 0..width {
+            let xf = x as f32 / width.saturating_sub(1).max(1) as f32;
+            let yf = y as f32 / height.saturating_sub(1).max(1) as f32;
+            let wave =
+                (((x + phase_x) as f32 * 0.035).sin() + ((y + phase_y) as f32 * 0.047).cos()) * 0.5
+                    + 0.5;
+            let inside_square = (x as i32) >= square_x
+                && (x as i32) < square_x + square as i32
+                && (y as i32) >= square_y
+                && (y as i32) < square_y + square as i32;
+            let dx = x as i32 - circle_x;
+            let dy = y as i32 - circle_y;
+            let inside_circle = dx * dx + dy * dy <= circle_radius * circle_radius;
+            let (r, g, b) = if inside_square {
+                (238, (96.0 + wave * 84.0) as u8, 56)
+            } else if inside_circle {
+                (42, (190.0 + wave * 45.0) as u8, 214)
+            } else {
+                (
+                    (34.0 + xf * 92.0 + wave * 22.0) as u8,
+                    (70.0 + yf * 112.0 + wave * 18.0) as u8,
+                    (118.0 + (1.0 - xf) * 68.0 + wave * 20.0) as u8,
+                )
+            };
+            rgba.extend_from_slice(&[r, g, b, 255]);
+        }
+    }
+
+    RgbaImage::from_raw(width, height, rgba).unwrap_or_else(|| RgbaImage::new(width, height))
 }
 
 fn press_esc_close(keys: Res<ButtonInput<KeyCode>>, mut exit: MessageWriter<AppExit>) {
@@ -2807,6 +2946,7 @@ mod tests {
             config.mask_visualization_mode,
             AutoGazeMaskVisualizationMode::ImageMaskOnly
         );
+        assert_eq!(config.mask_geometry_mode, DEFAULT_BEVY_MASK_GEOMETRY_MODE);
         assert_eq!(config.blend_alpha, DEFAULT_BLEND_ALPHA);
         assert_eq!(config.keyframe_duration, DEFAULT_BIRDS_KEYFRAME_DURATION);
         assert_eq!(config.display_transfer, BevyDisplayTransfer::Auto);
@@ -3152,7 +3292,8 @@ mod tests {
 
         let mut cpu_state = BevyVisualizationState::new(AutoGazeVisualizationMode::Interframe, 30);
         let mut gpu_state = BevyVisualizationState::new(AutoGazeVisualizationMode::Interframe, 30);
-        let options_cpu = VisualizationOptions::new(1.0, 0.38, false, BevyDisplayTransfer::Cpu);
+        let options_cpu = VisualizationOptions::new(1.0, 0.38, false, BevyDisplayTransfer::Cpu)
+            .with_full_frame_update_policy(0.0);
         let options_gpu = VisualizationOptions::new(1.0, 0.38, false, BevyDisplayTransfer::Gpu)
             .with_full_frame_update_policy(0.0);
 
@@ -3556,6 +3697,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn live_preview_uses_stable_panel_layout_and_reports_psnr() {
+        let width = 3;
+        let height = 2;
+        let rgba = deterministic_test_rgba(width, height, 9);
+        let frame = RgbaImage::from_raw(width as u32, height as u32, rgba.clone())
+            .expect("test rgba frame");
+
+        let visualization =
+            live_preview_visualization(&frame, true).expect("live preview visualization");
+
+        assert_eq!(visualization.width, (width * 3) as u32);
+        assert_eq!(visualization.height, height as u32);
+        assert_eq!(visualization.gaze_update_ratio, 0.0);
+        assert_eq!(visualization.psnr_db, Some(f64::INFINITY));
+        match visualization.image_data {
+            VisualizationImageData::PanelsRgba {
+                panel_width,
+                panel_height,
+                input_rgba,
+                mask_rgba,
+                output_rgba,
+            } => {
+                assert_eq!(panel_width, width as u32);
+                assert_eq!(panel_height, height as u32);
+                assert_eq!(input_rgba, rgba);
+                assert_eq!(output_rgba, rgba);
+                assert!(mask_rgba.iter().all(|value| *value == 0));
+            }
+            _ => panic!("live preview should use the same split-panel texture layout as inference"),
+        }
+    }
+
+    #[test]
+    fn live_preview_skips_psnr_when_overlay_is_disabled() {
+        let width = 2;
+        let height = 2;
+        let rgba = deterministic_test_rgba(width, height, 12);
+        let frame =
+            RgbaImage::from_raw(width as u32, height as u32, rgba).expect("test rgba frame");
+
+        let visualization =
+            live_preview_visualization(&frame, false).expect("live preview visualization");
+
+        assert_eq!(visualization.psnr_db, None);
+    }
+
     fn assert_gpu_cpu_visualization_match(
         rgba: &[u8],
         width: usize,
@@ -3799,6 +3987,7 @@ mod tests {
             driver_info: "test-driver-info".to_string(),
         });
         stats.set_run_config(InferenceRunConfigSummary::from(&BevyBurnAutoGazeConfig {
+            source: BevyFrameSource::SyntheticPan,
             mode: BevyAutoGazeMode::Tile224,
             visualization_mode: AutoGazeVisualizationMode::Interframe,
             display_transfer: BevyDisplayTransfer::Gpu,
@@ -3822,6 +4011,7 @@ mod tests {
                 clip_frames: 16,
                 model_frames: 2,
                 trace_points: 42,
+                active_trace_points: 9,
                 width: 640,
                 height: 360,
                 total_ms: 20.0,
@@ -3864,6 +4054,7 @@ mod tests {
         assert_eq!(summary["latest_clip_frames"], 16);
         assert_eq!(summary["latest_model_frames"], 2);
         assert_eq!(summary["latest_trace_points"], 42);
+        assert_eq!(summary["latest_active_trace_points"], 9);
         assert_eq!(summary["latest_mask_rects"], 12);
         assert_eq!(summary["latest_mask_row_spans"], 34);
         assert_eq!(summary["latest_mask_pixels"], 57_600);
@@ -3883,6 +4074,7 @@ mod tests {
         assert_eq!(summary["mode"], "tiled");
         assert_eq!(summary["visualization_mode"], "interframe");
         assert_eq!(summary["mask_visualization_mode"], "image-mask-only");
+        assert_eq!(summary["mask_geometry_mode"], "deduplicated");
         assert_eq!(summary["display_transfer"], "gpu");
         assert_eq!(summary["streaming_cache"], true);
         assert_eq!(summary["streaming_cache_effective"], false);
@@ -3911,6 +4103,7 @@ mod tests {
         assert_eq!(summary["avg_model_frame_fps"], 250.0);
         assert_eq!(summary["avg_model_ms"], 8.0);
         assert_eq!(summary["avg_trace_points"], 42.0);
+        assert_eq!(summary["avg_active_trace_points"], 9.0);
         assert_eq!(summary["avg_mask_rects"], 12.0);
         assert_eq!(summary["avg_mask_row_spans"], 34.0);
         assert_eq!(summary["avg_mask_pixels"], 57_600.0);
@@ -3930,13 +4123,16 @@ mod tests {
         assert_eq!(summary["latest_psnr_db_infinite"], false);
         assert_eq!(summary["ema_psnr_db"], 42.0);
         assert_eq!(summary["ema_psnr_db_infinite"], false);
+        assert_eq!(summary["source"], "synthetic-pan");
         assert_eq!(sample["processed_frames"], 1);
         assert_eq!(sample["processed_model_frames"], 2);
         assert_eq!(sample["latest_sequence"], 7);
         assert_eq!(sample["latest_clip_frames"], 16);
         assert_eq!(sample["latest_model_frames"], 2);
         assert_eq!(sample["latest_trace_points"], 42);
+        assert_eq!(sample["latest_active_trace_points"], 9);
         assert_eq!(sample["avg_trace_points"], 42.0);
+        assert_eq!(sample["avg_active_trace_points"], 9.0);
         assert_eq!(sample["latest_mask_rects"], 12);
         assert_eq!(sample["latest_mask_row_spans"], 34);
         assert_eq!(sample["latest_mask_pixels"], 57_600);
@@ -3956,9 +4152,11 @@ mod tests {
             sample["latest_output_tensor_bytes"],
             640 * 360 * 3 * 4 * std::mem::size_of::<f32>()
         );
+        assert_eq!(sample["source"], "synthetic-pan");
         assert_eq!(sample["mode"], "tiled");
         assert_eq!(sample["visualization_mode"], "interframe");
         assert_eq!(sample["mask_visualization_mode"], "image-mask-only");
+        assert_eq!(sample["mask_geometry_mode"], "deduplicated");
         assert_eq!(sample["display_transfer"], "gpu");
         assert_eq!(sample["streaming_cache"], true);
         assert_eq!(sample["streaming_cache_effective"], false);
@@ -4078,6 +4276,10 @@ mod tests {
             burn_autogaze::AutoGazeTaskLossOption::Value(0.7)
         );
         assert_eq!(options.tile_batch_size(), Some(9));
+        assert_eq!(
+            options.generation_coverage_stop_ratio(),
+            Some(config.tensor_full_frame_update_min_ratio)
+        );
 
         config.disable_task_loss_requirement = true;
         let options = pipeline_options_from_config(&config);
@@ -4154,6 +4356,26 @@ mod tests {
         let static_frame = load_static_frame(Some(&path), &BevyBurnAutoGazeConfig::default());
 
         assert!(static_frame.0.is_none());
+    }
+
+    #[test]
+    fn synthetic_pan_source_generates_deterministic_motion_frames() {
+        let config = BevyBurnAutoGazeConfig {
+            source: BevyFrameSource::SyntheticPan,
+            inference_width: Some(64),
+            inference_height: Some(36),
+            ..Default::default()
+        };
+        let mut source_a = SyntheticFrameSource::default();
+        let mut source_b = SyntheticFrameSource::default();
+
+        let first_a = source_a.next_frame(&config);
+        let second_a = source_a.next_frame(&config);
+        let first_b = source_b.next_frame(&config);
+
+        assert_eq!(first_a.dimensions(), (64, 36));
+        assert_eq!(first_a.as_raw(), first_b.as_raw());
+        assert_ne!(first_a.as_raw(), second_a.as_raw());
     }
 
     #[test]

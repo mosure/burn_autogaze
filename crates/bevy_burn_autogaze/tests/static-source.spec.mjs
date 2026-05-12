@@ -171,6 +171,67 @@ test("static wasm source defaults to live realtime dimensions", async ({ page })
   expectNoKnownWasmPanic(consoleLines, pageErrors);
 });
 
+test("synthetic wasm source does not request webcam frames", async ({ page }) => {
+  const consoleLines = [];
+  const pageErrors = [];
+
+  page.on("console", (message) => {
+    consoleLines.push(`${message.type()}: ${message.text()}`);
+  });
+  page.on("pageerror", (error) => {
+    pageErrors.push(error.message);
+  });
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: {
+        getUserMedia: async () => {
+          window.__autogazeGetUserMediaCalls =
+            (window.__autogazeGetUserMediaCalls || 0) + 1;
+          throw new Error("webcam should not be requested in synthetic-source mode");
+        },
+      },
+    });
+  });
+
+  await page.goto(
+    "/?source=synthetic-pan&load-model=false&show-fps=false&show-gaze-ratio=true&show-psnr=true&mode=realtime",
+    { waitUntil: "domcontentloaded" },
+  );
+
+  const status = page.locator("#status");
+  let state = "pending";
+  await expect
+    .poll(
+      async () => {
+        const text = (await status.textContent()) ?? "";
+        if (text.includes("synthetic source running")) {
+          state = "running";
+        } else if (text.includes("webgpu unavailable")) {
+          state = "no-webgpu";
+        } else if (text.includes("runtime error")) {
+          state = "error";
+        } else {
+          state = "pending";
+        }
+        return state;
+      },
+      { timeout: 60_000 },
+    )
+    .not.toBe("pending");
+  const getUserMediaCalls = await page.evaluate(
+    () => window.__autogazeGetUserMediaCalls || 0,
+  );
+  expect(getUserMediaCalls).toBe(0);
+  if (state === "no-webgpu") {
+    expectNoKnownWasmPanic(consoleLines, pageErrors);
+    return;
+  }
+  expect(state).toBe("running");
+  expect(pageErrors).toEqual([]);
+  expectNoKnownWasmPanic(consoleLines, pageErrors);
+});
+
 test("starts wasm model load through async wgpu setup", async ({ page }) => {
   const consoleLines = [];
   const pageErrors = [];

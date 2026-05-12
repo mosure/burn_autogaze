@@ -995,6 +995,8 @@ pub struct AutoGazeGazingModel<B: Backend> {
     pub connector: Connector<B>,
     pub gaze_decoder: AutoGazeLlamaForCausalLmMultiTokenPred<B>,
     #[module(skip)]
+    scale_layouts: Vec<ScaleTokenLayout>,
+    #[module(skip)]
     input_img_size: usize,
     #[module(skip)]
     num_vision_tokens_each_frame: usize,
@@ -1008,12 +1010,32 @@ pub struct AutoGazeGazingModel<B: Backend> {
 
 impl<B: Backend> AutoGazeGazingModel<B> {
     pub fn new(config: &GazeModelConfig, device: &B::Device) -> Self {
+        let token_count = config.num_vision_tokens_each_frame.max(1);
+        Self::new_with_scale_layouts(
+            config,
+            vec![ScaleTokenLayout {
+                token_count,
+                grid: square_grid(token_count),
+            }],
+            device,
+        )
+    }
+
+    pub(crate) fn new_with_scale_layouts(
+        config: &GazeModelConfig,
+        scale_layouts: Vec<ScaleTokenLayout>,
+        device: &B::Device,
+    ) -> Self {
         Self {
             vision_model: ShallowVideoConvNet::new(&config.vision_model_config, device),
             connector: Connector::new(&config.connector_config, device),
             gaze_decoder: AutoGazeLlamaForCausalLmMultiTokenPred::new(
                 &config.gaze_decoder_config,
                 device,
+            ),
+            scale_layouts: normalize_scale_layouts(
+                scale_layouts,
+                config.num_vision_tokens_each_frame.max(1),
             ),
             input_img_size: config.input_img_size.max(1),
             num_vision_tokens_each_frame: config.num_vision_tokens_each_frame.max(1),
@@ -1055,11 +1077,36 @@ impl<B: Backend> AutoGazeGazingModel<B> {
         max_gaze_tokens_each_frame: usize,
         task_loss_requirement: Option<f32>,
     ) -> AutoGazeGenerateOutput {
+        self.generate_with_coverage_stop(
+            video,
+            max_gaze_tokens_each_frame,
+            task_loss_requirement,
+            None,
+        )
+    }
+
+    pub(crate) fn generate_with_coverage_stop(
+        &self,
+        video: Tensor<B, 5>,
+        max_gaze_tokens_each_frame: usize,
+        task_loss_requirement: Option<f32>,
+        coverage_stop_ratio: Option<f64>,
+    ) -> AutoGazeGenerateOutput {
         let frames = video.shape().dims::<5>()[1];
         if frames > 1 {
-            self.generate_cached(video, max_gaze_tokens_each_frame, task_loss_requirement)
+            self.generate_cached_with_coverage_stop(
+                video,
+                max_gaze_tokens_each_frame,
+                task_loss_requirement,
+                coverage_stop_ratio,
+            )
         } else {
-            self.generate_uncached(video, max_gaze_tokens_each_frame, task_loss_requirement)
+            self.generate_uncached_with_coverage_stop(
+                video,
+                max_gaze_tokens_each_frame,
+                task_loss_requirement,
+                coverage_stop_ratio,
+            )
         }
     }
 
@@ -1068,6 +1115,21 @@ impl<B: Backend> AutoGazeGazingModel<B> {
         video: Tensor<B, 5>,
         max_gaze_tokens_each_frame: usize,
         task_loss_requirement: Option<f32>,
+    ) -> AutoGazeGenerateOutput {
+        self.generate_cached_with_coverage_stop(
+            video,
+            max_gaze_tokens_each_frame,
+            task_loss_requirement,
+            None,
+        )
+    }
+
+    pub(crate) fn generate_cached_with_coverage_stop(
+        &self,
+        video: Tensor<B, 5>,
+        max_gaze_tokens_each_frame: usize,
+        task_loss_requirement: Option<f32>,
+        coverage_stop_ratio: Option<f64>,
     ) -> AutoGazeGenerateOutput {
         let video = self.resize_video(video);
         let (video_embeds, _) = self.embed_video(video, false, None);
@@ -1119,6 +1181,11 @@ impl<B: Backend> AutoGazeGazingModel<B> {
             let mut frame_padded = vec![Vec::<bool>::new(); batch];
             let mut frame_confidences = vec![Vec::<f32>::new(); batch];
             let mut finished = vec![false; batch];
+            let mut coverage_trackers = generation_coverage_trackers(
+                batch,
+                coverage_stop_ratio,
+                &self.scale_layouts,
+            );
             let mut is_first_token = true;
             let generation_prefix_len = prefix_attention_mask.first().map(Vec::len).unwrap_or(0);
             let generation_tail_positions =
@@ -1204,7 +1271,13 @@ impl<B: Backend> AutoGazeGazingModel<B> {
                         prefix_attention_mask[batch_idx].push(1);
                         let tail = &generation_tail_positions[batch_idx];
                         prefix_position_ids[batch_idx].push(tail[local_idx % tail.len()]);
-                        if !valid {
+                        let coverage_stop = valid
+                            && observe_generation_coverage(
+                                &mut coverage_trackers,
+                                batch_idx,
+                                token,
+                            );
+                        if !valid || coverage_stop {
                             finished[batch_idx] = true;
                         }
                     }
@@ -1282,6 +1355,23 @@ impl<B: Backend> AutoGazeGazingModel<B> {
         max_gaze_tokens_each_frame: usize,
         task_loss_requirement: Option<f32>,
     ) -> AutoGazeGenerateOutput {
+        self.generate_streaming_cached_with_coverage_stop(
+            video,
+            cache,
+            max_gaze_tokens_each_frame,
+            task_loss_requirement,
+            None,
+        )
+    }
+
+    pub(crate) fn generate_streaming_cached_with_coverage_stop(
+        &self,
+        video: Tensor<B, 5>,
+        cache: &mut AutoGazeStreamingCache<B>,
+        max_gaze_tokens_each_frame: usize,
+        task_loss_requirement: Option<f32>,
+        coverage_stop_ratio: Option<f64>,
+    ) -> AutoGazeGenerateOutput {
         let video = self.resize_video(video);
         let [batch, frames, _channels, _height, _width] = video.shape().dims::<5>();
         let max_tokens = max_gaze_tokens_each_frame.max(1);
@@ -1346,6 +1436,11 @@ impl<B: Backend> AutoGazeGazingModel<B> {
             let mut frame_padded = vec![Vec::<bool>::new(); batch];
             let mut frame_confidences = vec![Vec::<f32>::new(); batch];
             let mut finished = vec![false; batch];
+            let mut coverage_trackers = generation_coverage_trackers(
+                batch,
+                coverage_stop_ratio,
+                &self.scale_layouts,
+            );
             let mut is_first_token = true;
             let generation_prefix_len = state
                 .prefix_attention_mask
@@ -1438,7 +1533,13 @@ impl<B: Backend> AutoGazeGazingModel<B> {
                         state.prefix_attention_mask[batch_idx].push(1);
                         let tail = &generation_tail_positions[batch_idx];
                         state.prefix_position_ids[batch_idx].push(tail[local_idx % tail.len()]);
-                        if !valid {
+                        let coverage_stop = valid
+                            && observe_generation_coverage(
+                                &mut coverage_trackers,
+                                batch_idx,
+                                token,
+                            );
+                        if !valid || coverage_stop {
                             finished[batch_idx] = true;
                         }
                     }
@@ -1490,6 +1591,21 @@ impl<B: Backend> AutoGazeGazingModel<B> {
         max_gaze_tokens_each_frame: usize,
         task_loss_requirement: Option<f32>,
     ) -> AutoGazeGenerateOutput {
+        self.generate_uncached_with_coverage_stop(
+            video,
+            max_gaze_tokens_each_frame,
+            task_loss_requirement,
+            None,
+        )
+    }
+
+    pub(crate) fn generate_uncached_with_coverage_stop(
+        &self,
+        video: Tensor<B, 5>,
+        max_gaze_tokens_each_frame: usize,
+        task_loss_requirement: Option<f32>,
+        coverage_stop_ratio: Option<f64>,
+    ) -> AutoGazeGenerateOutput {
         let video = self.resize_video(video);
         let (video_embeds, _) = self.embed_video(video, false, None);
         let [batch, frames, vision_tokens, dim] = video_embeds.shape().dims::<4>();
@@ -1539,6 +1655,11 @@ impl<B: Backend> AutoGazeGazingModel<B> {
             let mut frame_padded = vec![Vec::<bool>::new(); batch];
             let mut frame_confidences = vec![Vec::<f32>::new(); batch];
             let mut finished = vec![false; batch];
+            let mut coverage_trackers = generation_coverage_trackers(
+                batch,
+                coverage_stop_ratio,
+                &self.scale_layouts,
+            );
             let mut is_first_token = true;
             let max_tokens = max_gaze_tokens_each_frame.max(1);
             let generation_prefix_len = sequence_embeds.shape().dims::<3>()[1];
@@ -1613,7 +1734,13 @@ impl<B: Backend> AutoGazeGazingModel<B> {
                         prefix_attention_mask[batch_idx].push(1);
                         let tail = &generation_tail_positions[batch_idx];
                         prefix_position_ids[batch_idx].push(tail[local_idx % tail.len()]);
-                        if !valid {
+                        let coverage_stop = valid
+                            && observe_generation_coverage(
+                                &mut coverage_trackers,
+                                batch_idx,
+                                token,
+                            );
+                        if !valid || coverage_stop {
                             finished[batch_idx] = true;
                         }
                     }
@@ -1656,13 +1783,39 @@ impl<B: Backend> AutoGazeGazingModel<B> {
         max_gaze_tokens_each_frame: usize,
         task_loss_requirement: Option<f32>,
     ) -> Result<AutoGazeGenerateOutput, ExecutionError> {
+        self.generate_async_with_coverage_stop(
+            video,
+            max_gaze_tokens_each_frame,
+            task_loss_requirement,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn generate_async_with_coverage_stop(
+        &self,
+        video: Tensor<B, 5>,
+        max_gaze_tokens_each_frame: usize,
+        task_loss_requirement: Option<f32>,
+        coverage_stop_ratio: Option<f64>,
+    ) -> Result<AutoGazeGenerateOutput, ExecutionError> {
         let frames = video.shape().dims::<5>()[1];
         if frames > 1 {
-            self.generate_cached_async(video, max_gaze_tokens_each_frame, task_loss_requirement)
-                .await
+            self.generate_cached_async_with_coverage_stop(
+                video,
+                max_gaze_tokens_each_frame,
+                task_loss_requirement,
+                coverage_stop_ratio,
+            )
+            .await
         } else {
-            self.generate_uncached_async(video, max_gaze_tokens_each_frame, task_loss_requirement)
-                .await
+            self.generate_uncached_async_with_coverage_stop(
+                video,
+                max_gaze_tokens_each_frame,
+                task_loss_requirement,
+                coverage_stop_ratio,
+            )
+            .await
         }
     }
 
@@ -1671,6 +1824,22 @@ impl<B: Backend> AutoGazeGazingModel<B> {
         video: Tensor<B, 5>,
         max_gaze_tokens_each_frame: usize,
         task_loss_requirement: Option<f32>,
+    ) -> Result<AutoGazeGenerateOutput, ExecutionError> {
+        self.generate_cached_async_with_coverage_stop(
+            video,
+            max_gaze_tokens_each_frame,
+            task_loss_requirement,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn generate_cached_async_with_coverage_stop(
+        &self,
+        video: Tensor<B, 5>,
+        max_gaze_tokens_each_frame: usize,
+        task_loss_requirement: Option<f32>,
+        coverage_stop_ratio: Option<f64>,
     ) -> Result<AutoGazeGenerateOutput, ExecutionError> {
         let video = self.resize_video(video);
         let (video_embeds, _) = self.embed_video(video, false, None);
@@ -1722,6 +1891,11 @@ impl<B: Backend> AutoGazeGazingModel<B> {
             let mut frame_padded = vec![Vec::<bool>::new(); batch];
             let mut frame_confidences = vec![Vec::<f32>::new(); batch];
             let mut finished = vec![false; batch];
+            let mut coverage_trackers = generation_coverage_trackers(
+                batch,
+                coverage_stop_ratio,
+                &self.scale_layouts,
+            );
             let mut is_first_token = true;
             let generation_prefix_len = prefix_attention_mask.first().map(Vec::len).unwrap_or(0);
             let generation_tail_positions =
@@ -1808,7 +1982,13 @@ impl<B: Backend> AutoGazeGazingModel<B> {
                         prefix_attention_mask[batch_idx].push(1);
                         let tail = &generation_tail_positions[batch_idx];
                         prefix_position_ids[batch_idx].push(tail[local_idx % tail.len()]);
-                        if !valid {
+                        let coverage_stop = valid
+                            && observe_generation_coverage(
+                                &mut coverage_trackers,
+                                batch_idx,
+                                token,
+                            );
+                        if !valid || coverage_stop {
                             finished[batch_idx] = true;
                         }
                     }
@@ -1852,6 +2032,24 @@ impl<B: Backend> AutoGazeGazingModel<B> {
         cache: &mut AutoGazeStreamingCache<B>,
         max_gaze_tokens_each_frame: usize,
         task_loss_requirement: Option<f32>,
+    ) -> Result<AutoGazeGenerateOutput, ExecutionError> {
+        self.generate_streaming_cached_async_with_coverage_stop(
+            video,
+            cache,
+            max_gaze_tokens_each_frame,
+            task_loss_requirement,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn generate_streaming_cached_async_with_coverage_stop(
+        &self,
+        video: Tensor<B, 5>,
+        cache: &mut AutoGazeStreamingCache<B>,
+        max_gaze_tokens_each_frame: usize,
+        task_loss_requirement: Option<f32>,
+        coverage_stop_ratio: Option<f64>,
     ) -> Result<AutoGazeGenerateOutput, ExecutionError> {
         let video = self.resize_video(video);
         let [batch, frames, _channels, _height, _width] = video.shape().dims::<5>();
@@ -1917,6 +2115,11 @@ impl<B: Backend> AutoGazeGazingModel<B> {
             let mut frame_padded = vec![Vec::<bool>::new(); batch];
             let mut frame_confidences = vec![Vec::<f32>::new(); batch];
             let mut finished = vec![false; batch];
+            let mut coverage_trackers = generation_coverage_trackers(
+                batch,
+                coverage_stop_ratio,
+                &self.scale_layouts,
+            );
             let mut is_first_token = true;
             let generation_prefix_len = state
                 .prefix_attention_mask
@@ -2010,7 +2213,13 @@ impl<B: Backend> AutoGazeGazingModel<B> {
                         state.prefix_attention_mask[batch_idx].push(1);
                         let tail = &generation_tail_positions[batch_idx];
                         state.prefix_position_ids[batch_idx].push(tail[local_idx % tail.len()]);
-                        if !valid {
+                        let coverage_stop = valid
+                            && observe_generation_coverage(
+                                &mut coverage_trackers,
+                                batch_idx,
+                                token,
+                            );
+                        if !valid || coverage_stop {
                             finished[batch_idx] = true;
                         }
                     }
@@ -2062,6 +2271,22 @@ impl<B: Backend> AutoGazeGazingModel<B> {
         max_gaze_tokens_each_frame: usize,
         task_loss_requirement: Option<f32>,
     ) -> Result<AutoGazeGenerateOutput, ExecutionError> {
+        self.generate_uncached_async_with_coverage_stop(
+            video,
+            max_gaze_tokens_each_frame,
+            task_loss_requirement,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn generate_uncached_async_with_coverage_stop(
+        &self,
+        video: Tensor<B, 5>,
+        max_gaze_tokens_each_frame: usize,
+        task_loss_requirement: Option<f32>,
+        coverage_stop_ratio: Option<f64>,
+    ) -> Result<AutoGazeGenerateOutput, ExecutionError> {
         let video = self.resize_video(video);
         let (video_embeds, _) = self.embed_video(video, false, None);
         let [batch, frames, vision_tokens, dim] = video_embeds.shape().dims::<4>();
@@ -2110,6 +2335,11 @@ impl<B: Backend> AutoGazeGazingModel<B> {
             let mut frame_padded = vec![Vec::<bool>::new(); batch];
             let mut frame_confidences = vec![Vec::<f32>::new(); batch];
             let mut finished = vec![false; batch];
+            let mut coverage_trackers = generation_coverage_trackers(
+                batch,
+                coverage_stop_ratio,
+                &self.scale_layouts,
+            );
             let mut is_first_token = true;
             let max_tokens = max_gaze_tokens_each_frame.max(1);
             let generation_prefix_len = sequence_embeds.shape().dims::<3>()[1];
@@ -2185,7 +2415,13 @@ impl<B: Backend> AutoGazeGazingModel<B> {
                         prefix_attention_mask[batch_idx].push(1);
                         let tail = &generation_tail_positions[batch_idx];
                         prefix_position_ids[batch_idx].push(tail[local_idx % tail.len()]);
-                        if !valid {
+                        let coverage_stop = valid
+                            && observe_generation_coverage(
+                                &mut coverage_trackers,
+                                batch_idx,
+                                token,
+                            );
+                        if !valid || coverage_stop {
                             finished[batch_idx] = true;
                         }
                     }
@@ -2287,7 +2523,11 @@ impl Default for AutoGazeLoadOptions {
 impl<B: Backend> NativeAutoGazeModel<B> {
     pub fn new(config: &AutoGazeConfig, device: &B::Device) -> Self {
         Self {
-            gazing_model: AutoGazeGazingModel::new(&config.gaze_model_config, device),
+            gazing_model: AutoGazeGazingModel::new_with_scale_layouts(
+                &config.gaze_model_config,
+                scale_token_layouts(config),
+                device,
+            ),
             config: config.clone(),
         }
     }
@@ -2378,8 +2618,28 @@ impl<B: Backend> NativeAutoGazeModel<B> {
         max_gaze_tokens_each_frame: usize,
         task_loss_requirement: Option<f32>,
     ) -> AutoGazeGenerateOutput {
+        self.generate_with_task_loss_requirement_and_coverage_stop(
+            video,
+            max_gaze_tokens_each_frame,
+            task_loss_requirement,
+            None,
+        )
+    }
+
+    pub fn generate_with_task_loss_requirement_and_coverage_stop(
+        &self,
+        video: Tensor<B, 5>,
+        max_gaze_tokens_each_frame: usize,
+        task_loss_requirement: Option<f32>,
+        coverage_stop_ratio: Option<f64>,
+    ) -> AutoGazeGenerateOutput {
         self.gazing_model
-            .generate(video, max_gaze_tokens_each_frame, task_loss_requirement)
+            .generate_with_coverage_stop(
+                video,
+                max_gaze_tokens_each_frame,
+                task_loss_requirement,
+                coverage_stop_ratio,
+            )
     }
 
     pub async fn generate_with_task_loss_requirement_async(
@@ -2388,8 +2648,29 @@ impl<B: Backend> NativeAutoGazeModel<B> {
         max_gaze_tokens_each_frame: usize,
         task_loss_requirement: Option<f32>,
     ) -> Result<AutoGazeGenerateOutput, ExecutionError> {
+        self.generate_with_task_loss_requirement_and_coverage_stop_async(
+            video,
+            max_gaze_tokens_each_frame,
+            task_loss_requirement,
+            None,
+        )
+        .await
+    }
+
+    pub async fn generate_with_task_loss_requirement_and_coverage_stop_async(
+        &self,
+        video: Tensor<B, 5>,
+        max_gaze_tokens_each_frame: usize,
+        task_loss_requirement: Option<f32>,
+        coverage_stop_ratio: Option<f64>,
+    ) -> Result<AutoGazeGenerateOutput, ExecutionError> {
         self.gazing_model
-            .generate_async(video, max_gaze_tokens_each_frame, task_loss_requirement)
+            .generate_async_with_coverage_stop(
+                video,
+                max_gaze_tokens_each_frame,
+                task_loss_requirement,
+                coverage_stop_ratio,
+            )
             .await
     }
 
@@ -2400,11 +2681,29 @@ impl<B: Backend> NativeAutoGazeModel<B> {
         max_gaze_tokens_each_frame: usize,
         task_loss_requirement: Option<f32>,
     ) -> AutoGazeGenerateOutput {
-        self.gazing_model.generate_streaming_cached(
+        self.generate_streaming_with_task_loss_requirement_and_coverage_stop(
             video,
             cache,
             max_gaze_tokens_each_frame,
             task_loss_requirement,
+            None,
+        )
+    }
+
+    pub fn generate_streaming_with_task_loss_requirement_and_coverage_stop(
+        &self,
+        video: Tensor<B, 5>,
+        cache: &mut AutoGazeStreamingCache<B>,
+        max_gaze_tokens_each_frame: usize,
+        task_loss_requirement: Option<f32>,
+        coverage_stop_ratio: Option<f64>,
+    ) -> AutoGazeGenerateOutput {
+        self.gazing_model.generate_streaming_cached_with_coverage_stop(
+            video,
+            cache,
+            max_gaze_tokens_each_frame,
+            task_loss_requirement,
+            coverage_stop_ratio,
         )
     }
 
@@ -2415,12 +2714,31 @@ impl<B: Backend> NativeAutoGazeModel<B> {
         max_gaze_tokens_each_frame: usize,
         task_loss_requirement: Option<f32>,
     ) -> Result<AutoGazeGenerateOutput, ExecutionError> {
+        self.generate_streaming_with_task_loss_requirement_and_coverage_stop_async(
+            video,
+            cache,
+            max_gaze_tokens_each_frame,
+            task_loss_requirement,
+            None,
+        )
+        .await
+    }
+
+    pub async fn generate_streaming_with_task_loss_requirement_and_coverage_stop_async(
+        &self,
+        video: Tensor<B, 5>,
+        cache: &mut AutoGazeStreamingCache<B>,
+        max_gaze_tokens_each_frame: usize,
+        task_loss_requirement: Option<f32>,
+        coverage_stop_ratio: Option<f64>,
+    ) -> Result<AutoGazeGenerateOutput, ExecutionError> {
         self.gazing_model
-            .generate_streaming_cached_async(
+            .generate_streaming_cached_async_with_coverage_stop(
                 video,
                 cache,
                 max_gaze_tokens_each_frame,
                 task_loss_requirement,
+                coverage_stop_ratio,
             )
             .await
     }
@@ -3637,9 +3955,138 @@ fn generated_scale_token_masks(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ScaleTokenLayout {
+pub(crate) struct ScaleTokenLayout {
     token_count: usize,
     grid: usize,
+}
+
+#[derive(Clone, Debug)]
+struct GenerationCoverageTracker {
+    scale_layouts: Vec<ScaleTokenLayout>,
+    grid: usize,
+    covered: Vec<bool>,
+    covered_count: usize,
+    stop_cells: usize,
+}
+
+impl GenerationCoverageTracker {
+    fn new(scale_layouts: &[ScaleTokenLayout], stop_ratio: f64) -> Option<Self> {
+        if !stop_ratio.is_finite() || stop_ratio <= 0.0 {
+            return None;
+        }
+
+        let scale_layouts = normalize_scale_layouts(scale_layouts.to_vec(), 1);
+        let grid = coverage_grid_for_layouts(&scale_layouts);
+        let cells = grid.checked_mul(grid)?;
+        let stop_cells = ((stop_ratio.clamp(0.0, 1.0) * cells as f64).ceil() as usize)
+            .clamp(1, cells);
+        Some(Self {
+            scale_layouts,
+            grid,
+            covered: vec![false; cells],
+            covered_count: 0,
+            stop_cells,
+        })
+    }
+
+    fn observe_token(&mut self, token: i64) -> bool {
+        if token < 0 || self.covered_count >= self.stop_cells {
+            return self.covered_count >= self.stop_cells;
+        }
+
+        let Some((scale_idx, local)) = scale_token_index(token as usize, &self.scale_layouts)
+        else {
+            return false;
+        };
+        let source_grid = self.scale_layouts[scale_idx].grid.max(1);
+        let row = local / source_grid;
+        let col = local % source_grid;
+        let y0 = row.saturating_mul(self.grid) / source_grid;
+        let x0 = col.saturating_mul(self.grid) / source_grid;
+        let y1 = (row + 1).saturating_mul(self.grid).div_ceil(source_grid);
+        let x1 = (col + 1).saturating_mul(self.grid).div_ceil(source_grid);
+
+        for y in y0.min(self.grid)..y1.min(self.grid) {
+            let row_offset = y * self.grid;
+            for x in x0.min(self.grid)..x1.min(self.grid) {
+                let idx = row_offset + x;
+                if !self.covered[idx] {
+                    self.covered[idx] = true;
+                    self.covered_count += 1;
+                }
+            }
+        }
+        self.covered_count >= self.stop_cells
+    }
+}
+
+fn generation_coverage_trackers(
+    batch: usize,
+    stop_ratio: Option<f64>,
+    scale_layouts: &[ScaleTokenLayout],
+) -> Option<Vec<GenerationCoverageTracker>> {
+    let tracker = GenerationCoverageTracker::new(scale_layouts, stop_ratio?)?;
+    Some(vec![tracker; batch])
+}
+
+fn observe_generation_coverage(
+    trackers: &mut Option<Vec<GenerationCoverageTracker>>,
+    batch_idx: usize,
+    token: i64,
+) -> bool {
+    trackers
+        .as_mut()
+        .and_then(|trackers| trackers.get_mut(batch_idx))
+        .map(|tracker| tracker.observe_token(token))
+        .unwrap_or(false)
+}
+
+fn normalize_scale_layouts(
+    mut layouts: Vec<ScaleTokenLayout>,
+    fallback_token_count: usize,
+) -> Vec<ScaleTokenLayout> {
+    layouts.retain(|layout| layout.token_count > 0);
+    if layouts.is_empty() {
+        let token_count = fallback_token_count.max(1);
+        return vec![ScaleTokenLayout {
+            token_count,
+            grid: square_grid(token_count),
+        }];
+    }
+
+    for layout in &mut layouts {
+        layout.grid = layout.grid.max(1);
+    }
+    layouts
+}
+
+fn coverage_grid_for_layouts(layouts: &[ScaleTokenLayout]) -> usize {
+    const MAX_COVERAGE_GRID: usize = 256;
+    let max_grid = layouts.iter().map(|layout| layout.grid).max().unwrap_or(1);
+    let mut grid = 1usize;
+    for layout in layouts {
+        let Some(next) = bounded_lcm(grid, layout.grid.max(1), MAX_COVERAGE_GRID) else {
+            return max_grid.clamp(1, MAX_COVERAGE_GRID);
+        };
+        grid = next;
+    }
+    grid.max(max_grid.max(1)).min(MAX_COVERAGE_GRID)
+}
+
+fn bounded_lcm(left: usize, right: usize, max_value: usize) -> Option<usize> {
+    let gcd = gcd(left.max(1), right.max(1));
+    left.checked_div(gcd)?
+        .checked_mul(right.max(1))
+        .filter(|value| *value <= max_value)
+}
+
+fn gcd(mut left: usize, mut right: usize) -> usize {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left.max(1)
 }
 
 fn scale_token_index(token: usize, scale_layouts: &[ScaleTokenLayout]) -> Option<(usize, usize)> {
@@ -3796,6 +4243,32 @@ mod tests {
         assert_eq!(fine.cell_grid(), Some(14));
     }
 
+    #[test]
+    fn generation_coverage_tracker_stops_after_redundant_full_frame_cells() {
+        let config = AutoGazeConfig {
+            scales: "32+64+112+224".to_string(),
+            num_vision_tokens_each_frame: 265,
+            ..Default::default()
+        };
+        let layouts = scale_token_layouts(&config);
+        let mut tracker =
+            GenerationCoverageTracker::new(&layouts, 1.0).expect("coverage tracker");
+
+        assert!(!tracker.observe_token(0));
+        assert!(!tracker.observe_token(1));
+        assert!(!tracker.observe_token(2));
+        assert!(
+            tracker.observe_token(3),
+            "the four 2x2 coarse tokens cover the full normalized frame"
+        );
+        let covered_after_full_frame = tracker.covered_count;
+        assert!(tracker.observe_token(4));
+        assert_eq!(
+            tracker.covered_count, covered_after_full_frame,
+            "finer tokens inside already-covered coarse cells should not add work"
+        );
+    }
+
     #[cfg(feature = "ndarray")]
     #[test]
     fn generation_tail_positions_repeat_prefix_tail_for_generated_chunks() {
@@ -3888,7 +4361,9 @@ mod tests {
             .collect::<Vec<_>>();
         let video = Tensor::<B, 5>::from_data(TensorData::new(values, [1, 2, 3, 16, 16]), &device);
 
-        let uncached = model.gazing_model.generate_uncached(video.clone(), 4, None);
+        let uncached = model
+            .gazing_model
+            .generate_uncached(video.clone(), 4, None);
         let cached = model.gazing_model.generate_cached(video, 4, None);
 
         assert_eq!(cached.gazing_pos, uncached.gazing_pos);
@@ -3913,7 +4388,9 @@ mod tests {
             .collect::<Vec<_>>();
         let video = Tensor::<B, 5>::from_data(TensorData::new(values, [1, 2, 3, 16, 16]), &device);
 
-        let cached = model.gazing_model.generate_cached(video.clone(), 4, None);
+        let cached = model
+            .gazing_model
+            .generate_cached(video.clone(), 4, None);
         let mut cache = AutoGazeStreamingCache::new(2);
         let streaming =
             model

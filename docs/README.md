@@ -41,5 +41,5 @@ Additional docs:
 - [`performance-goal-loop.md`](./performance-goal-loop.md): iterative
   performance, quality, metrics, and hot-path cleanup loop.
 - [`validation.md`](./validation.md): release, wasm, browser, and fixture gates.
-- [`completion-audit.md`](./completion-audit.md): detailed historical coverage
-  checklist and hardware/browser notes.
+- [`completion-audit.md`](./completion-audit.md): current coverage checklist,
+  required gates, and hardware/browser caveats.

@@ -73,6 +73,15 @@ mask alpha-blended over the source image for a more readable mask panel.
 `image-mask-only` uses the same alpha-blended source/mask pixels but leaves
 unmasked pixels transparent.
 
+Mask geometry is independent from the visible mask style:
+
+- `native` draws and applies every decoded multi-scale cell.
+- `deduplicated` preserves the native update union but drops cells fully covered
+  by larger selected cells, which is useful for realtime viewers under heavy
+  motion.
+- `effective` projects selected tokens onto the finest active grid for compact
+  sparse-token consumers.
+
 | mode | output behavior | update ratio |
 |---|---|---|
 | `full-blend` | current frame plus alpha-blended mask | selected effective mask pixels / full frame |

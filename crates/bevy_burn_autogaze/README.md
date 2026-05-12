@@ -3,121 +3,137 @@
 Bevy viewer for `burn_autogaze`. Native and wasm builds use the same Bevy app
 and UI layer; platform code only supplies frames and model bytes.
 
-## Native
+## native
+
+```sh
+cargo run -p bevy_burn_autogaze
+cargo run -p bevy_burn_autogaze -- --image-path path/to/frame.png
+cargo run -p bevy_burn_autogaze -- --mode tiled --visualization-mode interframe
+```
+
+The no-arg default is the realtime camera profile:
+
+- `resize-224` model input.
+- 640px aspect-preserving source frames.
+- 16-frame rolling streaming cache.
+- Upstream model generation budget.
+- Deduplicated mask geometry.
+- Adaptive CPU/GPU display transfer.
+- Interframe output with PSNR enabled.
+- No periodic visualization keyframes.
+
+Point at local model assets with:
 
 ```sh
 cargo run -p bevy_burn_autogaze -- \
-  --model-dir /home/mosure/.cache/huggingface/hub/models--nvidia--AutoGaze/snapshots/5100fae739ec1bf3f875914fa1b703846a18943a
+  --model-dir /path/to/AutoGaze
 ```
 
-Use `--image-path path/to/frame.png` to run from a static image instead of the
-native camera. The default path is a continuous realtime profile: `resize-224`,
-640px aspect-preserving input, 16-frame rolling KV window, the model-configured
-generation budget, adaptive display transfer, PSNR overlay, interframe output, and no
-periodic visualization keyframes. Common viewer/inference knobs include `--top-k`, `--frames-per-clip`,
-`--max-in-flight`, `--max-gaze-tokens-each-frame`, `--inference-width`,
-`--inference-height`, `--task-loss-requirement`, `--disable-task-loss-requirement`,
-`--task-loss-requirement-db`, `--mask-cell-scale`, `--blend-alpha`, and `--show-fps`. `--show-gaze-ratio`
-toggles the text overlay for per-frame and EMA output update ratio.
-`--show-psnr=false` hides PSNR in dB between the current input and rendered
-output; the pixel comparison is skipped when this overlay is disabled.
-`--task-loss-requirement-db 28` expresses the upstream L1 reconstruction-loss
-threshold as `10^(-28 / 20)`, which is more PSNR-like but is not the same value
-as the rendered output PSNR overlay.
-`--help` lists the accepted values and aliases for mode-like options.
-`--log-pipeline-timing` prints source capture, resize/prep, pack, input
-upload/preprocess, model, visualization, and Bevy texture-update timing every
-few seconds. In `tiled` mode, source frames are resized into a complete AnyRes
-224px chunk grid and `--max-gaze-tokens-each-frame` controls the per-tile
-generation cap. The output recovery stitches each tile-local scale grid into a
-full-frame grid for that scale, matching upstream's mask recovery semantics.
-The default mask panel uses `--mask-visualization image-mask-only` to show only
-masked source pixels. Use `--mask-visualization image-overlay` to alpha-blend
-the colored mask over the full source frame, `--mask-visualization overlay` to
-show only the combined sparse-update footprint, or `--mask-visualization
-scale-rows` for a diagnostic view that draws only the active scale rows, each
-letterboxed to the source frame aspect.
-Use `--perf-summary-frames N` with `--image-path` or another deterministic
-source to process `N` inference outputs, print a JSON FPS/timing summary, and
-exit. Add `--perf-summary-path target/autogaze-bevy-perf/run.json` to write the
-same summary as a JSON artifact for hardware throughput reports.
-The docs birds asset profile remains available explicitly:
+Use `--load-model=false` to check camera/preview rendering without loading the
+model.
+
+## common options
+
+| option | default | notes |
+|---|---|---|
+| `--source` | `camera` | `camera`, `static`, or `synthetic-pan`; `--image-path` selects `static` automatically. |
+| `--mode` | `realtime` | `realtime`, `resize-224`, `tiled`, or full-resolution tiled aliases. |
+| `--frames-per-clip` | `16` | Number of frames in the model context window. |
+| `--streaming-cache` | `true` in realtime | Advances one frame at a time and preserves KV/cache order. |
+| `--max-in-flight` | `1` in realtime | Drops stale inference jobs instead of queueing old camera frames. |
+| `--task-loss-requirement` | model/viewer default | Upstream L1 reconstruction-loss threshold. |
+| `--task-loss-requirement-db` | unset | PSNR-like interface for the same task-loss threshold: `10^(-dB / 20)`. |
+| `--max-gaze-tokens-each-frame` | model default in realtime | `0` means the NVIDIA config value, currently `198`. |
+| `--top-k` | mode-specific | Number of gaze candidates considered per step. |
+| `--inference-width`, `--inference-height` | mode-specific | Source resize before inference/visualization. |
+| `--tile-batch-size` | mode-specific | Backend batch size for tiled modes. |
+| `--display-transfer` | `auto` | `auto`, `cpu`, or `gpu`. |
+| `--mask-geometry` | `deduplicated` | `native`, `deduplicated`, or `effective`. |
+| `--mask-visualization` | `image-mask-only` | `image-mask-only`, `image-overlay`, `overlay`, or `scale-rows`. |
+| `--visualization-mode` | `interframe` | `interframe` or `full-blend`. |
+| `--show-fps`, `--show-gaze-ratio`, `--show-psnr` | enabled where useful | Text overlays; PSNR work is skipped when disabled. |
+
+Run `cargo run -p bevy_burn_autogaze -- --help` for the complete list and
+aliases.
+
+## visualization
+
+Mask geometry controls the cells that are drawn and applied:
+
+- `deduplicated` preserves the native update union but removes cells fully
+  covered by other selected cells. This is the interactive default because
+  high-motion streams can otherwise repeat equivalent multi-scale work.
+- `native` draws every decoded AutoGaze cell exactly. Use it for model/debug
+  diagnostics and docs traces.
+- `effective` projects selected tokens onto the finest active grid for compact
+  sparse-token footprint views.
+
+Mask visualization controls how those cells are displayed:
+
+- `image-mask-only`: show only masked source pixels with transparent unmasked
+  pixels.
+- `image-overlay`: alpha-blend the colored mask over the full source frame.
+- `overlay`: show only the combined sparse-update footprint.
+- `scale-rows`: draw each active scale as a separate diagnostic row,
+  letterboxed to the source aspect.
+
+`--visualization-mode interframe --keyframe-duration 0` preserves prior output
+outside masked cells and updates masked cells from the current input. Positive
+keyframe durations are available for debugging. `full-blend` renders the current
+frame with an alpha-blended mask and reports selected effective mask coverage.
+
+The gaze-ratio overlay reports current and EMA output-pixel update ratio. The
+PSNR overlay reports current and EMA dB between the output column and current
+input.
+
+## tiled/docs profile
+
+The checked-in birds docs use full-resolution tiled inference and exact native
+mask diagnostics:
 
 ```sh
 cargo run -p bevy_burn_autogaze -- \
   --mode tiled --visualization-mode interframe \
   --max-gaze-tokens-each-frame 0 --frames-per-clip 16 \
   --tile-batch-size 4 --inference-width 1920 --inference-height 1080 \
-  --blend-alpha 0.55 --mask-visualization scale-rows --keyframe-duration 0
+  --blend-alpha 0.55 --mask-visualization scale-rows --mask-geometry native \
+  --keyframe-duration 0
 ```
 
-Realtime mode uses `--streaming-cache=true` by default. The cache advances one
-new frame at a time and evicts the oldest completed frame span from its rolling
-KV window instead of cold-starting at the horizon. Pass
-`--streaming-cache=false` for full-window comparison runs that reprocess the
-whole clip each inference.
-`--max-in-flight 1` is the default camera admission policy: if inference is busy,
-new camera frames refresh the buffered input window but do not queue stale model
-jobs. Realtime streaming-cache mode is always kept to one in-flight task when
-enabled so KV state advances in order; values above `1` apply to tiled or
-full-window non-streaming experiments. A max-gaze value of `0` uses the upstream
-model default, which is `198` for the NVIDIA config and is also the realtime
-default. The maximum frame budget is
-`max-gaze-tokens-each-frame * tile-count`, before task-loss stopping and
-confidence filtering. `--mode realtime` defaults to a 640px-wide
-aspect-preserving source frame. `--mode tiled` defaults to a bounded 1280px-wide
-aspect-preserving source frame, `--top-k 2`, 24 generated tokens per tile, and
-a tile batch size of 64. Pass explicit `--top-k`, `--tile-batch-size`,
-`--inference-width`, and `--inference-height` values for fixed full-resolution
-inspection.
-`--display-transfer auto` is the default display path. It keeps model-sized
-frames on the Bevy/Burn tensor bridge and uses the faster u8 Bevy image panel
-path for full-resolution displays, avoiding full-frame f32 tensor-panel uploads
-when many cells are active. `--display-transfer gpu` forces the shared
-Bevy/Burn WebGPU texture bridge for interop benchmarking, and
-`--display-transfer cpu` forces the u8 image path.
-For GPU interframe display, `--tensor-sparse-update-max-rects` and
-`--tensor-sparse-update-max-ratio` choose when the tensor compositor uses sparse
-rectangle copies instead of the dense mask path; use `0` rects to force dense
-updates for apples-to-apples benchmarking.
-Use `--require-hardware-adapter=true` for perf runs that should fail fast
-instead of silently measuring a CPU/software render adapter.
-Use `--load-model=false` to verify camera/preview rendering without waiting for
-model load or inference.
-From the repository root, run
-`cargo run -p xtask -- bevy-perf-matrix --frames 120 --camera` on a real GPU
-host to collect deterministic static-source and live camera throughput logs,
-per-case JSON summaries, and an aggregate `summary.json` under
-`target/autogaze-bevy-perf/`. The matrix runs the Bevy app with
-`cargo run --release` by default; pass `--profile dev` only when debugging the
-command path. Use `--case-timeout-seconds N` to override the default per-case
-timeout for slow first-build or driver-tuning hosts.
+For ordinary interactive tiled runs, prefer the default deduplicated geometry
+and bounded source dimensions unless you are explicitly inspecting the full
+source-resolution trace.
 
-`--visualization-mode full-blend` renders the current frame's alpha-blended
-mask. The default `--blend-alpha 0.38` keeps live overlays readable; the docs
-birds profile uses `0.55`. The center mask panel can color only the decoded
-multi-scale AutoGaze cells, alpha-blend those colors over the input image with
-`image-overlay`, show only masked input pixels with `image-mask-only`, or keep
-per-scale diagnostics separate with `scale-rows`.
-`--visualization-mode
-interframe --keyframe-duration 0` preserves the previous output outside masked
-cells and updates masked cells to the current input without periodic full-frame
-refreshes. Positive keyframe durations remain available for debugging. The
-gaze-ratio overlay reports the percentage of output pixels updated on the
-current frame plus an EMA across processed frames. The PSNR overlay reports
-current-frame and EMA dB for the output column compared to the current input
-frame.
+## performance capture
 
-In `full-blend` mode the update ratio reports selected effective mask coverage
-as a percentage of the full source frame. In `interframe` mode scheduled
-keyframes are excluded from the UI metric samples; intermediate frames report
-masked-cell coverage as a percentage of the full source frame.
-When the model is ready and inference is busy, camera frames continue to be
-buffered for the next clip but the displayed texture is not replaced by raw live
-preview frames; this keeps processed output monotonic and avoids apparent
-frame-order reversals in slower wasm runs.
+For deterministic summaries:
 
-## Web
+```sh
+cargo run -p bevy_burn_autogaze -- \
+  --image-path tests/fixtures/autogaze_birds_python_generate/raw_rgba_frame_00.png \
+  --perf-summary-frames 120 \
+  --perf-summary-path target/autogaze-bevy-perf/run.json
+```
+
+Use `--source synthetic-pan` for repeatable full-frame motion without a webcam.
+This feeds generated moving RGBA frames through the same frame queue,
+preprocessing, model, visualization, and display path as camera input.
+
+Use `--log-pipeline-timing` to print source capture, resize/prep, pack,
+preprocess/upload, model, visualization, and texture-update timing. Use
+`--require-hardware-adapter=true` when a perf run should fail instead of
+recording CPU/software adapter numbers.
+
+The matrix runner is the preferred multi-case path on a GPU host:
+
+```sh
+cargo run -p xtask -- bevy-perf-matrix --frames 120 --camera
+```
+
+It runs `cargo run --release` by default and writes per-case JSON summaries plus
+an aggregate `summary.json` under `target/autogaze-bevy-perf/`.
+
+## web
 
 ```sh
 npm run build:wasm
@@ -129,28 +145,22 @@ NVIDIA AutoGaze `config.json` and `model.safetensors` from Hugging Face by
 default and feeds browser camera frames through the exported `frame_input`
 function.
 
-The browser shell handles camera permission and frame upload only. The visible
-UI is rendered by Bevy into the `#bevy` canvas, matching the native path. Pass
-the same viewer/inference knobs as query parameters:
+The browser shell handles camera permission and frame upload only. Bevy renders
+the visible UI into the `#bevy` canvas, matching native. Pass viewer options as
+query parameters:
 
 ```text
-http://localhost:8080/?mode=tiled&visualization-mode=interframe&mask-visualization=scale-rows&keyframe-duration=0&frames-per-clip=16&inference-width=1920&inference-height=1080&tile-batch-size=4&show-fps=true&show-gaze-ratio=true&show-psnr=true
+http://localhost:8080/?source=static&mode=realtime&mask-geometry=deduplicated&show-psnr=true
 ```
 
-Use `?source=static` for a generated static frame, or `?image-url=./frame.png`
-to drive the Bevy UI from an image without requesting a webcam.
-`inference-width` and `inference-height` resize any received frame before it is
-queued for model inference and visualization; for generated static frames, those
-same query values also control the generated source resolution unless
-`static-width` or `static-height` are set. `load-model=false` keeps the viewer in
-preview mode for browser smoke tests. `max-in-flight` controls the same
-drop-if-busy inference admission policy as native.
-`perf-summary-frames=N` exposes live app timing at `window.__autogazePerf` and a
-final summary at `window.__autogazePerfSummary`, including dimensions, gaze
-ratio, frame counts, tensor interframe path, render adapter metadata, and the
-configured/effective realtime admission policy plus tensor sparse-update policy
-for Playwright smoke/perf checks.
+Useful browser parameters:
 
-Use `config-url` and `weights-url` query parameters to point the wasm build at
-alternate model assets. `mask-radius-scale` remains accepted as a compatibility
-alias for `mask-cell-scale`.
+- `source=static`: generated static frame, no webcam prompt.
+- `image-url=./frame.png`: image source, no webcam prompt.
+- `load-model=false`: preview-only smoke test.
+- `config-url` / `weights-url`: alternate model assets.
+- `perf-summary-frames=N`: exposes `window.__autogazePerf` samples and
+  `window.__autogazePerfSummary`.
+
+`mask-radius-scale` remains accepted as a compatibility alias for
+`mask-cell-scale`.

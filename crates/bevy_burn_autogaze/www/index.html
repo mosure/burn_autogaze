@@ -73,7 +73,9 @@
           await init();
           loading.style.display = "none";
 
-          if (usesStaticSource()) {
+          if (usesSyntheticSource()) {
+            setStatus("synthetic source running");
+          } else if (usesStaticSource()) {
             await startStaticSource();
           } else {
             await startCameraSource();
@@ -102,6 +104,18 @@
           source === "image" ||
           params.has("image-url") ||
           params.has("static-frame")
+        );
+      }
+
+      function usesSyntheticSource() {
+        const source = params.get("source")?.toLowerCase();
+        return (
+          source === "synthetic" ||
+          source === "synthetic-pan" ||
+          source === "pan" ||
+          source === "motion" ||
+          source === "full-motion" ||
+          source === "full-frame-motion"
         );
       }
 

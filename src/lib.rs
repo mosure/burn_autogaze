@@ -76,16 +76,18 @@ pub use safetensors_io::AutoGazeTraceStore;
 pub use teacher::AutoGazeTeacher;
 pub use trace::{FixationBounds, FixationPoint, FixationSet, FrameFixationTrace};
 pub use visualization::{
-    AutoGazeMaskPlanStats, AutoGazeMaskVisualizationMode, AutoGazeRgbaVisualizationBuffers,
-    AutoGazeRgbaVisualizationOptions, AutoGazeSparseUpdatePlan, AutoGazeTensorInterframePath,
-    AutoGazeTensorVisualization, AutoGazeTensorVisualizationOptions,
+    AutoGazeMaskGeometryMode, AutoGazeMaskPlanStats, AutoGazeMaskVisualizationMode,
+    AutoGazeRgbaVisualizationBuffers, AutoGazeRgbaVisualizationOptions, AutoGazeSparseUpdatePlan,
+    AutoGazeTensorInterframePath, AutoGazeTensorVisualization, AutoGazeTensorVisualizationOptions,
     AutoGazeTensorVisualizationPanels, AutoGazeTensorVisualizationState, AutoGazeVisualization,
     AutoGazeVisualizationMode, AutoGazeVisualizationPanels, AutoGazeVisualizationPanelsView,
     AutoGazeVisualizationState, DEFAULT_TENSOR_FULL_FRAME_UPDATE_MIN_RATIO,
     DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RATIO, DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RECTS,
     FixationPixelRect, copy_sparse_update_rgba, copy_sparse_update_tensor, fixation_alpha_mask,
-    fixation_cell_rects, fixation_effective_alpha_mask, fixation_effective_cell_rects,
-    fixation_effective_scale_mask_rgba, fixation_effective_sparse_update_plan,
+    fixation_cell_rects, fixation_deduplicated_cell_rects,
+    fixation_deduplicated_sparse_update_plan, fixation_effective_alpha_mask,
+    fixation_effective_cell_rects, fixation_effective_scale_mask_rgba,
+    fixation_effective_scale_mask_rgba_into, fixation_effective_sparse_update_plan,
     fixation_image_mask_only_rgba, fixation_image_mask_only_rgba_into,
     fixation_image_overlay_mask_rgba, fixation_image_overlay_mask_rgba_into, fixation_mask_rgba,
     fixation_mask_rgba_into, fixation_rect_union_pixel_count, fixation_scale_mask_rgba,

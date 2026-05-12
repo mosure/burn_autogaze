@@ -2,8 +2,8 @@ use std::{fmt, path::PathBuf, str::FromStr};
 
 use bevy::prelude::Resource;
 use burn_autogaze::{
-    AutoGazeInferenceMode, AutoGazeMaskVisualizationMode, AutoGazeRealtimePolicy,
-    AutoGazeVisualizationMode, DEFAULT_BLEND_ALPHA, DEFAULT_MAX_IN_FLIGHT,
+    AutoGazeInferenceMode, AutoGazeMaskGeometryMode, AutoGazeMaskVisualizationMode,
+    AutoGazeRealtimePolicy, AutoGazeVisualizationMode, DEFAULT_BLEND_ALPHA, DEFAULT_MAX_IN_FLIGHT,
     DEFAULT_MODEL_GENERATION_BUDGET, DEFAULT_REALTIME_TOP_K,
     DEFAULT_TENSOR_FULL_FRAME_UPDATE_MIN_RATIO, DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RATIO,
     DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RECTS, DEFAULT_TILED_FRAMES_PER_CLIP,
@@ -30,6 +30,8 @@ pub const DEFAULT_BIRDS_TILE_BATCH_SIZE: usize = 4;
 pub const DEFAULT_BIRDS_FRAMES_PER_CLIP: usize = 16;
 pub const DEFAULT_BIRDS_BLEND_ALPHA: f32 = 0.55;
 pub const DEFAULT_BIRDS_KEYFRAME_DURATION: usize = 0;
+pub const DEFAULT_BEVY_MASK_GEOMETRY_MODE: AutoGazeMaskGeometryMode =
+    AutoGazeMaskGeometryMode::Deduplicated;
 
 /// Viewer config sentinel for using the AutoGaze model's configured inference budget.
 ///
@@ -101,6 +103,46 @@ impl fmt::Display for BevyAutoGazeMode {
 
 pub const DEFAULT_BEVY_MODE: BevyAutoGazeMode = BevyAutoGazeMode::Resize224;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BevyFrameSource {
+    #[default]
+    Camera,
+    StaticImage,
+    SyntheticPan,
+}
+
+impl BevyFrameSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Camera => "camera",
+            Self::StaticImage => "static",
+            Self::SyntheticPan => "synthetic-pan",
+        }
+    }
+}
+
+impl FromStr for BevyFrameSource {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "camera" | "webcam" | "cam" | "live" => Ok(Self::Camera),
+            "static" | "image" | "image-path" | "file" | "still" => Ok(Self::StaticImage),
+            "synthetic" | "synthetic-pan" | "pan" | "camera-pan" | "motion" | "full-motion"
+            | "full-frame-motion" => Ok(Self::SyntheticPan),
+            other => Err(format!(
+                "unsupported frame source `{other}`; expected camera, static, or synthetic-pan"
+            )),
+        }
+    }
+}
+
+impl fmt::Display for BevyFrameSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum BevyDisplayTransfer {
     #[default]
@@ -151,6 +193,7 @@ pub struct BevyBurnAutoGazeConfig {
     pub weights_url: String,
     pub load_model: bool,
     pub warmup_model: bool,
+    pub source: BevyFrameSource,
     pub image_path: Option<PathBuf>,
     pub mode: BevyAutoGazeMode,
     pub top_k: usize,
@@ -164,6 +207,7 @@ pub struct BevyBurnAutoGazeConfig {
     pub inference_height: Option<u32>,
     pub mask_cell_scale: f32,
     pub mask_visualization_mode: AutoGazeMaskVisualizationMode,
+    pub mask_geometry_mode: AutoGazeMaskGeometryMode,
     pub blend_alpha: f32,
     pub visualization_mode: AutoGazeVisualizationMode,
     pub keyframe_duration: usize,
@@ -192,6 +236,7 @@ impl Default for BevyBurnAutoGazeConfig {
             weights_url: DEFAULT_WEIGHTS_URL.to_string(),
             load_model: true,
             warmup_model: true,
+            source: BevyFrameSource::Camera,
             image_path: None,
             mode,
             top_k: default_top_k(mode),
@@ -205,6 +250,7 @@ impl Default for BevyBurnAutoGazeConfig {
             inference_height,
             mask_cell_scale: 1.0,
             mask_visualization_mode: AutoGazeMaskVisualizationMode::ImageMaskOnly,
+            mask_geometry_mode: DEFAULT_BEVY_MASK_GEOMETRY_MODE,
             blend_alpha: DEFAULT_BLEND_ALPHA,
             visualization_mode: AutoGazeVisualizationMode::Interframe,
             keyframe_duration: DEFAULT_BIRDS_KEYFRAME_DURATION,
@@ -264,6 +310,13 @@ impl BevyBurnAutoGazeConfig {
             }
             "image-path" => {
                 self.image_path = (!value.is_empty()).then(|| PathBuf::from(value));
+                if self.image_path.is_some() {
+                    self.source = BevyFrameSource::StaticImage;
+                }
+                Ok(())
+            }
+            "source" | "frame-source" | "input-source" => {
+                self.source = value.parse()?;
                 Ok(())
             }
             "mode" => {
@@ -339,6 +392,18 @@ impl BevyBurnAutoGazeConfig {
             }
             "mask-visualization" | "mask-visualization-mode" | "mask-mode" | "mask-display" => {
                 self.mask_visualization_mode = value.parse()?;
+                Ok(())
+            }
+            "mask-geometry" | "mask-geometry-mode" | "mask-update-mode" | "mask-scale-policy" => {
+                self.mask_geometry_mode = value.parse()?;
+                Ok(())
+            }
+            "mask-dedup" | "mask-dedupe" => {
+                self.mask_geometry_mode = if parse_bool_option(&key, value)? {
+                    AutoGazeMaskGeometryMode::Deduplicated
+                } else {
+                    AutoGazeMaskGeometryMode::Native
+                };
                 Ok(())
             }
             "blend-alpha" => {
@@ -558,6 +623,7 @@ impl BevyBurnAutoGazeConfig {
             inference_width: Some(DEFAULT_BIRDS_INFERENCE_WIDTH),
             inference_height: Some(DEFAULT_BIRDS_INFERENCE_HEIGHT),
             mask_visualization_mode: AutoGazeMaskVisualizationMode::ImageMaskOnly,
+            mask_geometry_mode: AutoGazeMaskGeometryMode::Native,
             blend_alpha: DEFAULT_BIRDS_BLEND_ALPHA,
             keyframe_duration: DEFAULT_BIRDS_KEYFRAME_DURATION,
             display_transfer: BevyDisplayTransfer::Auto,
@@ -741,11 +807,12 @@ mod tests {
     fn applies_url_query_to_viewer_config() {
         let mut config = BevyBurnAutoGazeConfig::default();
         let errors = config.apply_query_string(
-            "?mode=full-res&top_k=2&frames-per-clip=3&max-in-flight=2&inference-width=1920&inference-height=1080&show-fps=false&show-psnr=false&task-loss-requirement=0.65&tile-batch-size=4&config-url=%2Fconfig.json&weights-url=%2Fmodel.safetensors&load-model=false&mask-cell-scale=2.5&mask-visualization=overlay&blend-alpha=0.5&visualization-mode=interframe&keyframe-duration=7&display-transfer=cpu&tensor-sparse-update-max-rects=8&tensor-sparse-update-max-ratio=0.05&tensor-full-frame-update-min-ratio=0.45&streaming-cache=false&require-hardware-adapter=true&perf-summary-frames=5&perf-summary-path=target%2Fperf.json",
+            "?mode=full-res&source=synthetic-pan&top_k=2&frames-per-clip=3&max-in-flight=2&inference-width=1920&inference-height=1080&show-fps=false&show-psnr=false&task-loss-requirement=0.65&tile-batch-size=4&config-url=%2Fconfig.json&weights-url=%2Fmodel.safetensors&load-model=false&mask-cell-scale=2.5&mask-visualization=overlay&mask-geometry=native&blend-alpha=0.5&visualization-mode=interframe&keyframe-duration=7&display-transfer=cpu&tensor-sparse-update-max-rects=8&tensor-sparse-update-max-ratio=0.05&tensor-full-frame-update-min-ratio=0.45&streaming-cache=false&require-hardware-adapter=true&perf-summary-frames=5&perf-summary-path=target%2Fperf.json",
         );
 
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(config.mode, BevyAutoGazeMode::Tile224);
+        assert_eq!(config.source, BevyFrameSource::SyntheticPan);
         assert_eq!(config.top_k, 2);
         assert_eq!(config.frames_per_clip, 3);
         assert_eq!(config.max_in_flight, 2);
@@ -765,6 +832,7 @@ mod tests {
             config.mask_visualization_mode,
             AutoGazeMaskVisualizationMode::Overlay
         );
+        assert_eq!(config.mask_geometry_mode, AutoGazeMaskGeometryMode::Native);
         assert_eq!(config.blend_alpha, 0.5);
         assert_eq!(
             config.visualization_mode,
@@ -823,6 +891,30 @@ mod tests {
             config.mask_visualization_mode,
             AutoGazeMaskVisualizationMode::ImageMaskOnly
         );
+
+        let errors = config.apply_query_string("?mask-geometry=effective");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            config.mask_geometry_mode,
+            AutoGazeMaskGeometryMode::Effective
+        );
+
+        let errors = config.apply_query_string("?mask-dedup=true");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            config.mask_geometry_mode,
+            AutoGazeMaskGeometryMode::Deduplicated
+        );
+    }
+
+    #[test]
+    fn image_path_query_selects_static_source_for_legacy_links() {
+        let mut config = BevyBurnAutoGazeConfig::default();
+        let errors = config.apply_query_string("?image-path=frame.png");
+
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(config.source, BevyFrameSource::StaticImage);
+        assert_eq!(config.image_path, Some(PathBuf::from("frame.png")));
     }
 
     #[test]
@@ -871,6 +963,7 @@ mod tests {
             config.mask_visualization_mode,
             AutoGazeMaskVisualizationMode::ImageMaskOnly
         );
+        assert_eq!(config.mask_geometry_mode, AutoGazeMaskGeometryMode::Native);
         assert_eq!(config.keyframe_duration, DEFAULT_BIRDS_KEYFRAME_DURATION);
         assert_eq!(config.display_transfer, BevyDisplayTransfer::Auto);
         assert!(!should_use_streaming_cache(

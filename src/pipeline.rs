@@ -549,6 +549,7 @@ pub struct AutoGazePipelineOptions {
     max_gaze_tokens_each_frame: Option<usize>,
     task_loss_requirement: AutoGazeTaskLossOption,
     tile_batch_size: Option<usize>,
+    generation_coverage_stop_ratio: Option<f64>,
 }
 
 impl AutoGazePipelineOptions {
@@ -557,6 +558,7 @@ impl AutoGazePipelineOptions {
             max_gaze_tokens_each_frame: None,
             task_loss_requirement: AutoGazeTaskLossOption::ModelDefault,
             tile_batch_size: None,
+            generation_coverage_stop_ratio: None,
         }
     }
 
@@ -570,6 +572,10 @@ impl AutoGazePipelineOptions {
 
     pub const fn tile_batch_size(&self) -> Option<usize> {
         self.tile_batch_size
+    }
+
+    pub const fn generation_coverage_stop_ratio(&self) -> Option<f64> {
+        self.generation_coverage_stop_ratio
     }
 
     pub const fn with_max_gaze_tokens_each_frame(
@@ -604,6 +610,16 @@ impl AutoGazePipelineOptions {
         self.tile_batch_size = Some(tile_batch_size);
         self
     }
+
+    pub const fn with_generation_coverage_stop_ratio(mut self, ratio: f64) -> Self {
+        self.generation_coverage_stop_ratio = Some(ratio);
+        self
+    }
+
+    pub const fn without_generation_coverage_stop(mut self) -> Self {
+        self.generation_coverage_stop_ratio = None;
+        self
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -620,6 +636,7 @@ pub struct AutoGazePipeline<B: Backend> {
     max_gaze_tokens_each_frame: usize,
     task_loss_requirement: Option<f32>,
     tile_batch_size: usize,
+    generation_coverage_stop_ratio: Option<f64>,
 }
 
 struct TileTraceAccumulator<'a> {
@@ -639,6 +656,7 @@ impl<B: Backend> AutoGazePipeline<B> {
             max_gaze_tokens_each_frame,
             task_loss_requirement,
             tile_batch_size: DEFAULT_TILED_TILE_BATCH_SIZE,
+            generation_coverage_stop_ratio: None,
         }
     }
 
@@ -676,6 +694,10 @@ impl<B: Backend> AutoGazePipeline<B> {
         self.tile_batch_size
     }
 
+    pub const fn generation_coverage_stop_ratio(&self) -> Option<f64> {
+        self.generation_coverage_stop_ratio
+    }
+
     pub fn with_options(mut self, options: AutoGazePipelineOptions) -> Self {
         self.apply_options(options);
         self
@@ -697,6 +719,8 @@ impl<B: Backend> AutoGazePipeline<B> {
         if let Some(tile_batch_size) = options.tile_batch_size {
             self.set_tile_batch_size(tile_batch_size);
         }
+
+        self.set_generation_coverage_stop_ratio(options.generation_coverage_stop_ratio);
     }
 
     pub fn with_max_gaze_tokens_each_frame(mut self, max_gaze_tokens_each_frame: usize) -> Self {
@@ -711,6 +735,11 @@ impl<B: Backend> AutoGazePipeline<B> {
 
     pub fn with_tile_batch_size(mut self, tile_batch_size: usize) -> Self {
         self.tile_batch_size = tile_batch_size.max(1);
+        self
+    }
+
+    pub fn with_generation_coverage_stop_ratio(mut self, ratio: Option<f64>) -> Self {
+        self.set_generation_coverage_stop_ratio(ratio);
         self
     }
 
@@ -732,6 +761,11 @@ impl<B: Backend> AutoGazePipeline<B> {
 
     pub fn set_tile_batch_size(&mut self, tile_batch_size: usize) {
         self.tile_batch_size = tile_batch_size.max(1);
+    }
+
+    pub fn set_generation_coverage_stop_ratio(&mut self, ratio: Option<f64>) {
+        self.generation_coverage_stop_ratio =
+            ratio.filter(|value| value.is_finite() && *value > 0.0);
     }
 
     pub const fn model(&self) -> &NativeAutoGazeModel<B> {
@@ -815,11 +849,13 @@ impl<B: Backend> AutoGazePipeline<B> {
     }
 
     pub fn generate(&self, video: Tensor<B, 5>) -> AutoGazeGenerateOutput {
-        self.model.generate_with_task_loss_requirement(
-            video,
-            self.max_gaze_tokens_each_frame,
-            self.task_loss_requirement,
-        )
+        self.model
+            .generate_with_task_loss_requirement_and_coverage_stop(
+                video,
+                self.max_gaze_tokens_each_frame,
+                self.task_loss_requirement,
+                self.generation_coverage_stop_ratio,
+            )
     }
 
     pub fn generate_with_limit(
@@ -827,11 +863,13 @@ impl<B: Backend> AutoGazePipeline<B> {
         video: Tensor<B, 5>,
         max_gaze_tokens_each_frame: usize,
     ) -> AutoGazeGenerateOutput {
-        self.model.generate_with_task_loss_requirement(
-            video,
-            max_gaze_tokens_each_frame.max(1),
-            self.task_loss_requirement,
-        )
+        self.model
+            .generate_with_task_loss_requirement_and_coverage_stop(
+                video,
+                max_gaze_tokens_each_frame.max(1),
+                self.task_loss_requirement,
+                self.generation_coverage_stop_ratio,
+            )
     }
 
     pub async fn generate_async(
@@ -839,10 +877,11 @@ impl<B: Backend> AutoGazePipeline<B> {
         video: Tensor<B, 5>,
     ) -> std::result::Result<AutoGazeGenerateOutput, ExecutionError> {
         self.model
-            .generate_with_task_loss_requirement_async(
+            .generate_with_task_loss_requirement_and_coverage_stop_async(
                 video,
                 self.max_gaze_tokens_each_frame,
                 self.task_loss_requirement,
+                self.generation_coverage_stop_ratio,
             )
             .await
     }
@@ -853,10 +892,11 @@ impl<B: Backend> AutoGazePipeline<B> {
         max_gaze_tokens_each_frame: usize,
     ) -> std::result::Result<AutoGazeGenerateOutput, ExecutionError> {
         self.model
-            .generate_with_task_loss_requirement_async(
+            .generate_with_task_loss_requirement_and_coverage_stop_async(
                 video,
                 max_gaze_tokens_each_frame.max(1),
                 self.task_loss_requirement,
+                self.generation_coverage_stop_ratio,
             )
             .await
     }
@@ -1009,13 +1049,16 @@ impl<B: Backend> AutoGazePipeline<B> {
         k: usize,
         cache: &mut AutoGazeStreamingCache<B>,
     ) -> Vec<FrameFixationTrace> {
-        self.model.trace_streaming_with_task_loss_requirement(
-            video,
-            cache,
-            k,
-            self.max_gaze_tokens_each_frame.max(k.max(1)),
-            self.task_loss_requirement,
-        )
+        let generated = self
+            .model
+            .generate_streaming_with_task_loss_requirement_and_coverage_stop(
+                video,
+                cache,
+                self.max_gaze_tokens_each_frame.max(k.max(1)),
+                self.task_loss_requirement,
+                self.generation_coverage_stop_ratio,
+            );
+        generated.traces(&self.model.config, self.max_gaze_tokens_each_frame.max(k.max(1)))
     }
 
     pub async fn trace_video_streaming_async(
@@ -1025,14 +1068,17 @@ impl<B: Backend> AutoGazePipeline<B> {
         cache: &mut AutoGazeStreamingCache<B>,
     ) -> std::result::Result<Vec<FrameFixationTrace>, ExecutionError> {
         self.model
-            .trace_streaming_with_task_loss_requirement_async(
+            .generate_streaming_with_task_loss_requirement_and_coverage_stop_async(
                 video,
                 cache,
-                k,
                 self.max_gaze_tokens_each_frame.max(k.max(1)),
                 self.task_loss_requirement,
+                self.generation_coverage_stop_ratio,
             )
             .await
+            .map(|generated| {
+                generated.traces(&self.model.config, self.max_gaze_tokens_each_frame.max(k.max(1)))
+            })
     }
 
     pub fn trace_prepared_run(
@@ -1236,12 +1282,16 @@ impl<B: Backend> AutoGazePipeline<B> {
     }
 
     fn trace_video_resize(&self, video: Tensor<B, 5>, k: usize) -> Vec<FrameFixationTrace> {
-        self.model.trace_video_with_task_loss_requirement(
-            video,
-            k,
-            self.max_gaze_tokens_each_frame.max(k.max(1)),
-            self.task_loss_requirement,
-        )
+        let trace_budget = self.max_gaze_tokens_each_frame.max(k.max(1));
+        let generated = self
+            .model
+            .generate_with_task_loss_requirement_and_coverage_stop(
+                video,
+                trace_budget,
+                self.task_loss_requirement,
+                self.generation_coverage_stop_ratio,
+            );
+        generated.traces(&self.model.config, trace_budget)
     }
 
     async fn trace_video_resize_async(
@@ -1249,14 +1299,16 @@ impl<B: Backend> AutoGazePipeline<B> {
         video: Tensor<B, 5>,
         k: usize,
     ) -> std::result::Result<Vec<FrameFixationTrace>, ExecutionError> {
+        let trace_budget = self.max_gaze_tokens_each_frame.max(k.max(1));
         self.model
-            .trace_video_with_task_loss_requirement_async(
+            .generate_with_task_loss_requirement_and_coverage_stop_async(
                 video,
-                k,
-                self.max_gaze_tokens_each_frame.max(k.max(1)),
+                trace_budget,
                 self.task_loss_requirement,
+                self.generation_coverage_stop_ratio,
             )
             .await
+            .map(|generated| generated.traces(&self.model.config, trace_budget))
     }
 
     fn collect_tiled_trace_points(

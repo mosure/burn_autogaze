@@ -962,6 +962,50 @@ fn bevy_perf_matrix(root: PathBuf, args: BevyPerfMatrixArgs) -> Result<()> {
             ],
             true,
         ),
+        (
+            "realtime-synthetic-pan-auto-interframe-psnr",
+            vec![
+                "--source",
+                "synthetic-pan",
+                "--mode",
+                "realtime",
+                "--display-transfer",
+                "auto",
+                "--visualization-mode",
+                "interframe",
+            ],
+            false,
+        ),
+        (
+            "realtime-synthetic-pan-cpu-interframe-no-psnr",
+            vec![
+                "--source",
+                "synthetic-pan",
+                "--mode",
+                "realtime",
+                "--display-transfer",
+                "cpu",
+                "--visualization-mode",
+                "interframe",
+                "--show-psnr=false",
+            ],
+            false,
+        ),
+        (
+            "realtime-synthetic-pan-gpu-interframe-no-psnr",
+            vec![
+                "--source",
+                "synthetic-pan",
+                "--mode",
+                "realtime",
+                "--display-transfer",
+                "gpu",
+                "--visualization-mode",
+                "interframe",
+                "--show-psnr=false",
+            ],
+            false,
+        ),
     ];
     if args.camera {
         cases.extend([
@@ -996,6 +1040,11 @@ fn bevy_perf_matrix(root: PathBuf, args: BevyPerfMatrixArgs) -> Result<()> {
         write_perf_matrix_manifest(&args.out, &args, &cases)?;
     }
 
+    let case_names = cases
+        .iter()
+        .map(|(name, _, _)| (*name).to_owned())
+        .collect::<Vec<_>>();
+
     for (name, case_args, include_static) in cases {
         let mut app_args = Vec::<OsString>::new();
         if include_static {
@@ -1020,7 +1069,7 @@ fn bevy_perf_matrix(root: PathBuf, args: BevyPerfMatrixArgs) -> Result<()> {
         )?;
     }
     if !runner.dry_run {
-        write_perf_aggregate(&args.out)?;
+        write_perf_aggregate(&args.out, &case_names)?;
         let summary = load_json(&args.out.join("summary.json"))?;
         validate_summary_or_aggregate(&summary, true)?;
         print_perf_summary(&summary)?;
@@ -1167,25 +1216,22 @@ fn write_json(path: &Path, data: &Value) -> Result<()> {
     Ok(())
 }
 
-fn write_perf_aggregate(out_dir: &Path) -> Result<()> {
+fn write_perf_aggregate(out_dir: &Path, case_names: &[String]) -> Result<()> {
+    ensure!(
+        !case_names.is_empty(),
+        "cannot write perf aggregate without case names"
+    );
     let mut rows = Vec::new();
-    for entry in fs::read_dir(out_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !is_perf_case_json_path(&path) {
-            continue;
-        }
+    for name in case_names {
+        let path = out_dir.join(format!("{name}.json"));
+        ensure!(
+            path.is_file(),
+            "missing per-case JSON summary for `{name}` at {}",
+            path.display()
+        );
         let mut row = load_json(&path)?;
         if let Some(object) = row.as_object_mut() {
-            object.insert(
-                "case".to_owned(),
-                Value::String(
-                    path.file_stem()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into(),
-                ),
-            );
+            object.insert("case".to_owned(), Value::String(name.clone()));
         }
         rows.push(row);
     }
@@ -1197,7 +1243,7 @@ fn write_perf_aggregate(out_dir: &Path) -> Result<()> {
     });
     ensure!(
         !rows.is_empty(),
-        "no per-case JSON summaries found in {}",
+        "no current per-case JSON summaries found in {}",
         out_dir.display()
     );
     let fps_values = rows
@@ -1216,6 +1262,7 @@ fn write_perf_aggregate(out_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn is_perf_case_json_path(path: &Path) -> bool {
     path.extension() == Some(OsStr::new("json"))
         && !matches!(
@@ -1275,6 +1322,7 @@ fn validate_summary(data: &Value, require_hardware_adapter: bool) -> Result<()> 
         "avg_display_ms",
         "avg_output_rgba_bytes",
         "avg_output_tensor_bytes",
+        "avg_active_trace_points",
     ] {
         require_number(data, field, 0.0, None, false)?;
     }
@@ -1293,6 +1341,7 @@ fn validate_summary(data: &Value, require_hardware_adapter: bool) -> Result<()> 
     for field in [
         "processed_model_frames",
         "latest_trace_points",
+        "latest_active_trace_points",
         "latest_sequence",
         "latest_output_rgba_bytes",
         "latest_output_tensor_bytes",
@@ -1316,6 +1365,12 @@ fn validate_summary(data: &Value, require_hardware_adapter: bool) -> Result<()> 
         );
     }
     require_enum(data, "mode", &["realtime", "resize-224", "tiled"], true)?;
+    require_enum(
+        data,
+        "source",
+        &["camera", "static", "synthetic-pan"],
+        false,
+    )?;
     require_enum(
         data,
         "visualization_mode",
@@ -1500,6 +1555,7 @@ fn validate_bevy_perf_summary_self_test() -> Result<()> {
         "latest_display_input_ms": 0.1,
         "target_frames": 4,
         "mode": "resize-224",
+        "source": "synthetic-pan",
         "visualization_mode": "interframe",
         "display_transfer": "gpu",
         "latest_effective_display_transfer": "gpu",
@@ -1723,6 +1779,14 @@ fn print_perf_row(row: &Value) -> Result<()> {
         .get("avg_gaze_update_ratio")
         .and_then(Value::as_f64)
         .unwrap_or(0.0);
+    let active_points = row
+        .get("avg_active_trace_points")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let trace_points = row
+        .get("avg_trace_points")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
     let adapter = row
         .get("render_adapter_name")
         .and_then(Value::as_str)
@@ -1757,7 +1821,7 @@ fn print_perf_row(row: &Value) -> Result<()> {
         "n/a".to_owned()
     };
     println!(
-        "  {case}: {fps:.2} output fps, total={total:.2} ms, model={model:.2} ms, display_input={display_input:.2} ms/{input_residency}, gaze={:.2}%, psnr={psnr} dB, residency={residency}, output={output_rgba_mib:.1} MiB rgba/{output_tensor_mib:.1} MiB tensor, adapter={adapter}",
+        "  {case}: {fps:.2} output fps, total={total:.2} ms, model={model:.2} ms, display_input={display_input:.2} ms/{input_residency}, points={active_points:.1}/{trace_points:.1}, gaze={:.2}%, psnr={psnr} dB, residency={residency}, output={output_rgba_mib:.1} MiB rgba/{output_tensor_mib:.1} MiB tensor, adapter={adapter}",
         gaze * 100.0
     );
     Ok(())
@@ -2295,6 +2359,36 @@ mod tests {
     }
 
     #[test]
+    fn perf_aggregate_uses_current_manifest_cases_only() {
+        let root = std::env::temp_dir().join(format!(
+            "burn-autogaze-xtask-aggregate-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp aggregate dir");
+
+        let mut current = valid_perf_summary();
+        current["avg_output_fps"] = Value::from(60.0);
+        write_json(&root.join("current-case.json"), &current).expect("write current case");
+
+        let stale = json!({
+            "case": "stale-case",
+            "avg_output_fps": 1.0
+        });
+        write_json(&root.join("stale-case.json"), &stale).expect("write stale case");
+
+        write_perf_aggregate(&root, &["current-case".to_owned()]).expect("write aggregate");
+        let aggregate = load_json(&root.join("summary.json")).expect("aggregate json");
+
+        assert_eq!(aggregate["case_count"], 1);
+        assert_eq!(aggregate["min_output_fps"], 60.0);
+        assert_eq!(aggregate["max_output_fps"], 60.0);
+        assert_eq!(aggregate["cases"][0]["case"], "current-case");
+
+        fs::remove_dir_all(&root).expect("cleanup temp aggregate dir");
+    }
+
+    #[test]
     fn perf_matrix_manifest_records_measurement_plan() {
         let root = std::env::temp_dir().join(format!(
             "burn-autogaze-xtask-manifest-{}",
@@ -2367,6 +2461,7 @@ mod tests {
             "avg_display_ms": 1.0,
             "avg_output_rgba_bytes": 0.0,
             "avg_output_tensor_bytes": 11059200.0,
+            "avg_active_trace_points": 9.0,
             "avg_gaze_update_ratio": 0.25,
             "latest_gaze_update_ratio": 0.2,
             "processed_frames": 4,
@@ -2376,6 +2471,7 @@ mod tests {
             "latest_width": 640,
             "latest_height": 360,
             "latest_trace_points": 12,
+            "latest_active_trace_points": 9,
             "latest_sequence": 3,
             "latest_output_rgba_bytes": 0,
             "latest_output_tensor_bytes": 11059200,

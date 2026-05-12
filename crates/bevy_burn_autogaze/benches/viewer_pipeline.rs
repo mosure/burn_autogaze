@@ -5,8 +5,9 @@ use bevy::{
     render::render_resource::{Extent3d, TextureDimension, TextureFormat},
 };
 use burn_autogaze::{
-    AutoGazeRgbaVisualizationBuffers, AutoGazeRgbaVisualizationOptions, AutoGazeVisualizationMode,
-    AutoGazeVisualizationState, FixationPoint,
+    AutoGazeMaskGeometryMode, AutoGazeRgbaVisualizationBuffers, AutoGazeRgbaVisualizationOptions,
+    AutoGazeVisualizationMode, AutoGazeVisualizationState,
+    DEFAULT_TENSOR_FULL_FRAME_UPDATE_MIN_RATIO, FixationPoint,
 };
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
@@ -27,11 +28,18 @@ struct VisualizationCase {
 }
 
 #[derive(Clone, Copy)]
+struct GeometryCase {
+    name: &'static str,
+    mode: AutoGazeMaskGeometryMode,
+}
+
+#[derive(Clone, Copy)]
 enum FixationCase {
     Multiscale,
     TinySparse,
     CoarseDense,
     DenseGrid64,
+    RedundantFullFrame,
 }
 
 impl FixationCase {
@@ -41,6 +49,7 @@ impl FixationCase {
             Self::TinySparse => "tiny-sparse",
             Self::CoarseDense => "coarse-dense",
             Self::DenseGrid64 => "dense-grid-64",
+            Self::RedundantFullFrame => "redundant-full-frame",
         }
     }
 
@@ -59,6 +68,7 @@ impl FixationCase {
                 0.25, 0.25, 0.5, 0.5, 1.0, 2,
             )],
             Self::DenseGrid64 => dense_grid_fixations(64),
+            Self::RedundantFullFrame => redundant_multiscale_fixations(),
         }
     }
 }
@@ -106,6 +116,21 @@ const FIXATION_CASES: &[FixationCase] = &[
     FixationCase::TinySparse,
     FixationCase::CoarseDense,
     FixationCase::DenseGrid64,
+    FixationCase::RedundantFullFrame,
+];
+const GEOMETRY_CASES: &[GeometryCase] = &[
+    GeometryCase {
+        name: "native",
+        mode: AutoGazeMaskGeometryMode::Native,
+    },
+    GeometryCase {
+        name: "deduplicated",
+        mode: AutoGazeMaskGeometryMode::Deduplicated,
+    },
+    GeometryCase {
+        name: "effective",
+        mode: AutoGazeMaskGeometryMode::Effective,
+    },
 ];
 const BLEND_ALPHA: f32 = 0.72;
 const KEYFRAME_DURATION: usize = 30;
@@ -123,6 +148,16 @@ fn bench_viewer_pipeline(c: &mut Criterion) {
         }
     }
 
+    group.finish();
+
+    let mut group = c.benchmark_group("bevy_autogaze_mask_geometry");
+    group.sample_size(10);
+    for &case in VIDEO_CASES {
+        group.throughput(Throughput::Bytes((case.width * case.height * 4 * 3) as u64));
+        for &geometry in GEOMETRY_CASES {
+            bench_geometry_case(&mut group, case, geometry);
+        }
+    }
     group.finish();
 }
 
@@ -148,14 +183,7 @@ fn bench_viewer_case(
                         AutoGazeVisualizationState::new(visualization.mode, KEYFRAME_DURATION);
                     if visualization.prime_interframe {
                         state
-                            .visualize_rgba(
-                                &previous,
-                                case.width,
-                                case.height,
-                                &points,
-                                1.0,
-                                BLEND_ALPHA,
-                            )
+                            .visualize_rgba_with_options(&previous, &points, rgba_options(case))
                             .expect("prime interframe state");
                     }
                     let mut images = Assets::<Image>::default();
@@ -176,14 +204,7 @@ fn bench_viewer_case(
                 |(mut state, mut images, handles)| match handles {
                     BenchImages::SideBySide { handle } => {
                         let output = state
-                            .visualize_rgba(
-                                &current,
-                                case.width,
-                                case.height,
-                                &points,
-                                1.0,
-                                BLEND_ALPHA,
-                            )
+                            .visualize_rgba_with_options(&current, &points, rgba_options(case))
                             .expect("visualize autogaze frame");
                         write_side_by_side_image(
                             &handle,
@@ -204,12 +225,7 @@ fn bench_viewer_case(
                             .visualize_rgba_panels_with_options_into(
                                 &current,
                                 &points,
-                                AutoGazeRgbaVisualizationOptions::new(
-                                    case.width,
-                                    case.height,
-                                    1.0,
-                                    BLEND_ALPHA,
-                                ),
+                                rgba_options(case),
                                 &mut buffers,
                             )
                             .expect("visualize autogaze panels");
@@ -229,6 +245,69 @@ fn bench_viewer_case(
                         black_box(update_ratio);
                         black_box(images.get(&output).and_then(|image| image.data.as_ref()));
                     }
+                },
+                BatchSize::LargeInput,
+            );
+        },
+    );
+}
+
+fn bench_geometry_case(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    case: VideoCase,
+    geometry: GeometryCase,
+) {
+    let current = deterministic_rgba_frame(case.height, case.width, 17);
+    let previous = deterministic_rgba_frame(case.height, case.width, 13);
+    let points = redundant_multiscale_fixations();
+    group.bench_with_input(
+        BenchmarkId::new("interframe-panels/redundant-multiscale", geometry.name),
+        &case,
+        |b, _| {
+            b.iter_batched(
+                || {
+                    let mut state =
+                        AutoGazeVisualizationState::new(AutoGazeVisualizationMode::Interframe, 0);
+                    state
+                        .visualize_rgba_panels_with_options(
+                            &previous,
+                            &points,
+                            AutoGazeRgbaVisualizationOptions::new(
+                                case.width,
+                                case.height,
+                                1.0,
+                                BLEND_ALPHA,
+                            )
+                            .with_full_frame_update_policy(
+                                DEFAULT_TENSOR_FULL_FRAME_UPDATE_MIN_RATIO,
+                            )
+                            .with_mask_geometry_mode(geometry.mode),
+                        )
+                        .expect("prime interframe state");
+                    (state, AutoGazeRgbaVisualizationBuffers::default())
+                },
+                |(mut state, mut buffers)| {
+                    let panels = state
+                        .visualize_rgba_panels_with_options_into(
+                            &current,
+                            &points,
+                            AutoGazeRgbaVisualizationOptions::new(
+                                case.width,
+                                case.height,
+                                1.0,
+                                BLEND_ALPHA,
+                            )
+                            .with_full_frame_update_policy(
+                                DEFAULT_TENSOR_FULL_FRAME_UPDATE_MIN_RATIO,
+                            )
+                            .with_mask_geometry_mode(geometry.mode),
+                            &mut buffers,
+                        )
+                        .expect("visualize redundant multiscale frame");
+                    black_box(panels.mask_plan_stats.rect_count);
+                    black_box(panels.update_ratio());
+                    black_box(buffers.mask_rgba.as_slice());
+                    black_box(buffers.blend_rgba.as_slice());
                 },
                 BatchSize::LargeInput,
             );
@@ -372,6 +451,11 @@ fn deterministic_rgba_frame(height: usize, width: usize, frame: usize) -> Vec<u8
     rgba
 }
 
+fn rgba_options(case: VideoCase) -> AutoGazeRgbaVisualizationOptions {
+    AutoGazeRgbaVisualizationOptions::new(case.width, case.height, 1.0, BLEND_ALPHA)
+        .with_full_frame_update_policy(DEFAULT_TENSOR_FULL_FRAME_UPDATE_MIN_RATIO)
+}
+
 fn multiscale_fixations() -> Vec<FixationPoint> {
     vec![
         FixationPoint::with_extent(0.25, 0.25, 0.5, 0.5, 0.98),
@@ -379,6 +463,16 @@ fn multiscale_fixations() -> Vec<FixationPoint> {
         FixationPoint::with_extent(3.5 / 7.0, 5.5 / 7.0, 1.0 / 7.0, 1.0 / 7.0, 0.84),
         FixationPoint::with_extent(11.5 / 14.0, 8.5 / 14.0, 1.0 / 14.0, 1.0 / 14.0, 0.77),
     ]
+}
+
+fn redundant_multiscale_fixations() -> Vec<FixationPoint> {
+    let mut points = Vec::new();
+    points.extend(dense_grid_fixations(2));
+    points.extend(dense_grid_fixations(4));
+    points.extend(dense_grid_fixations(7));
+    points.extend(dense_grid_fixations(14));
+    points.extend(dense_grid_fixations(28));
+    points
 }
 
 fn dense_grid_fixations(grid: usize) -> Vec<FixationPoint> {
