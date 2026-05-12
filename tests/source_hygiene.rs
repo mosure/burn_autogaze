@@ -18,6 +18,24 @@ fn bevy_source() -> Option<String> {
     }
 }
 
+fn bevy_config_source() -> Option<String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("crates")
+        .join("bevy_burn_autogaze")
+        .join("src")
+        .join("config.rs");
+    match std::fs::read_to_string(&path) {
+        Ok(source) => Some(source),
+        Err(err) => {
+            eprintln!(
+                "skipping Bevy config hygiene check: failed to read {}: {err}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
 fn function_body_after<'a>(source: &'a str, marker: &str, fn_name: &str) -> &'a str {
     let marker_start = source.find(marker).expect("marker should exist");
     let search = &source[marker_start..];
@@ -149,7 +167,7 @@ fn bevy_wasm_timing_does_not_use_std_instant() {
 
 #[test]
 fn bevy_realtime_default_uses_model_generation_budget() {
-    let Some(source) = bevy_source() else {
+    let Some(source) = bevy_config_source() else {
         return;
     };
 
@@ -216,6 +234,11 @@ fn production_pipeline_surfaces_avoid_unrecoverable_panics() {
         manifest.join("src").join("trace.rs"),
         manifest.join("src").join("visualization.rs"),
         manifest.join("src").join("wasm.rs"),
+        manifest
+            .join("crates")
+            .join("bevy_burn_autogaze")
+            .join("src")
+            .join("config.rs"),
         manifest
             .join("crates")
             .join("bevy_burn_autogaze")
@@ -612,8 +635,11 @@ fn repo_tooling_entrypoints_live_in_xtask() {
 
     let checked_docs = [
         manifest.join("README.md"),
+        manifest.join("docs").join("api.md"),
+        manifest.join("docs").join("benchmarking.md"),
         manifest.join("docs").join("completion-audit.md"),
         manifest.join("docs").join("sparse-readout-integration.md"),
+        manifest.join("docs").join("validation.md"),
         manifest
             .join("crates")
             .join("bevy_burn_autogaze")
@@ -679,6 +705,9 @@ fn bevy_platform_selection_is_target_cfg_not_feature_flags() {
 
     let checked_docs = [
         manifest.join("README.md"),
+        manifest.join("docs").join("api.md"),
+        manifest.join("docs").join("benchmarking.md"),
+        manifest.join("docs").join("validation.md"),
         manifest
             .join("crates")
             .join("bevy_burn_autogaze")
@@ -712,12 +741,15 @@ fn bevy_realtime_admission_uses_configured_core_policy() {
     let Some(source) = bevy_source() else {
         return;
     };
+    let Some(config) = bevy_config_source() else {
+        return;
+    };
     assert!(
         !source.contains("const REALTIME_POLICY"),
         "Bevy must not hide realtime admission behind a fixed local policy constant"
     );
     assert!(
-        source.contains("pub max_in_flight: usize"),
+        config.contains("pub max_in_flight: usize"),
         "Bevy config should expose the core realtime admission limit"
     );
     assert!(
@@ -725,7 +757,7 @@ fn bevy_realtime_admission_uses_configured_core_policy() {
         "Bevy should derive realtime admission from the sanitized viewer config"
     );
     let helper = function_body_after(
-        &source,
+        &config,
         "pub const fn realtime_policy_from_config",
         "pub const fn realtime_policy_from_config",
     );
