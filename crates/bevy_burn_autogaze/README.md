@@ -36,14 +36,14 @@ model.
 
 | option | default | notes |
 |---|---|---|
-| `--source` | `camera` | `camera`, `static`, or `synthetic-pan`; `--image-path` selects `static` automatically. |
+| `--source` | `camera` | `camera`, `static`, `synthetic-pan`, `synthetic-pulse`, or `synthetic-local-motion`; `--image-path` selects `static` automatically. |
 | `--mode` | `realtime` | `realtime`, `resize-224`, `tiled`, or full-resolution tiled aliases. |
 | `--frames-per-clip` | `16` | Number of frames in the model context window. |
 | `--streaming-cache` | `true` in realtime | Advances one frame at a time and preserves KV/cache order. |
 | `--max-in-flight` | `1` in realtime | Drops stale inference jobs instead of queueing old camera frames. |
-| `--task-loss-requirement` | model/viewer default | Upstream L1 reconstruction-loss threshold. |
+| `--task-loss-requirement` | `0.45` | Viewer L1 reconstruction-loss threshold. Stricter explicit values such as `0.3` use the bounded quality token budget unless `--max-gaze-tokens-each-frame` is set. |
 | `--task-loss-requirement-db` | unset | PSNR-like interface for the same task-loss threshold: `10^(-dB / 20)`. |
-| `--max-gaze-tokens-each-frame` | model default in realtime | `0` means the NVIDIA config value, currently `198`. |
+| `--max-gaze-tokens-each-frame` | `10` realtime, `24` for stricter realtime task loss and tiled | `0` means the NVIDIA config value, currently `198`; use it for full-budget quality runs. |
 | `--top-k` | mode-specific | Number of gaze candidates considered per step. |
 | `--inference-width`, `--inference-height` | mode-specific | Source resize before inference/visualization. |
 | `--tile-batch-size` | mode-specific | Backend batch size for tiled modes. |

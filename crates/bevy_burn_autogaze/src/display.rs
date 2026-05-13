@@ -3,6 +3,7 @@ use bevy::{
     image::ImageSampler,
     prelude::*,
     render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages},
+    ui::widget::ImageNode,
 };
 use bevy_burn::{BevyBurnHandle, BindingDirection, TransferKind};
 use burn::tensor::Tensor;
@@ -63,6 +64,7 @@ pub(crate) enum VisualizationImageData {
         input_rgba: Vec<u8>,
         mask_rgba: Vec<u8>,
         output_rgba: Vec<u8>,
+        output_matches_input: bool,
     },
     TensorPanels(Box<TensorPanelVisualizationData>),
 }
@@ -73,6 +75,7 @@ pub(crate) struct TensorPanelVisualizationData {
     pub(crate) input_rgba: Tensor<AutoGazeBevyBackend, 3>,
     pub(crate) mask_rgba: Tensor<AutoGazeBevyBackend, 3>,
     pub(crate) output_rgba: Tensor<AutoGazeBevyBackend, 3>,
+    pub(crate) output_matches_input: bool,
 }
 
 pub(crate) struct Visualization {
@@ -84,6 +87,7 @@ pub(crate) struct Visualization {
     pub(crate) tensor: Option<Tensor<AutoGazeBevyBackend, 3>>,
     pub(crate) image_data: VisualizationImageData,
     pub(crate) gaze_update_ratio: f64,
+    pub(crate) output_update_ratio: f64,
     pub(crate) interframe_keyframe: bool,
     pub(crate) psnr_db: Option<f64>,
     pub(crate) visualize_cpu_ms: f64,
@@ -115,6 +119,7 @@ pub(crate) fn apply_visualization_to_texture(
             input_rgba,
             mask_rgba,
             output_rgba,
+            output_matches_input: _,
         } => {
             set_panel_visualization_images(
                 texture,
@@ -125,6 +130,7 @@ pub(crate) fn apply_visualization_to_texture(
                     input_rgba,
                     mask_rgba,
                     output_rgba,
+                    output_matches_input: false,
                 },
             );
             texture.layout = AutoGazeTextureLayout::Panels;
@@ -153,6 +159,7 @@ pub(crate) fn apply_visualization_to_world(
                 input_rgba,
                 mask_rgba,
                 output_rgba,
+                output_matches_input,
             } = *panels;
             set_texture_layout(world, &texture, AutoGazeTextureLayout::Panels);
             remove_gpu_visualization_handle(world, texture.side_by_side_entity);
@@ -188,12 +195,18 @@ pub(crate) fn apply_visualization_to_world(
                 texture.mask_image.clone(),
                 mask_rgba,
             );
-            set_gpu_panel_upload_handle(
-                world,
-                texture.output_entity,
-                texture.output_image.clone(),
-                output_rgba,
-            );
+            if output_matches_input {
+                set_panel_image_handle(world, texture.output_entity, texture.input_image.clone());
+                remove_gpu_visualization_handle(world, texture.output_entity);
+            } else {
+                set_panel_image_handle(world, texture.output_entity, texture.output_image.clone());
+                set_gpu_panel_upload_handle(
+                    world,
+                    texture.output_entity,
+                    texture.output_image.clone(),
+                    output_rgba,
+                );
+            }
         }
         VisualizationImageData::SideBySideRgba(rgba) => {
             set_texture_layout(world, &texture, AutoGazeTextureLayout::SideBySide);
@@ -209,6 +222,7 @@ pub(crate) fn apply_visualization_to_world(
             input_rgba,
             mask_rgba,
             output_rgba,
+            output_matches_input,
         } => {
             set_texture_layout(world, &texture, AutoGazeTextureLayout::Panels);
             remove_gpu_visualization_handle(world, texture.side_by_side_entity);
@@ -223,8 +237,14 @@ pub(crate) fn apply_visualization_to_world(
                         input_rgba,
                         mask_rgba,
                         output_rgba,
+                        output_matches_input,
                     },
                 );
+            }
+            if output_matches_input {
+                set_panel_image_handle(world, texture.output_entity, texture.input_image.clone());
+            } else {
+                set_panel_image_handle(world, texture.output_entity, texture.output_image.clone());
             }
         }
     }
@@ -313,6 +333,15 @@ fn remove_panel_gpu_visualization_handles(world: &mut World, texture: &AutoGazeT
     remove_gpu_visualization_handle(world, texture.output_entity);
 }
 
+fn set_panel_image_handle(world: &mut World, entity: Option<Entity>, image: Handle<Image>) {
+    if let Some(entity) = entity
+        && let Ok(mut entity) = world.get_entity_mut(entity)
+        && let Some(mut image_node) = entity.get_mut::<ImageNode>()
+    {
+        image_node.image = image;
+    }
+}
+
 fn set_gpu_panel_upload_handle(
     world: &mut World,
     entity: Option<Entity>,
@@ -349,6 +378,7 @@ struct PanelVisualizationImages {
     input_rgba: Vec<u8>,
     mask_rgba: Vec<u8>,
     output_rgba: Vec<u8>,
+    output_matches_input: bool,
 }
 
 fn set_panel_visualization_images(
@@ -362,10 +392,13 @@ fn set_panel_visualization_images(
         input_rgba,
         mask_rgba,
         output_rgba,
+        output_matches_input,
     } = panels;
     set_visualization_image(&texture.input_image, width, height, input_rgba, images);
     set_visualization_image(&texture.mask_image, width, height, mask_rgba, images);
-    set_visualization_image(&texture.output_image, width, height, output_rgba, images);
+    if !output_matches_input {
+        set_visualization_image(&texture.output_image, width, height, output_rgba, images);
+    }
 }
 
 fn set_visualization_image(
@@ -384,7 +417,16 @@ fn set_visualization_image(
             .usage
             .contains(TextureUsages::COPY_DST | TextureUsages::TEXTURE_BINDING)
     {
-        image.data = Some(rgba);
+        if let Some(data) = image.data.as_mut() {
+            if data.len() == rgba.len() {
+                data.copy_from_slice(&rgba);
+            } else {
+                data.clear();
+                data.extend_from_slice(&rgba);
+            }
+        } else {
+            image.data = Some(rgba);
+        }
         return;
     }
 

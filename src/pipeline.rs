@@ -137,6 +137,13 @@ pub struct AutoGazeTraceRunOutput {
     pub model_frames: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AutoGazeReadoutStats {
+    pub generated_tokens: usize,
+    pub active_generated_tokens: usize,
+    pub padded_generated_tokens: usize,
+}
+
 /// Selected fixation points from a prepared AutoGaze run.
 ///
 /// This is the lower-allocation counterpart to `AutoGazeTraceRunOutput` for
@@ -146,6 +153,7 @@ pub struct AutoGazeReadoutRunOutput {
     pub points: Vec<Vec<Vec<FixationPoint>>>,
     pub frame_index: usize,
     pub model_frames: usize,
+    pub stats: AutoGazeReadoutStats,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -698,6 +706,13 @@ impl<B: Backend> AutoGazePipeline<B> {
         self.generation_coverage_stop_ratio
     }
 
+    pub fn effective_max_gaze_tokens_each_frame(&self) -> usize {
+        self.model.effective_max_gaze_tokens_each_frame(
+            self.max_gaze_tokens_each_frame,
+            self.generation_coverage_stop_ratio,
+        )
+    }
+
     pub fn with_options(mut self, options: AutoGazePipelineOptions) -> Self {
         self.apply_options(options);
         self
@@ -1043,6 +1058,81 @@ impl<B: Backend> AutoGazePipeline<B> {
         }
     }
 
+    fn readout_points_with_mode_and_stats(
+        &self,
+        video: Tensor<B, 5>,
+        k: usize,
+        mode: AutoGazeInferenceMode,
+        frame_index: usize,
+    ) -> (Vec<Vec<Vec<FixationPoint>>>, AutoGazeReadoutStats) {
+        let [batch, time, _channels, height, width] = video.shape().dims::<5>();
+        match mode.normalized() {
+            AutoGazeInferenceMode::ResizeToModelInput => {
+                let generation_budget = self.max_gaze_tokens_each_frame.max(k.max(1));
+                let generated = self.generate_with_limit(video, generation_budget);
+                let stats = generated_readout_stats(&generated, frame_index);
+                (
+                    generated_to_frame_points(&generated, &self.model.config),
+                    stats,
+                )
+            }
+            AutoGazeInferenceMode::TiledResizeToGrid { tile_size } => {
+                let layout = AutoGazeTileLayout::resized_grid(height, width, tile_size);
+                let video = resize_video_to_layout_grid(video, &layout);
+                let points = self.tiled_readout_points(video, k, batch, time, &layout);
+                let stats = points_readout_stats(&points, frame_index);
+                (points, stats)
+            }
+            AutoGazeInferenceMode::TiledFullResolution { tile_size, stride } => {
+                let layout = AutoGazeTileLayout::tiled(height, width, tile_size, stride);
+                let points = self.tiled_readout_points(video, k, batch, time, &layout);
+                let stats = points_readout_stats(&points, frame_index);
+                (points, stats)
+            }
+        }
+    }
+
+    async fn readout_points_with_mode_and_stats_async(
+        &self,
+        video: Tensor<B, 5>,
+        k: usize,
+        mode: AutoGazeInferenceMode,
+        frame_index: usize,
+    ) -> std::result::Result<(Vec<Vec<Vec<FixationPoint>>>, AutoGazeReadoutStats), ExecutionError>
+    {
+        let [batch, time, _channels, height, width] = video.shape().dims::<5>();
+        match mode.normalized() {
+            AutoGazeInferenceMode::ResizeToModelInput => {
+                let generation_budget = self.max_gaze_tokens_each_frame.max(k.max(1));
+                let generated = self
+                    .generate_with_limit_async(video, generation_budget)
+                    .await?;
+                let stats = generated_readout_stats(&generated, frame_index);
+                Ok((
+                    generated_to_frame_points(&generated, &self.model.config),
+                    stats,
+                ))
+            }
+            AutoGazeInferenceMode::TiledResizeToGrid { tile_size } => {
+                let layout = AutoGazeTileLayout::resized_grid(height, width, tile_size);
+                let video = resize_video_to_layout_grid(video, &layout);
+                let points = self
+                    .tiled_readout_points_async(video, k, batch, time, &layout)
+                    .await?;
+                let stats = points_readout_stats(&points, frame_index);
+                Ok((points, stats))
+            }
+            AutoGazeInferenceMode::TiledFullResolution { tile_size, stride } => {
+                let layout = AutoGazeTileLayout::tiled(height, width, tile_size, stride);
+                let points = self
+                    .tiled_readout_points_async(video, k, batch, time, &layout)
+                    .await?;
+                let stats = points_readout_stats(&points, frame_index);
+                Ok((points, stats))
+            }
+        }
+    }
+
     pub fn trace_video_streaming(
         &self,
         video: Tensor<B, 5>,
@@ -1058,7 +1148,10 @@ impl<B: Backend> AutoGazePipeline<B> {
                 self.task_loss_requirement,
                 self.generation_coverage_stop_ratio,
             );
-        generated.traces(&self.model.config, self.max_gaze_tokens_each_frame.max(k.max(1)))
+        generated.traces(
+            &self.model.config,
+            self.max_gaze_tokens_each_frame.max(k.max(1)),
+        )
     }
 
     pub async fn trace_video_streaming_async(
@@ -1077,7 +1170,10 @@ impl<B: Backend> AutoGazePipeline<B> {
             )
             .await
             .map(|generated| {
-                generated.traces(&self.model.config, self.max_gaze_tokens_each_frame.max(k.max(1)))
+                generated.traces(
+                    &self.model.config,
+                    self.max_gaze_tokens_each_frame.max(k.max(1)),
+                )
             })
     }
 
@@ -1124,15 +1220,29 @@ impl<B: Backend> AutoGazePipeline<B> {
             frame_index,
             model_frames,
         } = prepared;
-        let points = if let Some(cache) = cache {
-            traces_to_frame_points(self.trace_video_streaming(video, k, cache))
+        let (points, stats) = if let Some(cache) = cache {
+            let generated = self
+                .model
+                .generate_streaming_with_task_loss_requirement_and_coverage_stop(
+                    video,
+                    cache,
+                    self.max_gaze_tokens_each_frame.max(k.max(1)),
+                    self.task_loss_requirement,
+                    self.generation_coverage_stop_ratio,
+                );
+            let stats = generated_readout_stats(&generated, frame_index);
+            (
+                generated_to_frame_points(&generated, &self.model.config),
+                stats,
+            )
         } else {
-            self.readout_points_with_mode(video, k, mode)
+            self.readout_points_with_mode_and_stats(video, k, mode, frame_index)
         };
         AutoGazeReadoutRunOutput {
             points,
             frame_index,
             model_frames,
+            stats,
         }
     }
 
@@ -1174,15 +1284,31 @@ impl<B: Backend> AutoGazePipeline<B> {
             frame_index,
             model_frames,
         } = prepared;
-        let points = if let Some(cache) = cache {
-            traces_to_frame_points(self.trace_video_streaming_async(video, k, cache).await?)
+        let (points, stats) = if let Some(cache) = cache {
+            let generated = self
+                .model
+                .generate_streaming_with_task_loss_requirement_and_coverage_stop_async(
+                    video,
+                    cache,
+                    self.max_gaze_tokens_each_frame.max(k.max(1)),
+                    self.task_loss_requirement,
+                    self.generation_coverage_stop_ratio,
+                )
+                .await?;
+            let stats = generated_readout_stats(&generated, frame_index);
+            (
+                generated_to_frame_points(&generated, &self.model.config),
+                stats,
+            )
         } else {
-            self.readout_points_with_mode_async(video, k, mode).await?
+            self.readout_points_with_mode_and_stats_async(video, k, mode, frame_index)
+                .await?
         };
         Ok(AutoGazeReadoutRunOutput {
             points,
             frame_index,
             model_frames,
+            stats,
         })
     }
 
@@ -1800,11 +1926,48 @@ fn build_tiled_traces(
         .collect()
 }
 
-fn traces_to_frame_points(traces: Vec<FrameFixationTrace>) -> Vec<Vec<Vec<FixationPoint>>> {
-    traces
-        .into_iter()
-        .map(|trace| trace.frames.into_iter().map(|frame| frame.points).collect())
-        .collect()
+fn generated_readout_stats(
+    generated: &AutoGazeGenerateOutput,
+    frame_index: usize,
+) -> AutoGazeReadoutStats {
+    let Some(&frame_len) = generated.num_gazing_each_frame.get(frame_index) else {
+        return AutoGazeReadoutStats::default();
+    };
+    let cursor = generated
+        .num_gazing_each_frame
+        .iter()
+        .take(frame_index)
+        .copied()
+        .sum::<usize>();
+    let mut stats = AutoGazeReadoutStats::default();
+    for padded in &generated.if_padded_gazing {
+        for is_padded in padded.iter().skip(cursor).take(frame_len) {
+            stats.generated_tokens = stats.generated_tokens.saturating_add(1);
+            if *is_padded {
+                stats.padded_generated_tokens = stats.padded_generated_tokens.saturating_add(1);
+            } else {
+                stats.active_generated_tokens = stats.active_generated_tokens.saturating_add(1);
+            }
+        }
+    }
+    stats
+}
+
+fn points_readout_stats(
+    points: &[Vec<Vec<FixationPoint>>],
+    frame_index: usize,
+) -> AutoGazeReadoutStats {
+    let active_generated_tokens = points
+        .iter()
+        .filter_map(|frames| frames.get(frame_index))
+        .flat_map(|frame| frame.iter())
+        .filter(|point| point.confidence > 0.0)
+        .count();
+    AutoGazeReadoutStats {
+        generated_tokens: active_generated_tokens,
+        active_generated_tokens,
+        padded_generated_tokens: 0,
+    }
 }
 
 fn empty_batch_frame_points(batch: usize, time: usize) -> Vec<Vec<Vec<FixationPoint>>> {

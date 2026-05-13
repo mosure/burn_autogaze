@@ -1146,7 +1146,8 @@ impl<B: Backend> AutoGazeGazingModel<B> {
         let mut prefix_attention_mask = vec![vec![]; batch];
         let mut prefix_position_ids = vec![vec![]; batch];
         let mut pending_position_indices = vec![Vec::<usize>::new(); batch];
-        let max_tokens = max_gaze_tokens_each_frame.max(1);
+        let max_tokens =
+            self.effective_max_gaze_tokens(max_gaze_tokens_each_frame, coverage_stop_ratio);
         let cache_capacity = frames * (vision_tokens + max_tokens);
 
         for frame_idx in 0..frames {
@@ -1181,11 +1182,8 @@ impl<B: Backend> AutoGazeGazingModel<B> {
             let mut frame_padded = vec![Vec::<bool>::new(); batch];
             let mut frame_confidences = vec![Vec::<f32>::new(); batch];
             let mut finished = vec![false; batch];
-            let mut coverage_trackers = generation_coverage_trackers(
-                batch,
-                coverage_stop_ratio,
-                &self.scale_layouts,
-            );
+            let mut coverage_trackers =
+                generation_coverage_trackers(batch, coverage_stop_ratio, &self.scale_layouts);
             let mut is_first_token = true;
             let generation_prefix_len = prefix_attention_mask.first().map(Vec::len).unwrap_or(0);
             let generation_tail_positions =
@@ -1315,39 +1313,6 @@ impl<B: Backend> AutoGazeGazingModel<B> {
         }
     }
 
-    fn flush_streaming_pending_query(
-        &self,
-        state: &mut AutoGazeStreamingCacheState<B>,
-        device: &B::Device,
-    ) {
-        let Some(query_embeds) = state.pending_query_embeds.take() else {
-            return;
-        };
-
-        state.commit_pending_position_ids();
-        state.clear_pending_position_indices();
-
-        let query_len = query_embeds.shape().dims::<3>()[1];
-        let query_start = cached_sequence_len(&state.past_key_values);
-        let key_len = query_start + query_len;
-        let attention_mask =
-            attention_mask_tensor_or_none::<B>(&state.prefix_attention_mask, key_len, device);
-        let position_ids = position_ids_slice_tensor_optimized::<B>(
-            &state.prefix_position_ids,
-            query_start,
-            query_len,
-            device,
-        );
-        let outputs = self.gaze_decoder.forward_cached(
-            query_embeds,
-            attention_mask,
-            position_ids,
-            state.past_key_values.take(),
-            state.cache_capacity,
-        );
-        state.past_key_values = Some(outputs.past_key_values);
-    }
-
     pub fn generate_streaming_cached(
         &self,
         video: Tensor<B, 5>,
@@ -1374,7 +1339,8 @@ impl<B: Backend> AutoGazeGazingModel<B> {
     ) -> AutoGazeGenerateOutput {
         let video = self.resize_video(video);
         let [batch, frames, _channels, _height, _width] = video.shape().dims::<5>();
-        let max_tokens = max_gaze_tokens_each_frame.max(1);
+        let max_tokens =
+            self.effective_max_gaze_tokens(max_gaze_tokens_each_frame, coverage_stop_ratio);
         let horizon_frames = cache.horizon_frames.max(1);
         if cache
             .state
@@ -1436,11 +1402,8 @@ impl<B: Backend> AutoGazeGazingModel<B> {
             let mut frame_padded = vec![Vec::<bool>::new(); batch];
             let mut frame_confidences = vec![Vec::<f32>::new(); batch];
             let mut finished = vec![false; batch];
-            let mut coverage_trackers = generation_coverage_trackers(
-                batch,
-                coverage_stop_ratio,
-                &self.scale_layouts,
-            );
+            let mut coverage_trackers =
+                generation_coverage_trackers(batch, coverage_stop_ratio, &self.scale_layouts);
             let mut is_first_token = true;
             let generation_prefix_len = state
                 .prefix_attention_mask
@@ -1568,7 +1531,6 @@ impl<B: Backend> AutoGazeGazingModel<B> {
             }
             state.pending_position_indices = last_generated_indices;
             state.pending_query_embeds = next_query_embeds;
-            self.flush_streaming_pending_query(state, &device);
             state.record_completed_frame(vision_tokens + frame_count);
             state.processed_frames = state.processed_frames.saturating_add(1);
         }
@@ -1655,13 +1617,11 @@ impl<B: Backend> AutoGazeGazingModel<B> {
             let mut frame_padded = vec![Vec::<bool>::new(); batch];
             let mut frame_confidences = vec![Vec::<f32>::new(); batch];
             let mut finished = vec![false; batch];
-            let mut coverage_trackers = generation_coverage_trackers(
-                batch,
-                coverage_stop_ratio,
-                &self.scale_layouts,
-            );
+            let mut coverage_trackers =
+                generation_coverage_trackers(batch, coverage_stop_ratio, &self.scale_layouts);
             let mut is_first_token = true;
-            let max_tokens = max_gaze_tokens_each_frame.max(1);
+            let max_tokens =
+                self.effective_max_gaze_tokens(max_gaze_tokens_each_frame, coverage_stop_ratio);
             let generation_prefix_len = sequence_embeds.shape().dims::<3>()[1];
             let generation_tail_positions =
                 generation_tail_positions(&prefix_position_ids, self.num_multi_token_pred);
@@ -1856,7 +1816,8 @@ impl<B: Backend> AutoGazeGazingModel<B> {
         let mut prefix_attention_mask = vec![vec![]; batch];
         let mut prefix_position_ids = vec![vec![]; batch];
         let mut pending_position_indices = vec![Vec::<usize>::new(); batch];
-        let max_tokens = max_gaze_tokens_each_frame.max(1);
+        let max_tokens =
+            self.effective_max_gaze_tokens(max_gaze_tokens_each_frame, coverage_stop_ratio);
         let cache_capacity = frames * (vision_tokens + max_tokens);
 
         for frame_idx in 0..frames {
@@ -1891,11 +1852,8 @@ impl<B: Backend> AutoGazeGazingModel<B> {
             let mut frame_padded = vec![Vec::<bool>::new(); batch];
             let mut frame_confidences = vec![Vec::<f32>::new(); batch];
             let mut finished = vec![false; batch];
-            let mut coverage_trackers = generation_coverage_trackers(
-                batch,
-                coverage_stop_ratio,
-                &self.scale_layouts,
-            );
+            let mut coverage_trackers =
+                generation_coverage_trackers(batch, coverage_stop_ratio, &self.scale_layouts);
             let mut is_first_token = true;
             let generation_prefix_len = prefix_attention_mask.first().map(Vec::len).unwrap_or(0);
             let generation_tail_positions =
@@ -2053,7 +2011,8 @@ impl<B: Backend> AutoGazeGazingModel<B> {
     ) -> Result<AutoGazeGenerateOutput, ExecutionError> {
         let video = self.resize_video(video);
         let [batch, frames, _channels, _height, _width] = video.shape().dims::<5>();
-        let max_tokens = max_gaze_tokens_each_frame.max(1);
+        let max_tokens =
+            self.effective_max_gaze_tokens(max_gaze_tokens_each_frame, coverage_stop_ratio);
         let horizon_frames = cache.horizon_frames.max(1);
         if cache
             .state
@@ -2115,11 +2074,8 @@ impl<B: Backend> AutoGazeGazingModel<B> {
             let mut frame_padded = vec![Vec::<bool>::new(); batch];
             let mut frame_confidences = vec![Vec::<f32>::new(); batch];
             let mut finished = vec![false; batch];
-            let mut coverage_trackers = generation_coverage_trackers(
-                batch,
-                coverage_stop_ratio,
-                &self.scale_layouts,
-            );
+            let mut coverage_trackers =
+                generation_coverage_trackers(batch, coverage_stop_ratio, &self.scale_layouts);
             let mut is_first_token = true;
             let generation_prefix_len = state
                 .prefix_attention_mask
@@ -2248,7 +2204,6 @@ impl<B: Backend> AutoGazeGazingModel<B> {
             }
             state.pending_position_indices = last_generated_indices;
             state.pending_query_embeds = next_query_embeds;
-            self.flush_streaming_pending_query(state, &device);
             state.record_completed_frame(vision_tokens + frame_count);
             state.processed_frames = state.processed_frames.saturating_add(1);
         }
@@ -2335,13 +2290,11 @@ impl<B: Backend> AutoGazeGazingModel<B> {
             let mut frame_padded = vec![Vec::<bool>::new(); batch];
             let mut frame_confidences = vec![Vec::<f32>::new(); batch];
             let mut finished = vec![false; batch];
-            let mut coverage_trackers = generation_coverage_trackers(
-                batch,
-                coverage_stop_ratio,
-                &self.scale_layouts,
-            );
+            let mut coverage_trackers =
+                generation_coverage_trackers(batch, coverage_stop_ratio, &self.scale_layouts);
             let mut is_first_token = true;
-            let max_tokens = max_gaze_tokens_each_frame.max(1);
+            let max_tokens =
+                self.effective_max_gaze_tokens(max_gaze_tokens_each_frame, coverage_stop_ratio);
             let generation_prefix_len = sequence_embeds.shape().dims::<3>()[1];
             let generation_tail_positions =
                 generation_tail_positions(&prefix_position_ids, self.num_multi_token_pred);
@@ -2472,6 +2425,19 @@ impl<B: Backend> AutoGazeGazingModel<B> {
             InterpolateOptions::new(InterpolateMode::Bicubic).with_align_corners(false),
         );
         video.reshape([batch, time, 3, self.input_img_size, self.input_img_size])
+    }
+
+    pub fn effective_max_gaze_tokens(
+        &self,
+        max_gaze_tokens_each_frame: usize,
+        coverage_stop_ratio: Option<f64>,
+    ) -> usize {
+        effective_generation_max_tokens(
+            max_gaze_tokens_each_frame.max(1),
+            coverage_stop_ratio,
+            &self.scale_layouts,
+            self.num_multi_token_pred,
+        )
     }
 }
 
@@ -2633,13 +2599,12 @@ impl<B: Backend> NativeAutoGazeModel<B> {
         task_loss_requirement: Option<f32>,
         coverage_stop_ratio: Option<f64>,
     ) -> AutoGazeGenerateOutput {
-        self.gazing_model
-            .generate_with_coverage_stop(
-                video,
-                max_gaze_tokens_each_frame,
-                task_loss_requirement,
-                coverage_stop_ratio,
-            )
+        self.gazing_model.generate_with_coverage_stop(
+            video,
+            max_gaze_tokens_each_frame,
+            task_loss_requirement,
+            coverage_stop_ratio,
+        )
     }
 
     pub async fn generate_with_task_loss_requirement_async(
@@ -2698,13 +2663,14 @@ impl<B: Backend> NativeAutoGazeModel<B> {
         task_loss_requirement: Option<f32>,
         coverage_stop_ratio: Option<f64>,
     ) -> AutoGazeGenerateOutput {
-        self.gazing_model.generate_streaming_cached_with_coverage_stop(
-            video,
-            cache,
-            max_gaze_tokens_each_frame,
-            task_loss_requirement,
-            coverage_stop_ratio,
-        )
+        self.gazing_model
+            .generate_streaming_cached_with_coverage_stop(
+                video,
+                cache,
+                max_gaze_tokens_each_frame,
+                task_loss_requirement,
+                coverage_stop_ratio,
+            )
     }
 
     pub async fn generate_streaming_with_task_loss_requirement_async(
@@ -2756,6 +2722,15 @@ impl<B: Backend> NativeAutoGazeModel<B> {
 
     pub fn default_task_loss_requirement(&self) -> Option<f32> {
         self.config.inference_task_loss_requirement()
+    }
+
+    pub fn effective_max_gaze_tokens_each_frame(
+        &self,
+        max_gaze_tokens_each_frame: usize,
+        coverage_stop_ratio: Option<f64>,
+    ) -> usize {
+        self.gazing_model
+            .effective_max_gaze_tokens(max_gaze_tokens_each_frame, coverage_stop_ratio)
     }
 
     pub fn infer(&self, video: Tensor<B, 5>) -> AutoGazeGenerateOutput {
@@ -3447,12 +3422,13 @@ fn greedy_select_multi_tokens_from_packed_data(
         row_stride,
     };
     let mut builder = GreedySelectionBuilder::new(batch);
+    let mut selected = GreedyStepValues::new(batch);
     for multi_idx in 0..num_multi {
         if !builder.has_active_rows(context) {
             break;
         }
 
-        let selected = packed.step_values(multi_idx, &builder, context);
+        packed.step_values(multi_idx, &builder, context, &mut selected);
         builder.push_step(
             multi_idx,
             &selected.tokens,
@@ -3481,20 +3457,40 @@ struct GreedyStepValues {
     task_losses: Vec<f32>,
 }
 
+impl GreedyStepValues {
+    fn new(batch: usize) -> Self {
+        Self {
+            tokens: vec![0_i64; batch],
+            scores: vec![f32::NEG_INFINITY; batch],
+            confidences: vec![0.0_f32; batch],
+            task_losses: vec![f32::INFINITY; batch],
+        }
+    }
+
+    fn reset(&mut self, batch: usize) {
+        self.tokens.resize(batch, 0);
+        self.scores.resize(batch, f32::NEG_INFINITY);
+        self.confidences.resize(batch, 0.0);
+        self.task_losses.resize(batch, f32::INFINITY);
+        self.tokens.fill(0);
+        self.scores.fill(f32::NEG_INFINITY);
+        self.confidences.fill(0.0);
+        self.task_losses.fill(f32::INFINITY);
+    }
+}
+
 impl GreedyPackedLogits<'_> {
     fn step_values(
         &self,
         multi_idx: usize,
         builder: &GreedySelectionBuilder,
         context: GreedySelectionContext<'_>,
-    ) -> GreedyStepValues {
-        let mut tokens = vec![0_i64; self.batch];
-        let mut scores = vec![f32::NEG_INFINITY; self.batch];
-        let mut confidences = vec![0.0_f32; self.batch];
-        let mut task_losses = vec![f32::INFINITY; self.batch];
+        values: &mut GreedyStepValues,
+    ) {
+        values.reset(self.batch);
 
         for batch_idx in 0..self.batch {
-            task_losses[batch_idx] =
+            values.task_losses[batch_idx] =
                 self.values[batch_idx * self.row_stride + self.num_multi * self.vocab + multi_idx];
             if context.finished.get(batch_idx).copied().unwrap_or(false)
                 || context.prior_tokens[batch_idx].len() + builder.per_batch_tokens[batch_idx].len()
@@ -3523,21 +3519,14 @@ impl GreedyPackedLogits<'_> {
             }
 
             if let Some(token) = best_token {
-                tokens[batch_idx] = token;
-                scores[batch_idx] = best_score;
-                confidences[batch_idx] = if exp_sum > 0.0 {
+                values.tokens[batch_idx] = token;
+                values.scores[batch_idx] = best_score;
+                values.confidences[batch_idx] = if exp_sum > 0.0 {
                     best_score.exp() / exp_sum
                 } else {
                     1.0
                 };
             }
-        }
-
-        GreedyStepValues {
-            tokens,
-            scores,
-            confidences,
-            task_losses,
         }
     }
 }
@@ -3557,6 +3546,7 @@ struct GreedySelectionBuilder {
     per_batch_disallowed: Vec<Vec<i64>>,
     per_batch_valid: Vec<Vec<bool>>,
     per_batch_confidences: Vec<Vec<f32>>,
+    per_batch_stopped: Vec<bool>,
 }
 
 impl GreedySelectionBuilder {
@@ -3566,6 +3556,7 @@ impl GreedySelectionBuilder {
             per_batch_disallowed: vec![Vec::new(); batch],
             per_batch_valid: vec![Vec::new(); batch],
             per_batch_confidences: vec![Vec::new(); batch],
+            per_batch_stopped: vec![false; batch],
         }
     }
 
@@ -3575,6 +3566,7 @@ impl GreedySelectionBuilder {
             .enumerate()
             .any(|(batch_idx, selected)| {
                 !context.finished.get(batch_idx).copied().unwrap_or(false)
+                    && !self.per_batch_stopped[batch_idx]
                     && context.prior_tokens[batch_idx].len() + selected.len() < context.max_tokens
             })
     }
@@ -3605,6 +3597,7 @@ impl GreedySelectionBuilder {
     ) {
         for batch_idx in 0..self.per_batch_tokens.len() {
             if context.finished.get(batch_idx).copied().unwrap_or(false)
+                || self.per_batch_stopped[batch_idx]
                 || context.prior_tokens[batch_idx].len() + self.per_batch_tokens[batch_idx].len()
                     >= context.max_tokens
             {
@@ -3643,6 +3636,9 @@ impl GreedySelectionBuilder {
                     1.0
                 }
             });
+            if meets_task_loss_requirement {
+                self.per_batch_stopped[batch_idx] = true;
+            }
         }
     }
 
@@ -3696,8 +3692,10 @@ fn greedy_select_multi_tokens_from_data(
 
     for batch_idx in 0..batch {
         let mut disallowed = prior_tokens[batch_idx].clone();
+        let mut stopped = false;
         for multi_idx in 0..num_multi {
             if finished.get(batch_idx).copied().unwrap_or(false)
+                || stopped
                 || prior_tokens[batch_idx].len() + per_batch_tokens[batch_idx].len() >= max_tokens
             {
                 break;
@@ -3741,6 +3739,9 @@ fn greedy_select_multi_tokens_from_data(
                 } else {
                     1.0
                 });
+                if meets_task_loss_requirement {
+                    stopped = true;
+                }
             } else {
                 break;
             }
@@ -3978,8 +3979,8 @@ impl GenerationCoverageTracker {
         let scale_layouts = normalize_scale_layouts(scale_layouts.to_vec(), 1);
         let grid = coverage_grid_for_layouts(&scale_layouts);
         let cells = grid.checked_mul(grid)?;
-        let stop_cells = ((stop_ratio.clamp(0.0, 1.0) * cells as f64).ceil() as usize)
-            .clamp(1, cells);
+        let stop_cells =
+            ((stop_ratio.clamp(0.0, 1.0) * cells as f64).ceil() as usize).clamp(1, cells);
         Some(Self {
             scale_layouts,
             grid,
@@ -4039,6 +4040,35 @@ fn observe_generation_coverage(
         .and_then(|trackers| trackers.get_mut(batch_idx))
         .map(|tracker| tracker.observe_token(token))
         .unwrap_or(false)
+}
+
+fn effective_generation_max_tokens(
+    configured_max_tokens: usize,
+    coverage_stop_ratio: Option<f64>,
+    scale_layouts: &[ScaleTokenLayout],
+    num_multi_token_pred: usize,
+) -> usize {
+    let configured_max_tokens = configured_max_tokens.max(1);
+    let Some(stop_ratio) = coverage_stop_ratio else {
+        return configured_max_tokens;
+    };
+    if !stop_ratio.is_finite() || stop_ratio <= 0.0 || stop_ratio >= 1.0 {
+        return configured_max_tokens;
+    }
+
+    let Some(finest_grid) = scale_layouts
+        .iter()
+        .filter(|layout| layout.token_count > 0)
+        .map(|layout| layout.grid.max(1))
+        .max()
+    else {
+        return configured_max_tokens;
+    };
+    let finest_cells = finest_grid.saturating_mul(finest_grid).max(1);
+    let required_tokens = (stop_ratio.clamp(0.0, 1.0) * finest_cells as f64).ceil() as usize;
+    let chunk = num_multi_token_pred.max(1);
+    let chunk_aligned = required_tokens.max(1).div_ceil(chunk).saturating_mul(chunk);
+    configured_max_tokens.min(chunk_aligned.max(1))
 }
 
 fn normalize_scale_layouts(
@@ -4251,8 +4281,7 @@ mod tests {
             ..Default::default()
         };
         let layouts = scale_token_layouts(&config);
-        let mut tracker =
-            GenerationCoverageTracker::new(&layouts, 1.0).expect("coverage tracker");
+        let mut tracker = GenerationCoverageTracker::new(&layouts, 1.0).expect("coverage tracker");
 
         assert!(!tracker.observe_token(0));
         assert!(!tracker.observe_token(1));
@@ -4266,6 +4295,31 @@ mod tests {
         assert_eq!(
             tracker.covered_count, covered_after_full_frame,
             "finer tokens inside already-covered coarse cells should not add work"
+        );
+    }
+
+    #[test]
+    fn coverage_stop_bounds_effective_generation_budget_to_finest_grid_need() {
+        let config = AutoGazeConfig {
+            scales: "32+64+112+224".to_string(),
+            num_vision_tokens_each_frame: 265,
+            ..Default::default()
+        };
+        let layouts = scale_token_layouts(&config);
+
+        assert_eq!(
+            effective_generation_max_tokens(198, Some(0.45), &layouts, 10),
+            90,
+            "45% coverage cannot require more than ninety 14x14 fine cells, rounded to the ten-token decoder chunk"
+        );
+        assert_eq!(
+            effective_generation_max_tokens(198, None, &layouts, 10),
+            198
+        );
+        assert_eq!(
+            effective_generation_max_tokens(24, Some(0.45), &layouts, 10),
+            24,
+            "explicit user caps stay authoritative"
         );
     }
 
@@ -4361,9 +4415,7 @@ mod tests {
             .collect::<Vec<_>>();
         let video = Tensor::<B, 5>::from_data(TensorData::new(values, [1, 2, 3, 16, 16]), &device);
 
-        let uncached = model
-            .gazing_model
-            .generate_uncached(video.clone(), 4, None);
+        let uncached = model.gazing_model.generate_uncached(video.clone(), 4, None);
         let cached = model.gazing_model.generate_cached(video, 4, None);
 
         assert_eq!(cached.gazing_pos, uncached.gazing_pos);
@@ -4388,9 +4440,7 @@ mod tests {
             .collect::<Vec<_>>();
         let video = Tensor::<B, 5>::from_data(TensorData::new(values, [1, 2, 3, 16, 16]), &device);
 
-        let cached = model
-            .gazing_model
-            .generate_cached(video.clone(), 4, None);
+        let cached = model.gazing_model.generate_cached(video.clone(), 4, None);
         let mut cache = AutoGazeStreamingCache::new(2);
         let streaming =
             model
@@ -4615,7 +4665,7 @@ mod tests {
 
     #[cfg(feature = "ndarray")]
     #[test]
-    fn greedy_selection_disallows_hidden_token_after_task_loss_stop() {
+    fn greedy_selection_truncates_multi_token_block_after_task_loss_stop() {
         type B = burn::backend::NdArray<f32>;
         let device = Default::default();
         let scores = vec![
@@ -4658,7 +4708,8 @@ mod tests {
             },
         );
 
-        assert_eq!(selected.0, vec![vec![0, 4, 2]]);
+        assert_eq!(selected.0, vec![vec![0, 4]]);
+        assert_eq!(selected.1, vec![vec![true, false]]);
         assert_eq!(selected.0, reference.0);
         assert_eq!(selected.1, reference.1);
     }

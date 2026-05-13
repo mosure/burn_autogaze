@@ -38,7 +38,10 @@ enum FixationCase {
     Multiscale,
     TinySparse,
     CoarseDense,
+    Checkerboard16,
+    Checkerboard32,
     DenseGrid64,
+    DenseGrid196,
     RedundantFullFrame,
 }
 
@@ -48,7 +51,10 @@ impl FixationCase {
             Self::Multiscale => "multiscale",
             Self::TinySparse => "tiny-sparse",
             Self::CoarseDense => "coarse-dense",
+            Self::Checkerboard16 => "checkerboard-16",
+            Self::Checkerboard32 => "checkerboard-32",
             Self::DenseGrid64 => "dense-grid-64",
+            Self::DenseGrid196 => "dense-grid-196",
             Self::RedundantFullFrame => "redundant-full-frame",
         }
     }
@@ -67,7 +73,10 @@ impl FixationCase {
             Self::CoarseDense => vec![FixationPoint::with_grid_extent(
                 0.25, 0.25, 0.5, 0.5, 1.0, 2,
             )],
+            Self::Checkerboard16 => checkerboard_grid_fixations(16),
+            Self::Checkerboard32 => checkerboard_grid_fixations(32),
             Self::DenseGrid64 => dense_grid_fixations(64),
+            Self::DenseGrid196 => dense_grid_fixations(14),
             Self::RedundantFullFrame => redundant_multiscale_fixations(),
         }
     }
@@ -115,7 +124,10 @@ const FIXATION_CASES: &[FixationCase] = &[
     FixationCase::Multiscale,
     FixationCase::TinySparse,
     FixationCase::CoarseDense,
+    FixationCase::Checkerboard16,
+    FixationCase::Checkerboard32,
     FixationCase::DenseGrid64,
+    FixationCase::DenseGrid196,
     FixationCase::RedundantFullFrame,
 ];
 const GEOMETRY_CASES: &[GeometryCase] = &[
@@ -489,6 +501,26 @@ fn dense_grid_fixations(grid: usize) -> Vec<FixationPoint> {
                     grid,
                 )
             })
+        })
+        .collect()
+}
+
+fn checkerboard_grid_fixations(grid: usize) -> Vec<FixationPoint> {
+    let extent = 1.0 / grid as f32;
+    (0..grid)
+        .flat_map(|row| {
+            (0..grid)
+                .filter(move |col| (row + col) % 2 == 0)
+                .map(move |col| {
+                    FixationPoint::with_grid_extent(
+                        (col as f32 + 0.5) * extent,
+                        (row as f32 + 0.5) * extent,
+                        extent,
+                        extent,
+                        1.0,
+                        grid,
+                    )
+                })
         })
         .collect()
 }

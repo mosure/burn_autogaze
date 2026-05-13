@@ -1,5 +1,6 @@
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::Write as _;
@@ -110,6 +111,12 @@ struct BevyPerfMatrixArgs {
     out: PathBuf,
     #[arg(long)]
     camera: bool,
+    #[arg(
+        long,
+        value_name = "SUBSTRING",
+        help = "Only run Bevy perf cases whose names contain SUBSTRING."
+    )]
+    case_filter: Option<String>,
     #[arg(long, default_value_t = BEVY_PERF_CASE_TIMEOUT_SECS)]
     case_timeout_seconds: u64,
     #[arg(long, value_enum, default_value_t = BevyPerfBuildProfile::Release)]
@@ -500,6 +507,7 @@ fn release_readiness(root: PathBuf, args: ReleaseReadinessArgs) -> Result<()> {
             ),
             out: PathBuf::from("target/autogaze-bevy-perf"),
             camera: true,
+            case_filter: None,
             case_timeout_seconds: BEVY_PERF_CASE_TIMEOUT_SECS,
             profile: BevyPerfBuildProfile::Release,
         },
@@ -668,6 +676,7 @@ fn completion_audit(root: PathBuf, args: CompletionAuditArgs) -> Result<()> {
                 ),
                 out: args.out.clone(),
                 camera: true,
+                case_filter: None,
                 case_timeout_seconds: args.case_timeout_seconds,
                 profile: args.perf_profile,
             },
@@ -1006,6 +1015,99 @@ fn bevy_perf_matrix(root: PathBuf, args: BevyPerfMatrixArgs) -> Result<()> {
             ],
             false,
         ),
+        (
+            "realtime-synthetic-pulse-auto-interframe-psnr",
+            vec![
+                "--source",
+                "synthetic-pulse",
+                "--mode",
+                "realtime",
+                "--display-transfer",
+                "auto",
+                "--visualization-mode",
+                "interframe",
+            ],
+            false,
+        ),
+        (
+            "realtime-synthetic-pulse-gpu-interframe-no-psnr",
+            vec![
+                "--source",
+                "synthetic-pulse",
+                "--mode",
+                "realtime",
+                "--display-transfer",
+                "gpu",
+                "--visualization-mode",
+                "interframe",
+                "--show-psnr=false",
+            ],
+            false,
+        ),
+        (
+            "realtime-synthetic-local-motion-auto-interframe-psnr",
+            vec![
+                "--source",
+                "synthetic-local-motion",
+                "--mode",
+                "realtime",
+                "--display-transfer",
+                "auto",
+                "--visualization-mode",
+                "interframe",
+            ],
+            false,
+        ),
+        (
+            "realtime-synthetic-local-motion-taskloss-03-gpu-interframe",
+            vec![
+                "--source",
+                "synthetic-local-motion",
+                "--mode",
+                "realtime",
+                "--task-loss-requirement",
+                "0.3",
+                "--display-transfer",
+                "gpu",
+                "--visualization-mode",
+                "interframe",
+            ],
+            false,
+        ),
+        (
+            "realtime-synthetic-local-motion-taskloss-03-auto-interframe",
+            vec![
+                "--source",
+                "synthetic-local-motion",
+                "--mode",
+                "realtime",
+                "--task-loss-requirement",
+                "0.3",
+                "--display-transfer",
+                "auto",
+                "--visualization-mode",
+                "interframe",
+            ],
+            false,
+        ),
+        (
+            "realtime-synthetic-local-motion-taskloss-03-full-budget-gpu-interframe",
+            vec![
+                "--source",
+                "synthetic-local-motion",
+                "--mode",
+                "realtime",
+                "--task-loss-requirement",
+                "0.3",
+                "--max-gaze-tokens-each-frame",
+                "0",
+                "--display-transfer",
+                "gpu",
+                "--visualization-mode",
+                "interframe",
+            ],
+            false,
+        ),
     ];
     if args.camera {
         cases.extend([
@@ -1035,6 +1137,13 @@ fn bevy_perf_matrix(root: PathBuf, args: BevyPerfMatrixArgs) -> Result<()> {
             ),
         ]);
     }
+    if let Some(filter) = args.case_filter.as_deref() {
+        cases.retain(|(name, _, _)| name.contains(filter));
+        ensure!(
+            !cases.is_empty(),
+            "no Bevy perf cases matched --case-filter `{filter}`"
+        );
+    }
 
     if !runner.dry_run {
         write_perf_matrix_manifest(&args.out, &args, &cases)?;
@@ -1054,8 +1163,12 @@ fn bevy_perf_matrix(root: PathBuf, args: BevyPerfMatrixArgs) -> Result<()> {
         app_args.extend([
             OsString::from("--perf-summary-frames"),
             OsString::from(args.frames.to_string()),
+            OsString::from("--perf-summary-warmup-frames"),
+            OsString::from("4"),
             OsString::from("--perf-summary-path"),
             OsString::from(args.out.join(format!("{name}.json"))),
+            OsString::from("--perf-trace-path"),
+            OsString::from(args.out.join(format!("{name}.jsonl"))),
             OsString::from("--log-pipeline-timing"),
             OsString::from("--require-hardware-adapter=true"),
         ]);
@@ -1092,6 +1205,7 @@ fn write_perf_matrix_manifest(
                 "include_static_source": include_static,
                 "app_args": app_args,
                 "summary_path": out_dir.join(format!("{name}.json")).display().to_string(),
+                "trace_path": out_dir.join(format!("{name}.jsonl")).display().to_string(),
                 "log_path": out_dir.join(format!("{name}.log")).display().to_string(),
             })
         })
@@ -1100,9 +1214,11 @@ fn write_perf_matrix_manifest(
         "frames": args.frames,
         "image": args.image.display().to_string(),
         "camera": args.camera,
+        "case_filter": args.case_filter.as_deref(),
         "xtask_build_profile": args.profile.as_str(),
         "xtask_case_timeout_seconds": args.case_timeout_seconds,
         "xtask_cache_dir": out_dir.join("cache").display().to_string(),
+        "perf_summary_warmup_frames": 4,
         "require_hardware_adapter": true,
         "cases": cases,
     });
@@ -1119,6 +1235,7 @@ fn run_bevy_perf_case(
 ) -> Result<()> {
     let log_path = out_dir.join(format!("{name}.log"));
     let json_path = out_dir.join(format!("{name}.json"));
+    let trace_path = out_dir.join(format!("{name}.jsonl"));
     let mut args = vec![
         OsString::from("run"),
         OsString::from("-p"),
@@ -1161,7 +1278,16 @@ fn run_bevy_perf_case(
     );
     normalize_perf_json(&log_path, &json_path)?;
     let mut data = load_json(&json_path)?;
-    augment_perf_case_metadata(&mut data, name, profile, timeout, &out_dir.join("cache"))?;
+    let trace_rows = validate_perf_trace(&trace_path, &data)?;
+    augment_perf_case_metadata(
+        &mut data,
+        name,
+        profile,
+        timeout,
+        &out_dir.join("cache"),
+        &trace_path,
+        &trace_rows,
+    )?;
     write_json(&json_path, &data)?;
     validate_summary_or_aggregate(&data, true)?;
     print_perf_summary(&data)?;
@@ -1174,6 +1300,8 @@ fn augment_perf_case_metadata(
     profile: BevyPerfBuildProfile,
     timeout: Duration,
     cache_dir: &Path,
+    trace_path: &Path,
+    trace_rows: &[Value],
 ) -> Result<()> {
     let object = data
         .as_object_mut()
@@ -1191,7 +1319,166 @@ fn augment_perf_case_metadata(
         "xtask_cache_dir".to_owned(),
         Value::String(cache_dir.display().to_string()),
     );
+    object.insert(
+        "xtask_trace_path".to_owned(),
+        Value::String(trace_path.display().to_string()),
+    );
+    insert_perf_trace_diagnostics(object, trace_rows)?;
     Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct PerfTraceSample {
+    sequence: u64,
+    total_ms: f64,
+    model_ms: f64,
+    generated_tokens: u64,
+    active_generated_tokens: u64,
+    padded_generated_tokens: u64,
+    trace_points: u64,
+    mask_update_ratio: f64,
+    psnr_db: Option<f64>,
+    psnr_infinite: bool,
+}
+
+fn insert_perf_trace_diagnostics(
+    object: &mut serde_json::Map<String, Value>,
+    trace_rows: &[Value],
+) -> Result<()> {
+    let samples = trace_rows
+        .iter()
+        .map(perf_trace_sample)
+        .collect::<Result<Vec<_>>>()?;
+    if samples.is_empty() {
+        return Ok(());
+    }
+
+    let generated_values = samples
+        .iter()
+        .map(|sample| sample.generated_tokens as f64)
+        .collect::<Vec<_>>();
+    let active_generated_values = samples
+        .iter()
+        .map(|sample| sample.active_generated_tokens as f64)
+        .collect::<Vec<_>>();
+    let max_generated = generated_values.iter().copied().fold(0.0_f64, f64::max);
+    let max_active_generated = active_generated_values
+        .iter()
+        .copied()
+        .fold(0.0_f64, f64::max);
+    object.insert(
+        "max_generated_tokens".to_owned(),
+        Value::from(max_generated),
+    );
+    object.insert(
+        "p95_generated_tokens".to_owned(),
+        Value::from(percentile_for_values(&generated_values, 0.95)),
+    );
+    object.insert(
+        "max_active_generated_tokens".to_owned(),
+        Value::from(max_active_generated),
+    );
+    object.insert(
+        "p95_active_generated_tokens".to_owned(),
+        Value::from(percentile_for_values(&active_generated_values, 0.95)),
+    );
+
+    let finite_psnr = samples
+        .iter()
+        .filter_map(|sample| sample.psnr_db)
+        .collect::<Vec<_>>();
+    let infinite_psnr = samples.iter().filter(|sample| sample.psnr_infinite).count();
+    object.insert(
+        "finite_psnr_samples".to_owned(),
+        Value::from(finite_psnr.len()),
+    );
+    object.insert(
+        "infinite_psnr_samples".to_owned(),
+        Value::from(infinite_psnr),
+    );
+    if !finite_psnr.is_empty() {
+        object.insert(
+            "avg_finite_psnr_db".to_owned(),
+            Value::from(finite_psnr.iter().sum::<f64>() / finite_psnr.len() as f64),
+        );
+        object.insert(
+            "min_finite_psnr_db".to_owned(),
+            Value::from(finite_psnr.iter().copied().fold(f64::INFINITY, f64::min)),
+        );
+        object.insert(
+            "p05_finite_psnr_db".to_owned(),
+            Value::from(percentile_for_values(&finite_psnr, 0.05)),
+        );
+    }
+
+    let mut by_generated = BTreeMap::<u64, Vec<f64>>::new();
+    for sample in &samples {
+        by_generated
+            .entry(sample.generated_tokens)
+            .or_default()
+            .push(sample.model_ms);
+    }
+    let buckets = by_generated
+        .into_iter()
+        .map(|(generated_tokens, model_samples)| {
+            let count = model_samples.len();
+            let avg_model_ms = model_samples.iter().sum::<f64>() / count as f64;
+            json!({
+                "generated_tokens": generated_tokens,
+                "samples": count,
+                "avg_model_ms": avg_model_ms,
+                "p95_model_ms": percentile_for_values(&model_samples, 0.95),
+                "max_model_ms": model_samples.iter().copied().fold(0.0_f64, f64::max),
+            })
+        })
+        .collect::<Vec<_>>();
+    object.insert(
+        "model_ms_by_generated_tokens".to_owned(),
+        Value::Array(buckets),
+    );
+
+    let mut worst = samples.clone();
+    worst.sort_by(|left, right| right.model_ms.total_cmp(&left.model_ms));
+    let worst = worst
+        .into_iter()
+        .take(6)
+        .map(|sample| {
+            json!({
+                "sequence": sample.sequence,
+                "total_ms": sample.total_ms,
+                "model_ms": sample.model_ms,
+                "generated_tokens": sample.generated_tokens,
+                "active_generated_tokens": sample.active_generated_tokens,
+                "padded_generated_tokens": sample.padded_generated_tokens,
+                "trace_points": sample.trace_points,
+                "mask_update_ratio": sample.mask_update_ratio,
+                "psnr_db": sample.psnr_db,
+                "psnr_infinite": sample.psnr_infinite,
+            })
+        })
+        .collect::<Vec<_>>();
+    object.insert("worst_model_samples".to_owned(), Value::Array(worst));
+    Ok(())
+}
+
+fn perf_trace_sample(row: &Value) -> Result<PerfTraceSample> {
+    Ok(PerfTraceSample {
+        sequence: require_required_int(row, "latest_sequence", 0)?,
+        total_ms: require_required_number(row, "latest_total_ms", 0.0, None)?,
+        model_ms: require_required_number(row, "latest_model_ms", 0.0, None)?,
+        generated_tokens: require_required_int(row, "latest_generated_tokens", 0)?,
+        active_generated_tokens: require_required_int(row, "latest_active_generated_tokens", 0)?,
+        padded_generated_tokens: require_required_int(row, "latest_padded_generated_tokens", 0)?,
+        trace_points: require_required_int(row, "latest_trace_points", 0)?,
+        mask_update_ratio: require_required_number(
+            row,
+            "latest_mask_update_ratio",
+            0.0,
+            Some(1.0),
+        )?,
+        psnr_db: require_nullable_number(row, "latest_psnr_db", 0.0)?,
+        psnr_infinite: require_required_bool(row, "latest_psnr_db_infinite")?,
+    })
 }
 
 fn normalize_perf_json(log_path: &Path, json_path: &Path) -> Result<()> {
@@ -1207,6 +1494,121 @@ fn normalize_perf_json(log_path: &Path, json_path: &Path) -> Result<()> {
         serde_json::from_str(summary).context("parse perf summary from log")?
     };
     write_json(json_path, &data)
+}
+
+fn validate_perf_trace(trace_path: &Path, summary: &Value) -> Result<Vec<Value>> {
+    ensure!(
+        trace_path.is_file(),
+        "missing per-frame perf trace at {}",
+        trace_path.display()
+    );
+    let content = fs::read_to_string(trace_path)
+        .with_context(|| format!("read perf trace {}", trace_path.display()))?;
+    let mut rows = Vec::new();
+    for (index, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let row = serde_json::from_str::<Value>(line)
+            .with_context(|| format!("parse perf trace line {}", index + 1))?;
+        rows.push(row);
+    }
+    let processed = usize::try_from(require_required_int(summary, "processed_frames", 1)?)
+        .context("processed_frames exceeds usize")?;
+    ensure!(
+        rows.len() == processed,
+        "perf trace row count {} does not match processed_frames {processed}",
+        rows.len()
+    );
+
+    let mut previous_processed = 0_u64;
+    let mut previous_sequence = None::<u64>;
+    let mut total_samples = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        let processed_frames = require_required_int(row, "processed_frames", 1)?;
+        ensure!(
+            processed_frames > previous_processed,
+            "perf trace processed_frames is not strictly increasing at row {}",
+            index + 1
+        );
+        previous_processed = processed_frames;
+
+        let sequence = require_required_int(row, "latest_sequence", 0)?;
+        if let Some(previous) = previous_sequence {
+            ensure!(
+                sequence > previous,
+                "perf trace sequence is not strictly increasing at row {}: {sequence} <= {previous}",
+                index + 1
+            );
+        }
+        previous_sequence = Some(sequence);
+
+        let total_ms = require_required_number(row, "latest_total_ms", 0.0, None)?;
+        total_samples.push(total_ms);
+        for field in [
+            "latest_source_ms",
+            "latest_prepare_ms",
+            "latest_pack_ms",
+            "latest_input_ms",
+            "latest_display_input_ms",
+            "latest_model_ms",
+            "latest_visualize_ms",
+            "latest_display_ms",
+        ] {
+            require_number(row, field, 0.0, None, false)?;
+        }
+        for field in [
+            "latest_generated_tokens",
+            "latest_active_generated_tokens",
+            "latest_padded_generated_tokens",
+        ] {
+            require_int(row, field, 0, true)?;
+        }
+        ensure!(
+            require_required_int(row, "latest_generated_tokens", 0)?
+                >= require_required_int(row, "latest_active_generated_tokens", 0)?,
+            "perf trace generated-token count is smaller than active count at row {}",
+            index + 1
+        );
+        for field in [
+            "latest_gaze_update_ratio",
+            "latest_mask_update_ratio",
+            "latest_output_update_ratio",
+        ] {
+            require_number(row, field, 0.0, Some(1.0), true)?;
+        }
+        require_nullable_enum(
+            row,
+            "latest_tensor_interframe_path",
+            &[
+                "keyframe",
+                "dense-mask",
+                "dense-tensor",
+                "sparse-rects",
+                "full-frame",
+            ],
+        )?;
+    }
+
+    let traced_p95 = percentile_for_values(&total_samples, 0.95);
+    let summary_p95 = require_required_number(summary, "p95_total_ms", 0.0, None)?;
+    ensure!(
+        (traced_p95 - summary_p95).abs() <= 1e-6,
+        "perf trace p95_total_ms {traced_p95} does not match summary {summary_p95}"
+    );
+    Ok(rows)
+}
+
+fn percentile_for_values(samples: &[f64], percentile: f64) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(|left, right| left.total_cmp(right));
+    let index =
+        ((sorted.len().saturating_sub(1)) as f64 * percentile.clamp(0.0, 1.0)).round() as usize;
+    sorted[index]
 }
 
 fn write_json(path: &Path, data: &Value) -> Result<()> {
@@ -1306,6 +1708,11 @@ fn validate_summary(data: &Value, require_hardware_adapter: bool) -> Result<()> 
         "avg_model_frame_fps",
         "avg_input_fps",
         "p95_total_ms",
+        "p99_total_ms",
+        "max_total_ms",
+        "p05_output_fps",
+        "worst_output_fps",
+        "fps_stability_p05_to_avg",
     ] {
         require_number(data, field, 0.0, None, true)?;
     }
@@ -1320,13 +1727,41 @@ fn validate_summary(data: &Value, require_hardware_adapter: bool) -> Result<()> 
         "avg_visualize_cpu_ms",
         "avg_tensor_ms",
         "avg_display_ms",
+        "p50_model_ms",
+        "p95_model_ms",
+        "p99_model_ms",
+        "max_model_ms",
+        "p95_source_ms",
+        "p95_prepare_ms",
+        "p95_pack_ms",
+        "p95_input_ms",
+        "p95_display_input_ms",
+        "p95_visualize_ms",
+        "p95_visualize_cpu_ms",
+        "p95_psnr_ms",
+        "p95_tensor_ms",
+        "p95_display_ms",
         "avg_output_rgba_bytes",
         "avg_output_tensor_bytes",
         "avg_active_trace_points",
+        "avg_generated_tokens",
+        "avg_active_generated_tokens",
+        "avg_padded_generated_tokens",
+        "max_generated_tokens",
+        "p95_generated_tokens",
+        "max_active_generated_tokens",
+        "p95_active_generated_tokens",
     ] {
         require_number(data, field, 0.0, None, false)?;
     }
-    for field in ["avg_gaze_update_ratio", "latest_gaze_update_ratio"] {
+    for field in [
+        "avg_gaze_update_ratio",
+        "latest_gaze_update_ratio",
+        "avg_mask_update_ratio",
+        "latest_mask_update_ratio",
+        "avg_output_update_ratio",
+        "latest_output_update_ratio",
+    ] {
         require_number(data, field, 0.0, Some(1.0), true)?;
     }
     for field in [
@@ -1345,8 +1780,18 @@ fn validate_summary(data: &Value, require_hardware_adapter: bool) -> Result<()> 
         "latest_sequence",
         "latest_output_rgba_bytes",
         "latest_output_tensor_bytes",
+        "latest_generated_tokens",
+        "latest_active_generated_tokens",
+        "latest_padded_generated_tokens",
     ] {
         require_int(data, field, 0, true)?;
+    }
+    if data.get("latest_generated_tokens").is_some() {
+        ensure!(
+            require_required_int(data, "latest_generated_tokens", 0)?
+                >= require_required_int(data, "latest_active_generated_tokens", 0)?,
+            "`latest_generated_tokens` must be >= `latest_active_generated_tokens`"
+        );
     }
     require_number(data, "latest_display_input_ms", 0.0, None, false)?;
     if let Some(target_frames) = require_int(data, "target_frames", 1, false)? {
@@ -1356,6 +1801,8 @@ fn validate_summary(data: &Value, require_hardware_adapter: bool) -> Result<()> 
             "`processed_frames` must not exceed `target_frames`: {processed} > {target_frames}"
         );
     }
+    require_int(data, "skipped_warmup_frames", 0, false)?;
+    require_nullable_int(data, "latest_skipped_warmup_sequence", 0, false)?;
     let p50 = require_number(data, "p50_total_ms", 0.0, None, false)?;
     let p95 = require_required_number(data, "p95_total_ms", 0.0, None)?;
     if let Some(p50) = p50 {
@@ -1364,11 +1811,27 @@ fn validate_summary(data: &Value, require_hardware_adapter: bool) -> Result<()> 
             "`p95_total_ms` must be >= `p50_total_ms`: {p95} < {p50}"
         );
     }
+    let p99 = require_required_number(data, "p99_total_ms", 0.0, None)?;
+    let max_total = require_required_number(data, "max_total_ms", 0.0, None)?;
+    ensure!(
+        p99 >= p95,
+        "`p99_total_ms` must be >= `p95_total_ms`: {p99} < {p95}"
+    );
+    ensure!(
+        max_total >= p99,
+        "`max_total_ms` must be >= `p99_total_ms`: {max_total} < {p99}"
+    );
     require_enum(data, "mode", &["realtime", "resize-224", "tiled"], true)?;
     require_enum(
         data,
         "source",
-        &["camera", "static", "synthetic-pan"],
+        &[
+            "camera",
+            "static",
+            "synthetic-pan",
+            "synthetic-pulse",
+            "synthetic-local-motion",
+        ],
         false,
     )?;
     require_enum(
@@ -1387,6 +1850,7 @@ fn validate_summary(data: &Value, require_hardware_adapter: bool) -> Result<()> 
     require_enum(data, "xtask_build_profile", &["release", "dev"], false)?;
     require_int(data, "xtask_case_timeout_seconds", 1, false)?;
     require_string(data, "xtask_cache_dir", false)?;
+    require_string(data, "xtask_trace_path", false)?;
     require_nullable_enum(
         data,
         "latest_tensor_interframe_path",
@@ -1456,6 +1920,8 @@ fn validate_summary(data: &Value, require_hardware_adapter: bool) -> Result<()> 
         require_nullable_int(data, field, 1, false)?;
     }
     require_int(data, "max_gaze_tokens_each_frame", 0, false)?;
+    require_int(data, "stale_results", 0, false)?;
+    require_int(data, "perf_summary_warmup_frames", 0, false)?;
     require_int(data, "tensor_sparse_update_max_rects", 0, false)?;
     require_number(
         data,
@@ -1540,6 +2006,13 @@ fn validate_bevy_perf_summary_self_test() -> Result<()> {
         "avg_display_ms": 1.0,
         "avg_output_rgba_bytes": 0.0,
         "avg_output_tensor_bytes": 11059200.0,
+        "avg_generated_tokens": 10.0,
+        "avg_active_generated_tokens": 8.0,
+        "avg_padded_generated_tokens": 2.0,
+        "max_generated_tokens": 10.0,
+        "p95_generated_tokens": 10.0,
+        "max_active_generated_tokens": 8.0,
+        "p95_active_generated_tokens": 8.0,
         "avg_gaze_update_ratio": 0.25,
         "latest_gaze_update_ratio": 0.2,
         "processed_frames": 4,
@@ -1552,6 +2025,9 @@ fn validate_bevy_perf_summary_self_test() -> Result<()> {
         "latest_sequence": 3,
         "latest_output_rgba_bytes": 0,
         "latest_output_tensor_bytes": 11059200,
+        "latest_generated_tokens": 10,
+        "latest_active_generated_tokens": 8,
+        "latest_padded_generated_tokens": 2,
         "latest_display_input_ms": 0.1,
         "target_frames": 4,
         "mode": "resize-224",
@@ -1767,6 +2243,14 @@ fn print_perf_row(row: &Value) -> Result<()> {
         .get("avg_total_ms")
         .and_then(Value::as_f64)
         .unwrap_or(0.0);
+    let p95_total = row
+        .get("p95_total_ms")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let worst_fps = row
+        .get("worst_output_fps")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
     let model = row
         .get("avg_model_ms")
         .and_then(Value::as_f64)
@@ -1779,6 +2263,10 @@ fn print_perf_row(row: &Value) -> Result<()> {
         .get("avg_gaze_update_ratio")
         .and_then(Value::as_f64)
         .unwrap_or(0.0);
+    let output_update = row
+        .get("avg_output_update_ratio")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
     let active_points = row
         .get("avg_active_trace_points")
         .and_then(Value::as_f64)
@@ -1787,6 +2275,18 @@ fn print_perf_row(row: &Value) -> Result<()> {
         .get("avg_trace_points")
         .and_then(Value::as_f64)
         .unwrap_or(0.0);
+    let active_generated = row
+        .get("avg_active_generated_tokens")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let generated = row
+        .get("avg_generated_tokens")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let p95_generated = row
+        .get("p95_generated_tokens")
+        .and_then(Value::as_f64)
+        .unwrap_or(generated);
     let adapter = row
         .get("render_adapter_name")
         .and_then(Value::as_str)
@@ -1820,9 +2320,15 @@ fn print_perf_row(row: &Value) -> Result<()> {
     } else {
         "n/a".to_owned()
     };
+    let avg_psnr = row
+        .get("avg_finite_psnr_db")
+        .and_then(Value::as_f64)
+        .map(|value| format!("{value:.2}"))
+        .unwrap_or_else(|| "n/a".to_owned());
     println!(
-        "  {case}: {fps:.2} output fps, total={total:.2} ms, model={model:.2} ms, display_input={display_input:.2} ms/{input_residency}, points={active_points:.1}/{trace_points:.1}, gaze={:.2}%, psnr={psnr} dB, residency={residency}, output={output_rgba_mib:.1} MiB rgba/{output_tensor_mib:.1} MiB tensor, adapter={adapter}",
-        gaze * 100.0
+        "  {case}: {fps:.2} output fps (worst {worst_fps:.2}), total={total:.2} ms p95={p95_total:.2}, model={model:.2} ms, display_input={display_input:.2} ms/{input_residency}, generated={active_generated:.1}/{generated:.1} p95={p95_generated:.1}, points={active_points:.1}/{trace_points:.1}, mask={:.2}% output={:.2}%, psnr={psnr} dB avg_finite={avg_psnr} dB, residency={residency}, output={output_rgba_mib:.1} MiB rgba/{output_tensor_mib:.1} MiB tensor, adapter={adapter}",
+        gaze * 100.0,
+        output_update * 100.0
     );
     Ok(())
 }
@@ -2334,6 +2840,19 @@ mod tests {
             BevyPerfBuildProfile::Release,
             Duration::from_secs(42),
             Path::new("target/autogaze-bevy-perf/cache"),
+            Path::new("target/autogaze-bevy-perf/realtime-static-cpu.jsonl"),
+            &[json!({
+                "latest_sequence": 3,
+                "latest_total_ms": 18.0,
+                "latest_model_ms": 6.0,
+                "latest_generated_tokens": 10,
+                "latest_active_generated_tokens": 8,
+                "latest_padded_generated_tokens": 2,
+                "latest_trace_points": 12,
+                "latest_mask_update_ratio": 0.2,
+                "latest_psnr_db": 35.0,
+                "latest_psnr_db_infinite": false
+            })],
         )
         .expect("metadata should be inserted");
 
@@ -2341,6 +2860,13 @@ mod tests {
         assert_eq!(data["xtask_build_profile"], "release");
         assert_eq!(data["xtask_case_timeout_seconds"], 42);
         assert_eq!(data["xtask_cache_dir"], "target/autogaze-bevy-perf/cache");
+        assert_eq!(
+            data["xtask_trace_path"],
+            "target/autogaze-bevy-perf/realtime-static-cpu.jsonl"
+        );
+        assert_eq!(data["avg_finite_psnr_db"], 35.0);
+        assert_eq!(data["finite_psnr_samples"], 1);
+        assert_eq!(data["infinite_psnr_samples"], 0);
         validate_summary(&data, true).expect("augmented summary should validate");
     }
 
@@ -2404,6 +2930,7 @@ mod tests {
             image: PathBuf::from("fixture.png"),
             out: root.clone(),
             camera: true,
+            case_filter: None,
             case_timeout_seconds: 42,
             profile: BevyPerfBuildProfile::Release,
         };
@@ -2420,6 +2947,10 @@ mod tests {
         assert_eq!(manifest["xtask_case_timeout_seconds"], 42);
         assert_eq!(manifest["cases"][0]["case"], "case-a");
         assert_eq!(manifest["cases"][0]["include_static_source"], true);
+        assert_eq!(
+            manifest["cases"][0]["trace_path"],
+            root.join("case-a.jsonl").display().to_string()
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -2451,7 +2982,16 @@ mod tests {
             "avg_total_ms": 18.0,
             "p50_total_ms": 17.0,
             "p95_total_ms": 19.0,
+            "p99_total_ms": 20.0,
+            "max_total_ms": 21.0,
+            "p05_output_fps": 52.6,
+            "worst_output_fps": 47.6,
+            "fps_stability_p05_to_avg": 0.94,
             "avg_model_ms": 6.0,
+            "p50_model_ms": 5.8,
+            "p95_model_ms": 6.5,
+            "p99_model_ms": 7.0,
+            "max_model_ms": 7.2,
             "avg_input_ms": 1.0,
             "avg_display_input_ms": 0.1,
             "avg_pack_ms": 1.0,
@@ -2459,12 +2999,35 @@ mod tests {
             "avg_visualize_cpu_ms": 1.0,
             "avg_tensor_ms": 1.0,
             "avg_display_ms": 1.0,
+            "p95_source_ms": 0.1,
+            "p95_prepare_ms": 0.2,
+            "p95_pack_ms": 1.1,
+            "p95_input_ms": 1.2,
+            "p95_display_input_ms": 0.2,
+            "p95_visualize_ms": 2.4,
+            "p95_visualize_cpu_ms": 1.2,
+            "p95_psnr_ms": 0.4,
+            "p95_tensor_ms": 1.3,
+            "p95_display_ms": 1.4,
             "avg_output_rgba_bytes": 0.0,
             "avg_output_tensor_bytes": 11059200.0,
             "avg_active_trace_points": 9.0,
+            "avg_generated_tokens": 10.0,
+            "avg_active_generated_tokens": 8.0,
+            "avg_padded_generated_tokens": 2.0,
+            "max_generated_tokens": 10.0,
+            "p95_generated_tokens": 10.0,
+            "max_active_generated_tokens": 8.0,
+            "p95_active_generated_tokens": 8.0,
             "avg_gaze_update_ratio": 0.25,
             "latest_gaze_update_ratio": 0.2,
+            "avg_mask_update_ratio": 0.25,
+            "latest_mask_update_ratio": 0.2,
+            "avg_output_update_ratio": 0.25,
+            "latest_output_update_ratio": 0.2,
             "processed_frames": 4,
+            "skipped_warmup_frames": 2,
+            "latest_skipped_warmup_sequence": 1,
             "processed_model_frames": 8,
             "latest_clip_frames": 2,
             "latest_model_frames": 2,
@@ -2475,6 +3038,9 @@ mod tests {
             "latest_sequence": 3,
             "latest_output_rgba_bytes": 0,
             "latest_output_tensor_bytes": 11059200,
+            "latest_generated_tokens": 10,
+            "latest_active_generated_tokens": 8,
+            "latest_padded_generated_tokens": 2,
             "latest_display_input_ms": 0.1,
             "target_frames": 4,
             "mode": "resize-224",
@@ -2493,6 +3059,7 @@ mod tests {
             "ema_psnr_db": 34.0,
             "ema_psnr_db_infinite": false,
             "show_psnr": true,
+            "perf_summary_warmup_frames": 2,
             "configured_max_in_flight": 1,
             "effective_max_in_flight": 1,
             "frames_per_clip": 2,
@@ -2501,10 +3068,12 @@ mod tests {
             "inference_width": 640,
             "inference_height": 360,
             "max_gaze_tokens_each_frame": 0,
+            "stale_results": 0,
             "tensor_sparse_update_max_rects": 256,
             "tensor_sparse_update_max_ratio": 0.35,
             "render_adapter_device_type": "DiscreteGpu",
             "render_adapter_name": "test gpu",
+            "xtask_trace_path": "target/test.jsonl",
             "case": "self-test"
         })
     }

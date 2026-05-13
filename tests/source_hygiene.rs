@@ -214,16 +214,23 @@ fn bevy_wasm_model_warmup_does_not_block_on_backend_sync() {
 }
 
 #[test]
-fn bevy_realtime_default_uses_model_generation_budget() {
+fn bevy_explicit_task_loss_uses_bounded_quality_budget_without_mask_expansion() {
     let Some(source) = bevy_config_source() else {
         return;
     };
 
     assert!(
-        source.contains(
-            "pub const DEFAULT_REALTIME_MAX_GAZE_TOKENS: usize = DEFAULT_MODEL_GENERATION_BUDGET;"
-        ),
-        "Bevy realtime defaults should not silently cap the upstream model budget"
+        source.contains("default_max_gaze_tokens_for_task_loss("),
+        "Bevy config should route explicit task-loss quality requests through a named token-budget helper"
+    );
+    assert!(
+        source.contains("DEFAULT_REALTIME_QUALITY_MAX_GAZE_TOKENS"),
+        "Explicit stricter task-loss quality requests should raise the realtime token budget without restoring the full model budget"
+    );
+    assert!(
+        !source.contains("DEFAULT_REALTIME_HIGH_QUALITY_MASK_CELL_SCALE")
+            && !source.contains("default_mask_cell_scale_for_quality"),
+        "Task-loss quality defaults must not inflate display mask cells to compensate for a short readout"
     );
 }
 

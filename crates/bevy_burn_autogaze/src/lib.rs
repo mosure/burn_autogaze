@@ -1,4 +1,4 @@
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
@@ -40,17 +40,17 @@ use burn_autogaze::{
     prepare_rgba_clip_for_trace, resize_rgba_frame_to_dimensions, rgba_clip_to_tensor,
     should_use_streaming_cache, video_frame_tensor,
 };
+#[cfg(test)]
+use burn_autogaze::{
+    AutoGazeTaskLossOption, fixation_alpha_mask, fixation_scale_mask_rgba,
+    rgba_clip_to_inference_tensor, rgba_clip_to_processor_tensor,
+};
 pub use burn_autogaze::{
     DEFAULT_BLEND_ALPHA, DEFAULT_KEYFRAME_DURATION, DEFAULT_MAX_IN_FLIGHT,
     DEFAULT_MODEL_GENERATION_BUDGET, DEFAULT_REALTIME_FRAMES_PER_CLIP, DEFAULT_REALTIME_TOP_K,
     DEFAULT_TENSOR_FULL_FRAME_UPDATE_MIN_RATIO, DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RATIO,
     DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RECTS, DEFAULT_TILED_FRAMES_PER_CLIP,
     DEFAULT_TILED_MAX_GAZE_TOKENS, DEFAULT_TILED_TILE_BATCH_SIZE, DEFAULT_TILED_TOP_K,
-};
-#[cfg(test)]
-use burn_autogaze::{
-    fixation_alpha_mask, fixation_scale_mask_rgba, rgba_clip_to_inference_tensor,
-    rgba_clip_to_processor_tensor,
 };
 use image::RgbaImage;
 
@@ -62,13 +62,14 @@ use config::MODEL_INPUT_SIZE;
 pub use config::{
     BevyAutoGazeMode, BevyBurnAutoGazeConfig, BevyDisplayTransfer, BevyFrameSource,
     DEFAULT_BEVY_MASK_GEOMETRY_MODE, DEFAULT_BEVY_MODE, DEFAULT_BEVY_REALTIME_FRAMES_PER_CLIP,
-    DEFAULT_BEVY_STREAMING_CACHE, DEFAULT_BEVY_TILED_TOP_K, DEFAULT_BIRDS_BLEND_ALPHA,
-    DEFAULT_BIRDS_FRAMES_PER_CLIP, DEFAULT_BIRDS_INFERENCE_HEIGHT, DEFAULT_BIRDS_INFERENCE_WIDTH,
-    DEFAULT_BIRDS_KEYFRAME_DURATION, DEFAULT_BIRDS_MAX_GAZE_TOKENS, DEFAULT_BIRDS_TILE_BATCH_SIZE,
-    DEFAULT_BIRDS_TOP_K, DEFAULT_CONFIG_URL, DEFAULT_NATIVE_MODEL_DIR,
-    DEFAULT_REALTIME_INFERENCE_WIDTH, DEFAULT_REALTIME_MAX_GAZE_TOKENS,
-    DEFAULT_TILED_INFERENCE_WIDTH, DEFAULT_WEIGHTS_URL, ImplicitModeDefaults,
-    default_frames_per_clip, default_inference_dimensions, default_max_gaze_tokens_each_frame,
+    DEFAULT_BEVY_STREAMING_CACHE, DEFAULT_BEVY_TASK_LOSS_REQUIREMENT, DEFAULT_BEVY_TILED_TOP_K,
+    DEFAULT_BIRDS_BLEND_ALPHA, DEFAULT_BIRDS_FRAMES_PER_CLIP, DEFAULT_BIRDS_INFERENCE_HEIGHT,
+    DEFAULT_BIRDS_INFERENCE_WIDTH, DEFAULT_BIRDS_KEYFRAME_DURATION, DEFAULT_BIRDS_MAX_GAZE_TOKENS,
+    DEFAULT_BIRDS_TILE_BATCH_SIZE, DEFAULT_BIRDS_TOP_K, DEFAULT_CONFIG_URL,
+    DEFAULT_NATIVE_MODEL_DIR, DEFAULT_REALTIME_INFERENCE_WIDTH, DEFAULT_REALTIME_MAX_GAZE_TOKENS,
+    DEFAULT_REALTIME_QUALITY_MAX_GAZE_TOKENS, DEFAULT_TILED_INFERENCE_WIDTH, DEFAULT_WEIGHTS_URL,
+    ImplicitModeDefaults, default_frames_per_clip, default_inference_dimensions,
+    default_max_gaze_tokens_each_frame, default_max_gaze_tokens_for_task_loss,
     default_tile_batch_size, default_top_k, realtime_policy_from_config,
 };
 use display::{
@@ -81,7 +82,13 @@ pub type AutoGazeBevyBackend = burn::backend::WebGpu<f32, i32>;
 pub type AutoGazeBevyDevice = burn::backend::wgpu::WgpuDevice;
 const AUTO_GAZE_BEVY_BACKEND_NAME: &str = "webgpu";
 const DEFAULT_REALTIME_MODEL_WARMUP_RUNS: usize = 3;
+const DEFAULT_STREAMING_MODEL_WARMUP_EXTRA_RUNS: usize = 8;
 const DEFAULT_TILED_MODEL_WARMUP_RUNS: usize = 1;
+const SYNTHETIC_LOCAL_STRONG_FRAMES: u64 = 40;
+const SYNTHETIC_LOCAL_SUBTLE_FRAMES: u64 = 40;
+const SYNTHETIC_LOCAL_STILL_FRAMES: u64 = 32;
+const SYNTHETIC_LOCAL_CYCLE_FRAMES: u64 =
+    SYNTHETIC_LOCAL_STRONG_FRAMES + SYNTHETIC_LOCAL_SUBTLE_FRAMES + SYNTHETIC_LOCAL_STILL_FRAMES;
 const MAX_SPARE_CLIP_BUFFERS: usize = 2;
 const TIMING_LOG_INTERVAL_MS: f64 = 5_000.0;
 const UI_MARGIN_PX: f32 = 12.0;
@@ -258,7 +265,15 @@ struct SyntheticFrameSource {
 impl SyntheticFrameSource {
     fn next_frame(&mut self, config: &BevyBurnAutoGazeConfig) -> RgbaImage {
         let (width, height) = synthetic_source_dimensions(config);
-        let frame = synthetic_pan_frame(width, height, self.frame_index);
+        let frame = match config.source {
+            BevyFrameSource::SyntheticPulse => {
+                synthetic_pulse_frame(width, height, self.frame_index)
+            }
+            BevyFrameSource::SyntheticLocalMotion => {
+                synthetic_local_motion_frame(width, height, self.frame_index)
+            }
+            _ => synthetic_pan_frame(width, height, self.frame_index),
+        };
         self.frame_index = self.frame_index.wrapping_add(1);
         frame
     }
@@ -325,6 +340,10 @@ struct InferenceTiming {
     sequence: u64,
     clip_frames: usize,
     model_frames: usize,
+    effective_generation_budget: usize,
+    generated_tokens: usize,
+    active_generated_tokens: usize,
+    padded_generated_tokens: usize,
     trace_points: usize,
     active_trace_points: usize,
     width: usize,
@@ -349,6 +368,8 @@ struct InferenceTiming {
     effective_display_transfer: BevyDisplayTransfer,
     gaze_update_ratio: f64,
     gaze_update_ratio_sample: Option<f64>,
+    output_update_ratio: f64,
+    output_update_ratio_sample: Option<f64>,
     psnr_db: Option<f64>,
     tensor_interframe_path: Option<AutoGazeTensorInterframePath>,
     mask_plan_stats: AutoGazeMaskPlanStats,
@@ -381,6 +402,9 @@ struct InferenceTimingStats {
     total_ms: f64,
     model_ms: f64,
     model_frames: usize,
+    generated_tokens: usize,
+    active_generated_tokens: usize,
+    padded_generated_tokens: usize,
     trace_points: usize,
     active_trace_points: usize,
     input_ms: f64,
@@ -391,11 +415,24 @@ struct InferenceTimingStats {
     psnr_ms: f64,
     tensor_ms: f64,
     display_ms: f64,
+    source_samples: Vec<f64>,
+    prepare_samples: Vec<f64>,
+    pack_samples: Vec<f64>,
+    input_samples: Vec<f64>,
+    display_input_samples: Vec<f64>,
+    visualize_samples: Vec<f64>,
+    visualize_cpu_samples: Vec<f64>,
+    psnr_ms_samples: Vec<f64>,
+    tensor_samples: Vec<f64>,
+    display_samples: Vec<f64>,
     output_rgba_bytes: usize,
     output_tensor_bytes: usize,
     gaze_update_ratio: f64,
     gaze_update_samples: usize,
     latest_gaze_update_ratio: Option<f64>,
+    output_update_ratio: f64,
+    output_update_samples: usize,
+    latest_output_update_ratio: Option<f64>,
     psnr_stats: AutoGazePsnrStats,
     psnr_samples: usize,
     mask_rects: usize,
@@ -403,6 +440,9 @@ struct InferenceTimingStats {
     mask_pixels: usize,
     samples: Vec<f64>,
     model_samples: Vec<f64>,
+    stale_results: usize,
+    skipped_warmup_frames: usize,
+    latest_skipped_warmup_sequence: Option<u64>,
     emitted_summary: bool,
 }
 
@@ -429,6 +469,7 @@ struct InferenceRunConfigSummary {
     tensor_full_frame_update_min_ratio: f64,
     show_psnr: bool,
     warmup_model: bool,
+    perf_summary_warmup_frames: usize,
     burn_backend: &'static str,
 }
 
@@ -460,6 +501,7 @@ impl From<&BevyBurnAutoGazeConfig> for InferenceRunConfigSummary {
             tensor_full_frame_update_min_ratio: config.tensor_full_frame_update_min_ratio,
             show_psnr: config.show_psnr,
             warmup_model: config.warmup_model,
+            perf_summary_warmup_frames: config.perf_summary_warmup_frames,
             burn_backend: AUTO_GAZE_BEVY_BACKEND_NAME,
         }
     }
@@ -505,6 +547,15 @@ impl InferenceTimingStats {
         self.total_ms += timing.total_ms;
         self.model_ms += timing.model_ms;
         self.model_frames += timing.model_frames;
+        self.generated_tokens = self
+            .generated_tokens
+            .saturating_add(timing.generated_tokens);
+        self.active_generated_tokens = self
+            .active_generated_tokens
+            .saturating_add(timing.active_generated_tokens);
+        self.padded_generated_tokens = self
+            .padded_generated_tokens
+            .saturating_add(timing.padded_generated_tokens);
         self.trace_points += timing.trace_points;
         self.active_trace_points += timing.active_trace_points;
         self.input_ms += timing.input_ms;
@@ -515,6 +566,16 @@ impl InferenceTimingStats {
         self.psnr_ms += timing.psnr_ms;
         self.tensor_ms += timing.tensor_ms;
         self.display_ms += timing.display_ms;
+        self.source_samples.push(timing.source_ms);
+        self.prepare_samples.push(timing.prepare_ms);
+        self.pack_samples.push(timing.pack_ms);
+        self.input_samples.push(timing.input_ms);
+        self.display_input_samples.push(timing.display_input_ms);
+        self.visualize_samples.push(timing.visualize_ms);
+        self.visualize_cpu_samples.push(timing.visualize_cpu_ms);
+        self.psnr_ms_samples.push(timing.psnr_ms);
+        self.tensor_samples.push(timing.tensor_ms);
+        self.display_samples.push(timing.display_ms);
         self.output_rgba_bytes = self
             .output_rgba_bytes
             .saturating_add(timing.output_rgba_bytes);
@@ -525,6 +586,11 @@ impl InferenceTimingStats {
             self.gaze_update_ratio += ratio;
             self.gaze_update_samples = self.gaze_update_samples.saturating_add(1);
             self.latest_gaze_update_ratio = Some(ratio);
+        }
+        if let Some(ratio) = timing.output_update_ratio_sample {
+            self.output_update_ratio += ratio;
+            self.output_update_samples = self.output_update_samples.saturating_add(1);
+            self.latest_output_update_ratio = Some(ratio);
         }
         if let Some(psnr_db) = timing.psnr_db {
             self.psnr_stats.record(psnr_db);
@@ -558,17 +624,22 @@ impl InferenceTimingStats {
 
         self.last_log = Some(now);
         log(&format!(
-            "AutoGaze timing: {:.1} output fps / {:.1} model-frame fps ({:.1} ms) clip={} model_frames={} points={}/{} rects={} spans={} gaze={:.2}% {}x{}, source={:.1} ms, prepare={:.1} ms, pack={:.1} ms, input={:.1} ms, display_input={:.1} ms ({}) model={:.1} ms, trace={:.1} ms, sync={:.1} ms, visualize_cpu={:.1} ms, psnr={:.1} ms, tensor={:.1} ms, display_transfer={}, tensor_path={}, visualize={:.1} ms, display={:.1} ms, output={:.1} MiB rgba/{:.1} MiB f32",
+            "AutoGaze timing: {:.1} output fps / {:.1} model-frame fps ({:.1} ms) clip={} model_frames={} budget={} generated={}/{} padded={} points={}/{} rects={} spans={} mask={:.2}% output={:.2}% {}x{}, source={:.1} ms, prepare={:.1} ms, pack={:.1} ms, input={:.1} ms, display_input={:.1} ms ({}) model={:.1} ms, trace={:.1} ms, sync={:.1} ms, visualize_cpu={:.1} ms, psnr={:.1} ms, tensor={:.1} ms, display_transfer={}, tensor_path={}, visualize={:.1} ms, display={:.1} ms, output={:.1} MiB rgba/{:.1} MiB f32",
             timing.e2e_fps(),
             timing.model_frame_fps(),
             timing.total_ms,
             timing.clip_frames,
             timing.model_frames,
+            timing.effective_generation_budget,
+            timing.active_generated_tokens,
+            timing.generated_tokens,
+            timing.padded_generated_tokens,
             timing.active_trace_points,
             timing.trace_points,
             timing.mask_plan_stats.rect_count,
             timing.mask_plan_stats.row_span_count,
             timing.gaze_update_ratio * 100.0,
+            timing.output_update_ratio * 100.0,
             timing.width,
             timing.height,
             timing.source_ms,
@@ -595,6 +666,15 @@ impl InferenceTimingStats {
         ));
     }
 
+    fn record_stale_result(&mut self) {
+        self.stale_results = self.stale_results.saturating_add(1);
+    }
+
+    fn skip_warmup_frame(&mut self, timing: InferenceTiming) {
+        self.skipped_warmup_frames = self.skipped_warmup_frames.saturating_add(1);
+        self.latest_skipped_warmup_sequence = Some(timing.sequence);
+    }
+
     fn processed_frames(&self) -> usize {
         self.samples.len()
     }
@@ -615,6 +695,8 @@ impl InferenceTimingStats {
         let avg_output_tensor_bytes =
             mean_or_zero(self.output_tensor_bytes as f64, processed_frames);
         let avg_gaze_update_ratio = mean_or_zero(self.gaze_update_ratio, self.gaze_update_samples);
+        let avg_output_update_ratio =
+            mean_or_zero(self.output_update_ratio, self.output_update_samples);
         let avg_input_fps = fps_from_millis(avg_total_ms)
             * mean_or_zero(self.model_frames as f64, processed_frames);
         let avg_model_frame_fps = if self.model_ms > 0.0 {
@@ -625,13 +707,29 @@ impl InferenceTimingStats {
         let avg_trace_points = mean_or_zero(self.trace_points as f64, processed_frames);
         let avg_active_trace_points =
             mean_or_zero(self.active_trace_points as f64, processed_frames);
+        let avg_generated_tokens = mean_or_zero(self.generated_tokens as f64, processed_frames);
+        let avg_active_generated_tokens =
+            mean_or_zero(self.active_generated_tokens as f64, processed_frames);
+        let avg_padded_generated_tokens =
+            mean_or_zero(self.padded_generated_tokens as f64, processed_frames);
         let avg_mask_rects = mean_or_zero(self.mask_rects as f64, processed_frames);
         let avg_mask_row_spans = mean_or_zero(self.mask_row_spans as f64, processed_frames);
         let avg_mask_pixels = mean_or_zero(self.mask_pixels as f64, processed_frames);
         let p50_total_ms = percentile_ms(&self.samples, 0.50);
         let p95_total_ms = percentile_ms(&self.samples, 0.95);
+        let p99_total_ms = percentile_ms(&self.samples, 0.99);
+        let max_total_ms = max_ms(&self.samples);
         let p50_model_ms = percentile_ms(&self.model_samples, 0.50);
         let p95_model_ms = percentile_ms(&self.model_samples, 0.95);
+        let p99_model_ms = percentile_ms(&self.model_samples, 0.99);
+        let max_model_ms = max_ms(&self.model_samples);
+        let p05_output_fps = fps_from_millis(p95_total_ms);
+        let worst_output_fps = fps_from_millis(max_total_ms);
+        let fps_stability_p05_to_avg = if avg_total_ms > 0.0 && p95_total_ms > 0.0 {
+            avg_total_ms / p95_total_ms
+        } else {
+            0.0
+        };
         let latest_clip_frames = self
             .latest
             .map(|timing| timing.clip_frames)
@@ -642,6 +740,8 @@ impl InferenceTimingStats {
             .unwrap_or_default();
         let mut summary = serde_json::json!({
             "target_frames": target_frames,
+            "skipped_warmup_frames": self.skipped_warmup_frames,
+            "latest_skipped_warmup_sequence": self.latest_skipped_warmup_sequence,
             "processed_frames": processed_frames,
             "processed_model_frames": self.model_frames,
             "avg_output_fps": fps_from_millis(avg_total_ms),
@@ -650,11 +750,31 @@ impl InferenceTimingStats {
             "avg_total_ms": avg_total_ms,
             "p50_total_ms": p50_total_ms,
             "p95_total_ms": p95_total_ms,
+            "p99_total_ms": p99_total_ms,
+            "max_total_ms": max_total_ms,
+            "p05_output_fps": p05_output_fps,
+            "worst_output_fps": worst_output_fps,
+            "fps_stability_p05_to_avg": fps_stability_p05_to_avg,
             "avg_model_ms": avg_model_ms,
             "p50_model_ms": p50_model_ms,
             "p95_model_ms": p95_model_ms,
+            "p99_model_ms": p99_model_ms,
+            "max_model_ms": max_model_ms,
+            "p95_source_ms": percentile_ms(&self.source_samples, 0.95),
+            "p95_prepare_ms": percentile_ms(&self.prepare_samples, 0.95),
+            "p95_pack_ms": percentile_ms(&self.pack_samples, 0.95),
+            "p95_input_ms": percentile_ms(&self.input_samples, 0.95),
+            "p95_display_input_ms": percentile_ms(&self.display_input_samples, 0.95),
+            "p95_visualize_ms": percentile_ms(&self.visualize_samples, 0.95),
+            "p95_visualize_cpu_ms": percentile_ms(&self.visualize_cpu_samples, 0.95),
+            "p95_psnr_ms": percentile_ms(&self.psnr_ms_samples, 0.95),
+            "p95_tensor_ms": percentile_ms(&self.tensor_samples, 0.95),
+            "p95_display_ms": percentile_ms(&self.display_samples, 0.95),
             "avg_trace_points": avg_trace_points,
             "avg_active_trace_points": avg_active_trace_points,
+            "avg_generated_tokens": avg_generated_tokens,
+            "avg_active_generated_tokens": avg_active_generated_tokens,
+            "avg_padded_generated_tokens": avg_padded_generated_tokens,
             "avg_mask_rects": avg_mask_rects,
             "avg_mask_row_spans": avg_mask_row_spans,
             "avg_mask_pixels": avg_mask_pixels,
@@ -669,6 +789,8 @@ impl InferenceTimingStats {
             "avg_output_rgba_bytes": avg_output_rgba_bytes,
             "avg_output_tensor_bytes": avg_output_tensor_bytes,
             "avg_gaze_update_ratio": avg_gaze_update_ratio,
+            "avg_mask_update_ratio": avg_gaze_update_ratio,
+            "avg_output_update_ratio": avg_output_update_ratio,
             "psnr_samples": self.psnr_samples,
             "latest_psnr_db": psnr_metric_json_value(&self.psnr_stats, PsnrMetricKind::Current),
             "latest_psnr_db_infinite": psnr_metric_is_infinite(&self.psnr_stats, PsnrMetricKind::Current),
@@ -684,14 +806,21 @@ impl InferenceTimingStats {
             "latest_model_frames": latest_model_frames,
             "latest_trace_points": self.latest.map(|timing| timing.trace_points).unwrap_or_default(),
             "latest_active_trace_points": self.latest.map(|timing| timing.active_trace_points).unwrap_or_default(),
+            "latest_generated_tokens": self.latest.map(|timing| timing.generated_tokens).unwrap_or_default(),
+            "latest_active_generated_tokens": self.latest.map(|timing| timing.active_generated_tokens).unwrap_or_default(),
+            "latest_padded_generated_tokens": self.latest.map(|timing| timing.padded_generated_tokens).unwrap_or_default(),
+            "latest_effective_generation_budget": self.latest.map(|timing| timing.effective_generation_budget).unwrap_or_default(),
             "latest_mask_rects": self.latest.map(|timing| timing.mask_plan_stats.rect_count).unwrap_or_default(),
             "latest_mask_row_spans": self.latest.map(|timing| timing.mask_plan_stats.row_span_count).unwrap_or_default(),
             "latest_mask_pixels": self.latest.map(|timing| timing.mask_plan_stats.pixel_count).unwrap_or_default(),
             "latest_gaze_update_ratio": self.latest_gaze_update_ratio.unwrap_or_default(),
+            "latest_mask_update_ratio": self.latest_gaze_update_ratio.unwrap_or_default(),
+            "latest_output_update_ratio": self.latest_output_update_ratio.unwrap_or_default(),
             "latest_tensor_interframe_path": self.latest.and_then(|timing| timing.tensor_interframe_path).map(|path| path.as_str()),
             "latest_sequence": self.latest.map(|timing| timing.sequence).unwrap_or_default(),
             "latest_width": self.latest.map(|timing| timing.width).unwrap_or_default(),
             "latest_height": self.latest.map(|timing| timing.height).unwrap_or_default(),
+            "stale_results": self.stale_results,
             "render_adapter_name": self.render_adapter.as_ref().map(|adapter| adapter.name.as_str()),
             "render_adapter_vendor": self.render_adapter.as_ref().map(|adapter| adapter.vendor),
             "render_adapter_device_type": self.render_adapter.as_ref().map(|adapter| adapter.device_type.as_str()),
@@ -745,6 +874,10 @@ fn percentile_ms(samples: &[f64], percentile: f64) -> f64 {
     let index =
         ((sorted.len().saturating_sub(1)) as f64 * percentile.clamp(0.0, 1.0)).round() as usize;
     sorted[index]
+}
+
+fn max_ms(samples: &[f64]) -> f64 {
+    samples.iter().copied().reduce(f64::max).unwrap_or(0.0)
 }
 
 fn insert_run_config_json_fields(
@@ -811,6 +944,10 @@ fn insert_run_config_json_fields(
     );
     fields.insert("show_psnr".to_string(), config.show_psnr.into());
     fields.insert("warmup_model".to_string(), config.warmup_model.into());
+    fields.insert(
+        "perf_summary_warmup_frames".to_string(),
+        config.perf_summary_warmup_frames.into(),
+    );
     fields.insert("burn_backend".to_string(), config.burn_backend.into());
 }
 
@@ -840,7 +977,6 @@ fn psnr_metric_is_infinite(stats: &AutoGazePsnrStats, kind: PsnrMetricKind) -> b
         .unwrap_or(false)
 }
 
-#[cfg(any(target_arch = "wasm32", test))]
 fn perf_sample_json(stats: &InferenceTimingStats) -> Option<String> {
     let latest = stats.latest?;
     let avg_output_fps = fps_from_millis(mean_or_zero(stats.total_ms, stats.processed_frames()));
@@ -855,25 +991,56 @@ fn perf_sample_json(stats: &InferenceTimingStats) -> Option<String> {
     let avg_trace_points = mean_or_zero(stats.trace_points as f64, stats.processed_frames());
     let avg_active_trace_points =
         mean_or_zero(stats.active_trace_points as f64, stats.processed_frames());
+    let avg_generated_tokens =
+        mean_or_zero(stats.generated_tokens as f64, stats.processed_frames());
+    let avg_active_generated_tokens = mean_or_zero(
+        stats.active_generated_tokens as f64,
+        stats.processed_frames(),
+    );
+    let avg_padded_generated_tokens = mean_or_zero(
+        stats.padded_generated_tokens as f64,
+        stats.processed_frames(),
+    );
     let avg_mask_rects = mean_or_zero(stats.mask_rects as f64, stats.processed_frames());
     let avg_mask_row_spans = mean_or_zero(stats.mask_row_spans as f64, stats.processed_frames());
     let avg_mask_pixels = mean_or_zero(stats.mask_pixels as f64, stats.processed_frames());
+    let p95_total_ms = percentile_ms(&stats.samples, 0.95);
+    let p99_total_ms = percentile_ms(&stats.samples, 0.99);
+    let max_total_ms = max_ms(&stats.samples);
     let mut sample = serde_json::json!({
         "processed_frames": stats.processed_frames(),
+        "skipped_warmup_frames": stats.skipped_warmup_frames,
+        "latest_skipped_warmup_sequence": stats.latest_skipped_warmup_sequence,
         "processed_model_frames": stats.model_frames,
         "latest_sequence": latest.sequence,
         "latest_clip_frames": latest.clip_frames,
         "latest_model_frames": latest.model_frames,
+        "latest_source_ms": latest.source_ms,
+        "latest_prepare_ms": latest.prepare_ms,
+        "latest_pack_ms": latest.pack_ms,
+        "latest_input_ms": latest.input_ms,
+        "latest_display_input_ms": latest.display_input_ms,
         "latest_total_ms": latest.total_ms,
         "latest_model_ms": latest.model_ms,
+        "latest_trace_ms": latest.trace_ms,
+        "latest_sync_ms": latest.sync_ms,
+        "latest_visualize_cpu_ms": latest.visualize_cpu_ms,
+        "latest_psnr_ms": latest.psnr_ms,
+        "latest_tensor_ms": latest.tensor_ms,
+        "latest_visualize_ms": latest.visualize_ms,
         "latest_display_ms": latest.display_ms,
-        "latest_display_input_ms": latest.display_input_ms,
+        "latest_effective_generation_budget": latest.effective_generation_budget,
+        "latest_generated_tokens": latest.generated_tokens,
+        "latest_active_generated_tokens": latest.active_generated_tokens,
+        "latest_padded_generated_tokens": latest.padded_generated_tokens,
         "latest_trace_points": latest.trace_points,
         "latest_active_trace_points": latest.active_trace_points,
         "latest_mask_rects": latest.mask_plan_stats.rect_count,
         "latest_mask_row_spans": latest.mask_plan_stats.row_span_count,
         "latest_mask_pixels": latest.mask_plan_stats.pixel_count,
         "latest_gaze_update_ratio": stats.latest_gaze_update_ratio.unwrap_or_default(),
+        "latest_mask_update_ratio": stats.latest_gaze_update_ratio.unwrap_or_default(),
+        "latest_output_update_ratio": stats.latest_output_update_ratio.unwrap_or_default(),
         "latest_tensor_interframe_path": latest.tensor_interframe_path.map(|path| path.as_str()),
         "latest_output_rgba_bytes": latest.output_rgba_bytes,
         "latest_output_tensor_bytes": latest.output_tensor_bytes,
@@ -893,6 +1060,9 @@ fn perf_sample_json(stats: &InferenceTimingStats) -> Option<String> {
         "avg_input_fps": avg_input_fps,
         "avg_trace_points": avg_trace_points,
         "avg_active_trace_points": avg_active_trace_points,
+        "avg_generated_tokens": avg_generated_tokens,
+        "avg_active_generated_tokens": avg_active_generated_tokens,
+        "avg_padded_generated_tokens": avg_padded_generated_tokens,
         "avg_mask_rects": avg_mask_rects,
         "avg_mask_row_spans": avg_mask_row_spans,
         "avg_mask_pixels": avg_mask_pixels,
@@ -901,12 +1071,38 @@ fn perf_sample_json(stats: &InferenceTimingStats) -> Option<String> {
         "avg_output_rgba_bytes": mean_or_zero(stats.output_rgba_bytes as f64, stats.processed_frames()),
         "avg_output_tensor_bytes": mean_or_zero(stats.output_tensor_bytes as f64, stats.processed_frames()),
         "avg_gaze_update_ratio": mean_or_zero(stats.gaze_update_ratio, stats.gaze_update_samples),
+        "avg_mask_update_ratio": mean_or_zero(stats.gaze_update_ratio, stats.gaze_update_samples),
+        "avg_output_update_ratio": mean_or_zero(stats.output_update_ratio, stats.output_update_samples),
         "psnr_samples": stats.psnr_samples,
         "latest_psnr_db": psnr_metric_json_value(&stats.psnr_stats, PsnrMetricKind::Current),
         "latest_psnr_db_infinite": psnr_metric_is_infinite(&stats.psnr_stats, PsnrMetricKind::Current),
         "ema_psnr_db": psnr_metric_json_value(&stats.psnr_stats, PsnrMetricKind::Ema),
         "ema_psnr_db_infinite": psnr_metric_is_infinite(&stats.psnr_stats, PsnrMetricKind::Ema),
-        "p95_total_ms": percentile_ms(&stats.samples, 0.95),
+        "p50_total_ms": percentile_ms(&stats.samples, 0.50),
+        "p95_total_ms": p95_total_ms,
+        "p99_total_ms": p99_total_ms,
+        "max_total_ms": max_total_ms,
+        "p05_output_fps": fps_from_millis(p95_total_ms),
+        "worst_output_fps": fps_from_millis(max_total_ms),
+        "fps_stability_p05_to_avg": if p95_total_ms > 0.0 {
+            mean_or_zero(stats.total_ms, stats.processed_frames()) / p95_total_ms
+        } else {
+            0.0
+        },
+        "p95_model_ms": percentile_ms(&stats.model_samples, 0.95),
+        "p99_model_ms": percentile_ms(&stats.model_samples, 0.99),
+        "max_model_ms": max_ms(&stats.model_samples),
+        "p95_source_ms": percentile_ms(&stats.source_samples, 0.95),
+        "p95_prepare_ms": percentile_ms(&stats.prepare_samples, 0.95),
+        "p95_pack_ms": percentile_ms(&stats.pack_samples, 0.95),
+        "p95_input_ms": percentile_ms(&stats.input_samples, 0.95),
+        "p95_display_input_ms": percentile_ms(&stats.display_input_samples, 0.95),
+        "p95_visualize_ms": percentile_ms(&stats.visualize_samples, 0.95),
+        "p95_visualize_cpu_ms": percentile_ms(&stats.visualize_cpu_samples, 0.95),
+        "p95_psnr_ms": percentile_ms(&stats.psnr_ms_samples, 0.95),
+        "p95_tensor_ms": percentile_ms(&stats.tensor_samples, 0.95),
+        "p95_display_ms": percentile_ms(&stats.display_samples, 0.95),
+        "stale_results": stats.stale_results,
     });
     if let Some(fields) = sample.as_object_mut() {
         insert_run_config_json_fields(fields, stats.run_config);
@@ -1323,6 +1519,8 @@ fn process_frames(
     let pipeline = pipeline.clone();
     let top_k = frame_input.config.top_k.max(1);
     let log_pipeline_timing = frame_input.config.log_pipeline_timing;
+    let perf_summary_warmup_frames = frame_input.config.perf_summary_warmup_frames;
+    let perf_trace_path = frame_input.config.perf_trace_path.clone();
     let context_frames = frame_input.config.frames_per_clip.max(1);
     let visualization_options = VisualizationOptions::new(
         frame_input.config.mask_cell_scale,
@@ -1382,6 +1580,9 @@ fn process_frames(
             if let Some(mut sequencer) = world.get_resource_mut::<InferenceSequencer>()
                 && !sequencer.accept(sequence)
             {
+                if let Some(mut stats) = world.get_resource_mut::<InferenceTimingStats>() {
+                    stats.record_stale_result();
+                }
                 if let Ok(mut tracker) = world.get_entity_mut(task_entity) {
                     tracker.remove::<ProcessAutoGaze>();
                     tracker.despawn();
@@ -1396,6 +1597,7 @@ fn process_frames(
                         height,
                         image_data,
                         gaze_update_ratio,
+                        output_update_ratio: _,
                         interframe_keyframe,
                         psnr_db,
                         mut timing,
@@ -1444,7 +1646,23 @@ fn process_frames(
                             if let Some(render_adapter) = render_adapter {
                                 stats.set_render_adapter(render_adapter);
                             }
-                            stats.record(timing, log_pipeline_timing);
+                            if stats.skipped_warmup_frames < perf_summary_warmup_frames {
+                                stats.skip_warmup_frame(timing);
+                            } else {
+                                stats.record(timing, log_pipeline_timing);
+                                if perf_trace_path.is_some()
+                                    && let Some(sample) = perf_sample_json(&stats)
+                                {
+                                    let truncate = stats.processed_frames() == 1;
+                                    if let Err(err) = write_perf_trace_sample(
+                                        perf_trace_path.as_deref(),
+                                        &sample,
+                                        truncate,
+                                    ) {
+                                        log(&format!("failed to write AutoGaze perf trace: {err}"));
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1616,9 +1834,10 @@ async fn warmup_pipeline_if_enabled(
         frames_per_clip
     };
     let mut cache = AutoGazeStreamingCache::new(frames_per_clip);
-    let warmup_pipeline = pipeline.clone().with_task_loss_requirement(None);
-    for run_idx in 0..model_warmup_runs(config.mode) {
-        let rgba = warmup_rgba_clip(width, height, clip_len, run_idx)?;
+    let warmup_pipeline = pipeline.clone();
+    let warmup_runs = model_warmup_runs(config, use_streaming_cache);
+    for run_idx in 0..warmup_runs {
+        let rgba = warmup_rgba_clip(config.source, width, height, clip_len, run_idx, warmup_runs)?;
         let shape = AutoGazeRgbaClipShape::new(clip_len, height, width);
         let prepared = prepare_rgba_clip_for_trace::<AutoGazeBevyBackend>(
             &rgba,
@@ -1636,8 +1855,8 @@ async fn warmup_pipeline_if_enabled(
     }
     sync_warmup_backend(device)?;
     log(&format!(
-        "AutoGaze model warmup complete in {:.1} ms",
-        elapsed_ms(warmup_start)
+        "AutoGaze model warmup complete in {:.1} ms ({warmup_runs} runs)",
+        elapsed_ms(warmup_start),
     ));
     Ok(())
 }
@@ -1653,11 +1872,20 @@ fn sync_warmup_backend(_device: &AutoGazeBevyDevice) -> Result<(), String> {
     Ok(())
 }
 
-fn model_warmup_runs(mode: BevyAutoGazeMode) -> usize {
-    match mode {
+fn model_warmup_runs(config: &BevyBurnAutoGazeConfig, use_streaming_cache: bool) -> usize {
+    let base_runs = match config.mode {
         BevyAutoGazeMode::Resize224 => DEFAULT_REALTIME_MODEL_WARMUP_RUNS,
         BevyAutoGazeMode::Tile224 => DEFAULT_TILED_MODEL_WARMUP_RUNS,
+    };
+    if use_streaming_cache {
+        return base_runs.max(
+            config
+                .frames_per_clip
+                .saturating_add(DEFAULT_STREAMING_MODEL_WARMUP_EXTRA_RUNS),
+        );
     }
+
+    base_runs
 }
 
 fn warmup_dimensions(config: &BevyBurnAutoGazeConfig) -> (usize, usize) {
@@ -1676,10 +1904,12 @@ fn warmup_dimensions(config: &BevyBurnAutoGazeConfig) -> (usize, usize) {
 }
 
 fn warmup_rgba_clip(
+    source: BevyFrameSource,
     width: usize,
     height: usize,
     clip_len: usize,
     seed: usize,
+    warmup_runs: usize,
 ) -> Result<Vec<u8>, String> {
     let frame_bytes = width
         .checked_mul(height)
@@ -1687,10 +1917,52 @@ fn warmup_rgba_clip(
         .ok_or_else(|| "AutoGaze warmup byte length overflow".to_string())?;
     let mut rgba = Vec::with_capacity(frame_bytes.saturating_mul(clip_len));
     for frame_idx in 0..clip_len {
-        let frame = warmup_frame(width, height, seed + frame_idx)?;
+        let frame_seed = warmup_frame_seed(source, seed, frame_idx, clip_len, warmup_runs);
+        let frame = warmup_frame_for_source(source, width, height, frame_seed)?;
         rgba.extend_from_slice(frame.as_raw());
     }
     Ok(rgba)
+}
+
+fn warmup_frame_seed(
+    source: BevyFrameSource,
+    run_idx: usize,
+    frame_idx: usize,
+    clip_len: usize,
+    warmup_runs: usize,
+) -> usize {
+    let ordinal = run_idx.saturating_mul(clip_len).saturating_add(frame_idx);
+    if source != BevyFrameSource::SyntheticLocalMotion {
+        return ordinal;
+    }
+
+    let total = warmup_runs.saturating_mul(clip_len).max(1);
+    ((ordinal as u128 * u128::from(SYNTHETIC_LOCAL_CYCLE_FRAMES)) / total as u128) as usize
+}
+
+fn warmup_frame_for_source(
+    source: BevyFrameSource,
+    width: usize,
+    height: usize,
+    seed: usize,
+) -> Result<RgbaImage, String> {
+    let width_u32 = u32::try_from(width).map_err(|_| "AutoGaze warmup width overflow")?;
+    let height_u32 = u32::try_from(height).map_err(|_| "AutoGaze warmup height overflow")?;
+    let frame_index = seed as u64;
+    match source {
+        BevyFrameSource::SyntheticPan => {
+            Ok(synthetic_pan_frame(width_u32, height_u32, frame_index))
+        }
+        BevyFrameSource::SyntheticPulse => {
+            Ok(synthetic_pulse_frame(width_u32, height_u32, frame_index))
+        }
+        BevyFrameSource::SyntheticLocalMotion => Ok(synthetic_local_motion_frame(
+            width_u32,
+            height_u32,
+            frame_index,
+        )),
+        BevyFrameSource::Camera | BevyFrameSource::StaticImage => warmup_frame(width, height, seed),
+    }
 }
 
 fn warmup_frame(width: usize, height: usize, seed: usize) -> Result<RgbaImage, String> {
@@ -1724,7 +1996,10 @@ fn pipeline_options_from_config(config: &BevyBurnAutoGazeConfig) -> AutoGazePipe
     } else if let Some(task_loss_requirement) = config.task_loss_requirement {
         options = options.with_task_loss_requirement(task_loss_requirement);
     }
-    if matches!(config.visualization_mode, AutoGazeVisualizationMode::Interframe) {
+    if matches!(
+        config.visualization_mode,
+        AutoGazeVisualizationMode::Interframe
+    ) {
         options =
             options.with_generation_coverage_stop_ratio(config.tensor_full_frame_update_min_ratio);
     }
@@ -1797,17 +2072,26 @@ struct FinishedReadout {
     frame_index: usize,
     model_frames: usize,
     model_ms: f64,
+    effective_generation_budget: usize,
+    generated_tokens: usize,
+    active_generated_tokens: usize,
+    padded_generated_tokens: usize,
 }
 
 fn finished_readout_from_run_output(
     output: AutoGazeReadoutRunOutput,
     model_ms: f64,
+    effective_generation_budget: usize,
 ) -> FinishedReadout {
     FinishedReadout {
         points: output.points,
         frame_index: output.frame_index,
         model_frames: output.model_frames,
         model_ms,
+        effective_generation_budget,
+        generated_tokens: output.stats.generated_tokens,
+        active_generated_tokens: output.stats.active_generated_tokens,
+        padded_generated_tokens: output.stats.padded_generated_tokens,
     }
 }
 
@@ -1841,6 +2125,10 @@ async fn finish_autogaze_visualization(
         frame_index,
         model_frames,
         model_ms,
+        effective_generation_budget,
+        generated_tokens,
+        active_generated_tokens,
+        padded_generated_tokens,
     } = finished;
     let trace_ms = prepared.input_ms + model_ms;
     let points = batch_points
@@ -1868,6 +2156,10 @@ async fn finish_autogaze_visualization(
         sequence,
         clip_frames: context_frames,
         model_frames,
+        effective_generation_budget,
+        generated_tokens,
+        active_generated_tokens,
+        padded_generated_tokens,
         trace_points: points.len(),
         active_trace_points,
         width,
@@ -1893,6 +2185,9 @@ async fn finish_autogaze_visualization(
         gaze_update_ratio: visualization.gaze_update_ratio,
         gaze_update_ratio_sample: (!visualization.interframe_keyframe)
             .then_some(visualization.gaze_update_ratio),
+        output_update_ratio: visualization.output_update_ratio,
+        output_update_ratio_sample: (!visualization.interframe_keyframe)
+            .then_some(visualization.output_update_ratio),
         psnr_db: visualization.psnr_db,
         tensor_interframe_path: visualization.tensor_interframe_path,
         mask_plan_stats: visualization.mask_plan_stats,
@@ -1955,6 +2250,7 @@ async fn run_autogaze_readout(
         .lock()
         .map_err(|_| "AutoGaze model lock was poisoned".to_string())?
         .clone();
+    let effective_generation_budget = pipeline.effective_max_gaze_tokens_each_frame();
     let model_start = timestamp_now();
     let run_output = if use_streaming_cache {
         pipeline
@@ -1969,6 +2265,7 @@ async fn run_autogaze_readout(
     Ok(finished_readout_from_run_output(
         run_output,
         elapsed_ms(model_start),
+        effective_generation_budget,
     ))
 }
 
@@ -2238,17 +2535,25 @@ fn visualize_rgba_tensor(
         )
         .map_err(|err| format!("failed to visualize AutoGaze tensor output: {err:#}"))?;
     let tensor_ms = elapsed_ms(tensor_start);
-    let gaze_update_ratio = tensor_panels.update_ratio();
-    let output_tensor_bytes = width * height * 3 * 4 * std::mem::size_of::<f32>();
     let tensor_interframe_path = visualization_state.gpu.last_interframe_path();
     let mask_plan_stats = visualization_state
         .gpu
         .last_mask_plan_stats()
         .unwrap_or_default();
+    let output_update_ratio = tensor_panels.update_ratio();
+    let gaze_update_ratio =
+        gaze_ratio_from_mask_stats(tensor_panels.width, tensor_panels.height, mask_plan_stats);
     let interframe_keyframe = matches!(
         tensor_interframe_path,
         Some(AutoGazeTensorInterframePath::Keyframe)
     );
+    let output_matches_input = is_interframe_full_output_match(
+        visualization_state.gpu.mode(),
+        interframe_keyframe,
+        output_update_ratio,
+    );
+    let tensor_panel_count = if output_matches_input { 2 } else { 3 };
+    let output_tensor_bytes = width * height * tensor_panel_count * 4 * std::mem::size_of::<f32>();
 
     #[cfg(test)]
     let test_side_by_side_rgba = tensor_panels_to_side_by_side_rgba(tensor_panels.clone());
@@ -2265,8 +2570,10 @@ fn visualize_rgba_tensor(
             input_rgba: tensor_panels.input_rgba,
             mask_rgba: tensor_panels.mask_rgba,
             output_rgba: tensor_panels.output_rgba,
+            output_matches_input,
         })),
         gaze_update_ratio,
+        output_update_ratio,
         interframe_keyframe,
         psnr_db: None,
         visualize_cpu_ms: 0.0,
@@ -2348,8 +2655,13 @@ fn visualize_rgba_bytes(
                 == AutoGazeVisualizationMode::Interframe
                 && visualization_state.cpu.last_frame_was_keyframe();
             let visualize_cpu_ms = elapsed_ms(visualize_cpu_start);
-            let gaze_update_ratio = visualization.update_ratio();
             let mask_plan_stats = visualization.mask_plan_stats;
+            let output_update_ratio = visualization.update_ratio();
+            let gaze_update_ratio = gaze_ratio_from_mask_stats(
+                visualization.width,
+                visualization.height,
+                mask_plan_stats,
+            );
             let side_by_side_rgba = visualization.side_by_side_rgba;
             let output_rgba_bytes = side_by_side_rgba.len();
             Ok(Visualization {
@@ -2361,6 +2673,7 @@ fn visualize_rgba_bytes(
                 tensor: None,
                 image_data: VisualizationImageData::SideBySideRgba(side_by_side_rgba),
                 gaze_update_ratio,
+                output_update_ratio,
                 interframe_keyframe,
                 psnr_db,
                 visualize_cpu_ms,
@@ -2398,12 +2711,29 @@ fn visualize_rgba_bytes(
                 == AutoGazeVisualizationMode::Interframe
                 && visualization_state.cpu.last_frame_was_keyframe();
             let visualize_cpu_ms = elapsed_ms(visualize_cpu_start);
-            let gaze_update_ratio = panels.update_ratio();
             let mask_plan_stats = panels.mask_plan_stats;
+            let output_update_ratio = panels.update_ratio();
+            let gaze_update_ratio =
+                gaze_ratio_from_mask_stats(panels.width, panels.height, mask_plan_stats);
+            let output_matches_input = is_interframe_full_output_match(
+                visualization_state.cpu.mode(),
+                interframe_keyframe,
+                output_update_ratio,
+            );
             let mask_rgba = std::mem::take(&mut buffers.mask_rgba);
-            let output_rgba = std::mem::take(&mut buffers.blend_rgba);
+            let output_rgba = if output_matches_input {
+                Vec::new()
+            } else {
+                std::mem::take(&mut buffers.blend_rgba)
+            };
             let input_rgba = rgba.to_vec();
-            let output_rgba_bytes = input_rgba.len() + mask_rgba.len() + output_rgba.len();
+            let output_rgba_bytes = input_rgba.len()
+                + mask_rgba.len()
+                + if output_matches_input {
+                    0
+                } else {
+                    output_rgba.len()
+                };
             Ok(Visualization {
                 width: (width * 3) as u32,
                 height: height as u32,
@@ -2417,8 +2747,10 @@ fn visualize_rgba_bytes(
                     input_rgba,
                     mask_rgba,
                     output_rgba,
+                    output_matches_input,
                 },
                 gaze_update_ratio,
+                output_update_ratio,
                 interframe_keyframe,
                 psnr_db,
                 visualize_cpu_ms,
@@ -2445,7 +2777,25 @@ fn live_preview_visualization(
             .with_cpu_panels();
     let mut visualization = visualize_points(rgba, &[], visualization_options, &mut state)?;
     visualization.gaze_update_ratio = 0.0;
+    visualization.output_update_ratio = 0.0;
     Ok(visualization)
+}
+
+fn gaze_ratio_from_mask_stats(
+    width: usize,
+    height: usize,
+    mask_plan_stats: AutoGazeMaskPlanStats,
+) -> f64 {
+    mask_plan_stats.update_ratio(width, height)
+}
+
+fn is_interframe_full_output_match(
+    mode: AutoGazeVisualizationMode,
+    interframe_keyframe: bool,
+    output_update_ratio: f64,
+) -> bool {
+    mode == AutoGazeVisualizationMode::Interframe
+        && (interframe_keyframe || output_update_ratio >= 1.0)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2486,7 +2836,9 @@ fn next_source_frame(
             .0
             .as_ref()
             .map(|frame| (Arc::clone(frame), 0.0, 0.0)),
-        BevyFrameSource::SyntheticPan => {
+        BevyFrameSource::SyntheticPan
+        | BevyFrameSource::SyntheticPulse
+        | BevyFrameSource::SyntheticLocalMotion => {
             let source_start = timestamp_now();
             let frame = synthetic_source.next_frame(config);
             let source_ms = elapsed_ms(source_start);
@@ -2595,6 +2947,93 @@ fn synthetic_pan_frame(width: u32, height: u32, frame_index: u64) -> RgbaImage {
     RgbaImage::from_raw(width, height, rgba).unwrap_or_else(|| RgbaImage::new(width, height))
 }
 
+fn synthetic_pulse_frame(width: u32, height: u32, frame_index: u64) -> RgbaImage {
+    const STATIC_FRAMES: u64 = 16;
+    const MOTION_FRAMES: u64 = 24;
+    const HOLD_FRAMES: u64 = 8;
+    let cycle = STATIC_FRAMES + MOTION_FRAMES + HOLD_FRAMES;
+    let phase = frame_index % cycle;
+    let pan_index = if phase < STATIC_FRAMES {
+        0
+    } else if phase < STATIC_FRAMES + MOTION_FRAMES {
+        phase - STATIC_FRAMES + 1
+    } else {
+        MOTION_FRAMES
+    };
+    synthetic_pan_frame(width, height, pan_index)
+}
+
+fn synthetic_local_motion_frame(width: u32, height: u32, frame_index: u64) -> RgbaImage {
+    let width = width.max(1);
+    let height = height.max(1);
+    let phase = frame_index % SYNTHETIC_LOCAL_CYCLE_FRAMES;
+    let strong_dx = (width as f32 / 150.0).max(1.0);
+    let subtle_dx = (width as f32 / 1800.0).max(0.25);
+    let local_progress = if phase < SYNTHETIC_LOCAL_STRONG_FRAMES {
+        phase as f32 * strong_dx
+    } else if phase < SYNTHETIC_LOCAL_STRONG_FRAMES + SYNTHETIC_LOCAL_SUBTLE_FRAMES {
+        SYNTHETIC_LOCAL_STRONG_FRAMES as f32 * strong_dx
+            + (phase - SYNTHETIC_LOCAL_STRONG_FRAMES) as f32 * subtle_dx
+    } else {
+        SYNTHETIC_LOCAL_STRONG_FRAMES as f32 * strong_dx
+            + SYNTHETIC_LOCAL_SUBTLE_FRAMES as f32 * subtle_dx
+    };
+    let base_x = (width as f32 * 0.22 + local_progress).round() as i32;
+    let base_y = (height as f32 * 0.42).round() as i32;
+    let patch_w = (width / 8).clamp(24, width.max(24));
+    let patch_h = (height / 7).clamp(20, height.max(20));
+    let patch_w_i = patch_w as i32;
+    let patch_h_i = patch_h as i32;
+    let small_w = (patch_w_i / 4).max(8);
+    let small_h = (patch_h_i / 3).max(6);
+    let center_x = base_x + patch_w_i / 2;
+    let center_y = base_y + patch_h_i / 2;
+    let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+
+    for y in 0..height {
+        for x in 0..width {
+            let xf = x as f32 / width.saturating_sub(1).max(1) as f32;
+            let yf = y as f32 / height.saturating_sub(1).max(1) as f32;
+            let checker = (((x / 18) + (y / 18)) & 1) as u8;
+            let fine = (((x.wrapping_mul(13) ^ y.wrapping_mul(7)) + 31) & 0x1f) as u8;
+            let mut r = (38.0 + xf * 68.0) as u8 + checker * 14 + fine / 4;
+            let mut g = (58.0 + yf * 92.0) as u8 + checker * 10 + fine / 5;
+            let mut b = (86.0 + (1.0 - xf) * 54.0) as u8 + checker * 8 + fine / 3;
+
+            let xi = x as i32;
+            let yi = y as i32;
+            let in_patch =
+                xi >= base_x && xi < base_x + patch_w_i && yi >= base_y && yi < base_y + patch_h_i;
+            if in_patch {
+                let lx = (xi - base_x).max(0) as u32;
+                let ly = (yi - base_y).max(0) as u32;
+                let stripe = (((lx / 5) + (ly / 7)) & 1) as u8;
+                r = 210_u8.saturating_sub(stripe * 34).saturating_add(fine / 3);
+                g = 122_u8.saturating_add(stripe * 28);
+                b = 48_u8.saturating_add(((lx + ly) & 0x1f) as u8);
+            }
+
+            let small_x = base_x + patch_w_i / 2 - small_w / 2;
+            let small_y = base_y - patch_h_i / 3;
+            let in_small =
+                xi >= small_x && xi < small_x + small_w && yi >= small_y && yi < small_y + small_h;
+            let dx = xi - center_x;
+            let dy = yi - center_y;
+            let radius = (patch_h_i.min(patch_w_i) / 3).max(6);
+            let in_circle = dx * dx + dy * dy <= radius * radius;
+            if in_small || in_circle {
+                r = 42;
+                g = 202_u8.saturating_add((((x + y) / 3) & 0x1f) as u8);
+                b = 220;
+            }
+
+            rgba.extend_from_slice(&[r, g, b, 255]);
+        }
+    }
+
+    RgbaImage::from_raw(width, height, rgba).unwrap_or_else(|| RgbaImage::new(width, height))
+}
+
 fn press_esc_close(keys: Res<ButtonInput<KeyCode>>, mut exit: MessageWriter<AppExit>) {
     if keys.just_pressed(KeyCode::Escape) {
         exit.write(AppExit::Success);
@@ -2682,6 +3121,52 @@ fn write_perf_summary(path: Option<&Path>, summary: &str) -> Result<(), String> 
 
 #[cfg(target_arch = "wasm32")]
 fn write_perf_summary(_path: Option<&Path>, _summary: &str) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_perf_trace_sample(
+    path: Option<&Path>,
+    sample: &str,
+    truncate: bool,
+) -> Result<(), String> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "failed to create perf trace directory `{}`: {err}",
+                parent.display()
+            )
+        })?;
+    }
+    let value: serde_json::Value = serde_json::from_str(sample)
+        .map_err(|err| format!("invalid perf trace JSON before write: {err}"))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).write(true);
+    if truncate {
+        options.truncate(true);
+    } else {
+        options.append(true);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|err| format!("failed to open `{}`: {err}", path.display()))?;
+    serde_json::to_writer(&mut file, &value)
+        .map_err(|err| format!("failed to encode perf trace JSON: {err}"))?;
+    use std::io::Write as _;
+    writeln!(file).map_err(|err| format!("failed to write `{}`: {err}", path.display()))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn write_perf_trace_sample(
+    _path: Option<&Path>,
+    _sample: &str,
+    _truncate: bool,
+) -> Result<(), String> {
     Ok(())
 }
 
@@ -2934,6 +3419,10 @@ mod tests {
             DEFAULT_REALTIME_MAX_GAZE_TOKENS
         );
         assert_eq!(
+            config.task_loss_requirement,
+            Some(DEFAULT_BEVY_TASK_LOSS_REQUIREMENT)
+        );
+        assert_eq!(
             config.frames_per_clip,
             DEFAULT_BEVY_REALTIME_FRAMES_PER_CLIP
         );
@@ -2960,8 +3449,12 @@ mod tests {
         ));
         assert_eq!(
             pipeline_options_from_config(&config).max_gaze_tokens_each_frame(),
-            None,
-            "realtime defaults must delegate to the model-configured inference budget"
+            Some(DEFAULT_REALTIME_MAX_GAZE_TOKENS),
+            "realtime defaults should use one decoder chunk for stable interactive frame pacing"
+        );
+        assert_eq!(
+            pipeline_options_from_config(&config).task_loss_requirement(),
+            AutoGazeTaskLossOption::Value(DEFAULT_BEVY_TASK_LOSS_REQUIREMENT)
         );
     }
 
@@ -3377,6 +3870,63 @@ mod tests {
     }
 
     #[test]
+    fn bevy_gaze_ratio_and_psnr_follow_mask_not_full_frame_policy() {
+        let device = AutoGazeBevyDevice::default();
+        let width = 8;
+        let height = 4;
+        let previous = deterministic_test_rgba(width, height, 41);
+        let current = deterministic_test_rgba(width, height, 43);
+        let point = FixationPoint::with_grid_extent(0.25, 0.5, 0.5, 1.0, 1.0, 2);
+        let options = VisualizationOptions::new(1.0, 0.38, true, BevyDisplayTransfer::Cpu)
+            .with_full_frame_update_policy(0.45)
+            .with_cpu_panels();
+        let mut state = BevyVisualizationState::new(AutoGazeVisualizationMode::Interframe, 30);
+
+        visualize_frame_rgba(
+            FrameVisualInput {
+                rgba: &previous,
+                width,
+                height,
+                tensor: None,
+            },
+            &[],
+            options,
+            &mut state,
+            &device,
+        )
+        .expect("prime interframe state");
+        let visualization = visualize_frame_rgba(
+            FrameVisualInput {
+                rgba: &current,
+                width,
+                height,
+                tensor: None,
+            },
+            &[point],
+            options,
+            &mut state,
+            &device,
+        )
+        .expect("masked interframe visualization");
+
+        assert_eq!(visualization.gaze_update_ratio, 0.5);
+        assert!(!visualization.psnr_db.expect("psnr").is_infinite());
+        let VisualizationImageData::PanelsRgba { output_rgba, .. } = visualization.image_data
+        else {
+            panic!("expected split-panel CPU visualization");
+        };
+        assert_ne!(output_rgba, current);
+        assert_eq!(
+            &output_rgba[0..(width / 2 * 4)],
+            &current[0..(width / 2 * 4)]
+        );
+        assert_eq!(
+            &output_rgba[(width / 2 * 4)..(width * 4)],
+            &previous[(width / 2 * 4)..(width * 4)]
+        );
+    }
+
+    #[test]
     fn cpu_panel_transfer_uses_split_images_without_side_by_side_buffer() {
         let device = AutoGazeBevyDevice::default();
         let width = 4;
@@ -3419,12 +3969,14 @@ mod tests {
                 input_rgba,
                 mask_rgba,
                 output_rgba,
+                output_matches_input,
             } => {
                 assert_eq!(panel_width, width as u32);
                 assert_eq!(panel_height, height as u32);
                 assert_eq!(input_rgba, rgba);
                 assert_eq!(mask_rgba, expected.mask_rgba);
                 assert_eq!(output_rgba, expected.blend_rgba);
+                assert!(!output_matches_input);
             }
             _ => panic!("expected split panel visualization payload"),
         }
@@ -3466,11 +4018,18 @@ mod tests {
         );
         assert!(visualization.tensor.is_none());
         assert_eq!(visualization.output_tensor_bytes, 0);
-        assert_eq!(visualization.output_rgba_bytes, rgba.len() * 3);
-        assert!(matches!(
-            visualization.image_data,
-            VisualizationImageData::PanelsRgba { .. }
-        ));
+        assert_eq!(visualization.output_rgba_bytes, rgba.len() * 2);
+        match visualization.image_data {
+            VisualizationImageData::PanelsRgba {
+                output_matches_input,
+                output_rgba,
+                ..
+            } => {
+                assert!(output_matches_input);
+                assert!(output_rgba.is_empty());
+            }
+            _ => panic!("expected split panel visualization payload"),
+        }
     }
 
     #[test]
@@ -3552,9 +4111,11 @@ mod tests {
                     input_rgba,
                     mask_rgba,
                     output_rgba,
+                    output_matches_input,
                 } = *panels;
                 assert_eq!(panel_width, width as u32);
                 assert_eq!(panel_height, height as u32);
+                assert!(!output_matches_input);
                 assert_eq!(tensor_visualization_to_rgba(input_rgba, &device), rgba);
                 assert_eq!(
                     tensor_visualization_to_rgba(mask_rgba, &device),
@@ -3719,11 +4280,13 @@ mod tests {
                 input_rgba,
                 mask_rgba,
                 output_rgba,
+                output_matches_input,
             } => {
                 assert_eq!(panel_width, width as u32);
                 assert_eq!(panel_height, height as u32);
                 assert_eq!(input_rgba, rgba);
                 assert_eq!(output_rgba, rgba);
+                assert!(!output_matches_input);
                 assert!(mask_rgba.iter().all(|value| *value == 0));
             }
             _ => panic!("live preview should use the same split-panel texture layout as inference"),
@@ -4010,6 +4573,10 @@ mod tests {
                 sequence: 7,
                 clip_frames: 16,
                 model_frames: 2,
+                effective_generation_budget: 32,
+                generated_tokens: 10,
+                active_generated_tokens: 8,
+                padded_generated_tokens: 2,
                 trace_points: 42,
                 active_trace_points: 9,
                 width: 640,
@@ -4029,6 +4596,8 @@ mod tests {
                 effective_display_transfer: BevyDisplayTransfer::Gpu,
                 gaze_update_ratio: 0.25,
                 gaze_update_ratio_sample: Some(0.25),
+                output_update_ratio: 0.20,
+                output_update_ratio_sample: Some(0.20),
                 psnr_db: Some(42.0),
                 tensor_interframe_path: Some(AutoGazeTensorInterframePath::SparseRects),
                 mask_plan_stats: AutoGazeMaskPlanStats {
@@ -4048,11 +4617,20 @@ mod tests {
                 .expect("perf sample json");
 
         assert_eq!(summary["target_frames"], 1);
+        assert_eq!(summary["skipped_warmup_frames"], 0);
+        assert_eq!(
+            summary["latest_skipped_warmup_sequence"],
+            serde_json::Value::Null
+        );
         assert_eq!(summary["processed_frames"], 1);
         assert_eq!(summary["processed_model_frames"], 2);
         assert_eq!(summary["latest_sequence"], 7);
         assert_eq!(summary["latest_clip_frames"], 16);
         assert_eq!(summary["latest_model_frames"], 2);
+        assert_eq!(summary["latest_effective_generation_budget"], 32);
+        assert_eq!(summary["latest_generated_tokens"], 10);
+        assert_eq!(summary["latest_active_generated_tokens"], 8);
+        assert_eq!(summary["latest_padded_generated_tokens"], 2);
         assert_eq!(summary["latest_trace_points"], 42);
         assert_eq!(summary["latest_active_trace_points"], 9);
         assert_eq!(summary["latest_mask_rects"], 12);
@@ -4061,6 +4639,10 @@ mod tests {
         assert_eq!(summary["latest_width"], 640);
         assert_eq!(summary["latest_height"], 360);
         assert_eq!(summary["latest_gaze_update_ratio"], 0.25);
+        assert_eq!(summary["latest_mask_update_ratio"], 0.25);
+        assert_eq!(summary["latest_output_update_ratio"], 0.20);
+        assert_eq!(summary["avg_output_update_ratio"], 0.20);
+        assert_eq!(summary["stale_results"], 0);
         assert_eq!(summary["latest_tensor_interframe_path"], "sparse-rects");
         assert_eq!(summary["latest_effective_display_transfer"], "gpu");
         assert_eq!(summary["display_residency"], "gpu-tensor");
@@ -4102,6 +4684,9 @@ mod tests {
         assert_eq!(summary["avg_input_fps"], 100.0);
         assert_eq!(summary["avg_model_frame_fps"], 250.0);
         assert_eq!(summary["avg_model_ms"], 8.0);
+        assert_eq!(summary["avg_generated_tokens"], 10.0);
+        assert_eq!(summary["avg_active_generated_tokens"], 8.0);
+        assert_eq!(summary["avg_padded_generated_tokens"], 2.0);
         assert_eq!(summary["avg_trace_points"], 42.0);
         assert_eq!(summary["avg_active_trace_points"], 9.0);
         assert_eq!(summary["avg_mask_rects"], 12.0);
@@ -4129,8 +4714,15 @@ mod tests {
         assert_eq!(sample["latest_sequence"], 7);
         assert_eq!(sample["latest_clip_frames"], 16);
         assert_eq!(sample["latest_model_frames"], 2);
+        assert_eq!(sample["latest_effective_generation_budget"], 32);
+        assert_eq!(sample["latest_generated_tokens"], 10);
+        assert_eq!(sample["latest_active_generated_tokens"], 8);
+        assert_eq!(sample["latest_padded_generated_tokens"], 2);
         assert_eq!(sample["latest_trace_points"], 42);
         assert_eq!(sample["latest_active_trace_points"], 9);
+        assert_eq!(sample["avg_generated_tokens"], 10.0);
+        assert_eq!(sample["avg_active_generated_tokens"], 8.0);
+        assert_eq!(sample["avg_padded_generated_tokens"], 2.0);
         assert_eq!(sample["avg_trace_points"], 42.0);
         assert_eq!(sample["avg_active_trace_points"], 9.0);
         assert_eq!(sample["latest_mask_rects"], 12);
@@ -4249,6 +4841,30 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn perf_trace_writer_replaces_then_appends_jsonl_samples() {
+        let path = std::env::temp_dir()
+            .join(format!(
+                "burn_autogaze_perf_trace_test_{}",
+                std::process::id()
+            ))
+            .join("trace.jsonl");
+        let _ = std::fs::remove_file(&path);
+
+        write_perf_trace_sample(Some(&path), r#"{"frame":1}"#, true).expect("write trace");
+        write_perf_trace_sample(Some(&path), r#"{"frame":2}"#, false).expect("append trace");
+        let content = std::fs::read_to_string(&path).expect("read trace");
+
+        assert_eq!(content.lines().count(), 2);
+        assert!(content.contains("\"frame\":1"));
+        assert!(content.contains("\"frame\":2"));
+        let _ = std::fs::remove_file(&path);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
+
     #[test]
     fn inference_sequence_rejects_stale_results() {
         let mut sequencer = InferenceSequencer::default();
@@ -4287,6 +4903,54 @@ mod tests {
             options.task_loss_requirement(),
             burn_autogaze::AutoGazeTaskLossOption::Disabled
         );
+    }
+
+    #[test]
+    fn streaming_model_warmup_reaches_cache_compaction_horizon() {
+        let config = BevyBurnAutoGazeConfig {
+            mode: BevyAutoGazeMode::Resize224,
+            frames_per_clip: 16,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            model_warmup_runs(&config, false),
+            DEFAULT_REALTIME_MODEL_WARMUP_RUNS
+        );
+        assert_eq!(
+            model_warmup_runs(&config, true),
+            16 + DEFAULT_STREAMING_MODEL_WARMUP_EXTRA_RUNS
+        );
+        assert!(
+            model_warmup_runs(&config, true) > config.frames_per_clip,
+            "streaming warmup should run beyond the cache horizon so steady-state compaction is prewarmed"
+        );
+    }
+
+    #[test]
+    fn local_motion_warmup_spans_strong_subtle_and_still_phases() {
+        let runs = 24;
+        let seeds = (0..runs)
+            .map(|run_idx| {
+                warmup_frame_seed(BevyFrameSource::SyntheticLocalMotion, run_idx, 0, 1, runs) as u64
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            seeds
+                .iter()
+                .any(|&seed| seed < SYNTHETIC_LOCAL_STRONG_FRAMES)
+        );
+        assert!(seeds.iter().any(|&seed| {
+            (SYNTHETIC_LOCAL_STRONG_FRAMES
+                ..SYNTHETIC_LOCAL_STRONG_FRAMES + SYNTHETIC_LOCAL_SUBTLE_FRAMES)
+                .contains(&seed)
+        }));
+        assert!(seeds.iter().any(|&seed| {
+            (SYNTHETIC_LOCAL_STRONG_FRAMES + SYNTHETIC_LOCAL_SUBTLE_FRAMES
+                ..SYNTHETIC_LOCAL_CYCLE_FRAMES)
+                .contains(&seed)
+        }));
     }
 
     #[test]
@@ -4376,6 +5040,32 @@ mod tests {
         assert_eq!(first_a.dimensions(), (64, 36));
         assert_eq!(first_a.as_raw(), first_b.as_raw());
         assert_ne!(first_a.as_raw(), second_a.as_raw());
+    }
+
+    #[test]
+    fn synthetic_local_motion_has_motion_then_settles() {
+        let strong_a = synthetic_local_motion_frame(96, 54, 4);
+        let strong_b = synthetic_local_motion_frame(96, 54, 12);
+        let subtle_a = synthetic_local_motion_frame(96, 54, 48);
+        let subtle_b = synthetic_local_motion_frame(96, 54, 56);
+        let still_a = synthetic_local_motion_frame(96, 54, 88);
+        let still_b = synthetic_local_motion_frame(96, 54, 104);
+
+        assert_eq!(strong_a.dimensions(), (96, 54));
+        assert!(rgba_sum_abs_diff(strong_a.as_raw(), strong_b.as_raw()) > 0);
+        assert!(rgba_sum_abs_diff(subtle_a.as_raw(), subtle_b.as_raw()) > 0);
+        assert_eq!(still_a.as_raw(), still_b.as_raw());
+        assert!(
+            rgba_sum_abs_diff(strong_a.as_raw(), strong_b.as_raw())
+                > rgba_sum_abs_diff(subtle_a.as_raw(), subtle_b.as_raw())
+        );
+    }
+
+    fn rgba_sum_abs_diff(left: &[u8], right: &[u8]) -> u64 {
+        left.iter()
+            .zip(right)
+            .map(|(left, right)| left.abs_diff(*right) as u64)
+            .sum()
     }
 
     #[test]

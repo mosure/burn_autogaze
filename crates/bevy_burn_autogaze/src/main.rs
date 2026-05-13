@@ -2,9 +2,9 @@ use bevy::app::AppExit;
 #[cfg(not(target_arch = "wasm32"))]
 use bevy_burn_autogaze::{
     BevyAutoGazeMode, BevyDisplayTransfer, BevyFrameSource, DEFAULT_BEVY_STREAMING_CACHE,
-    DEFAULT_BIRDS_KEYFRAME_DURATION, DEFAULT_BLEND_ALPHA, DEFAULT_TILED_INFERENCE_WIDTH,
-    default_frames_per_clip, default_inference_dimensions, default_max_gaze_tokens_each_frame,
-    default_tile_batch_size, default_top_k,
+    DEFAULT_BEVY_TASK_LOSS_REQUIREMENT, DEFAULT_BIRDS_KEYFRAME_DURATION, DEFAULT_BLEND_ALPHA,
+    DEFAULT_TILED_INFERENCE_WIDTH, default_frames_per_clip, default_inference_dimensions,
+    default_max_gaze_tokens_for_task_loss, default_tile_batch_size, default_top_k,
 };
 use bevy_burn_autogaze::{BevyBurnAutoGazeConfig, run_app};
 #[cfg(not(target_arch = "wasm32"))]
@@ -252,6 +252,22 @@ enum NativeFrameSource {
         help = "Generate deterministic full-frame motion for repeatable high-motion perf runs."
     )]
     SyntheticPan,
+    #[value(
+        name = "synthetic-pulse",
+        alias = "pulse",
+        alias = "motion-pulse",
+        alias = "burst-motion",
+        help = "Generate deterministic static-to-motion pulses for repeatable FPS stability runs."
+    )]
+    SyntheticPulse,
+    #[value(
+        name = "synthetic-local-motion",
+        alias = "local-motion",
+        alias = "local",
+        alias = "subtle-motion",
+        help = "Generate deterministic local motion that decays from movement to subtle movement to stillness."
+    )]
+    SyntheticLocalMotion,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -261,6 +277,8 @@ impl From<NativeFrameSource> for BevyFrameSource {
             NativeFrameSource::Camera => Self::Camera,
             NativeFrameSource::StaticImage => Self::StaticImage,
             NativeFrameSource::SyntheticPan => Self::SyntheticPan,
+            NativeFrameSource::SyntheticPulse => Self::SyntheticPulse,
+            NativeFrameSource::SyntheticLocalMotion => Self::SyntheticLocalMotion,
         }
     }
 }
@@ -327,7 +345,7 @@ impl FromStr for TaskLossRequirementArg {
 #[command(
     about = "native Bevy viewer for burn_autogaze",
     version,
-    long_about = "Runs the burn_autogaze video pipeline with camera or static-image input and renders Input | Mask | Output through Bevy. The default path is a continuous realtime streaming configuration: 640px source resize, 16-frame rolling KV window, the model's configured generation budget, deduplicated native mask geometry, adaptive display transfer, PSNR overlay, interframe output, and no periodic visualization keyframes. Use --mask-geometry native for exact decoded-cell diagnostics, --display-transfer gpu to force Bevy/Burn tensor interop, --streaming-cache=false for full-window comparison, or --mode tiled plus explicit 1080p/docs settings for full-resolution inspection."
+    long_about = "Runs the burn_autogaze video pipeline with camera or static-image input and renders Input | Mask | Output through Bevy. The default path is a continuous realtime streaming configuration: 640px source resize, 16-frame rolling KV window, bounded generated-token readout, deduplicated native mask geometry, adaptive display transfer, PSNR overlay, interframe output, and no periodic visualization keyframes. Use --mask-geometry native for exact decoded-cell diagnostics, --display-transfer gpu to force Bevy/Burn tensor interop, --streaming-cache=false for full-window comparison, --max-gaze-tokens-each-frame 0 for the model's full configured budget, or --mode tiled plus explicit 1080p/docs settings for full-resolution inspection."
 )]
 struct NativeArgs {
     #[arg(
@@ -380,7 +398,7 @@ struct NativeArgs {
     #[arg(
         long,
         value_enum,
-        help = "Input source. Defaults to camera, or static when --image-path is supplied. synthetic-pan is deterministic full-frame motion for perf tests."
+        help = "Input source. Defaults to camera, or static when --image-path is supplied. synthetic-local-motion is the most useful deterministic source for fine-cell FPS stability repros."
     )]
     source: Option<NativeFrameSource>,
 
@@ -427,7 +445,7 @@ struct NativeArgs {
         long,
         value_name = "COUNT",
         value_parser = parse_usize,
-        help = "Model-side generated-token cap. Defaults to the model's configured inference budget in realtime and 24 in tiled mode; 0 also uses the model budget."
+        help = "Model-side generated-token cap. Defaults to 10 in realtime, 24 for stricter explicit realtime task-loss thresholds, and 24 in tiled mode; pass 0 to use the model's full configured budget."
     )]
     max_gaze_tokens_each_frame: Option<usize>,
 
@@ -442,7 +460,7 @@ struct NativeArgs {
     #[arg(
         long,
         value_name = "FLOAT|none",
-        help = "Override model task-loss threshold; use none/off to disable, default/model for model config."
+        help = "Override viewer task-loss threshold. Default is 0.45; stricter values such as 0.3 raise the implicit realtime token cap to the bounded quality budget. Use none/off to disable, default/model for model config."
     )]
     task_loss_requirement: Option<TaskLossRequirementArg>,
 
@@ -505,10 +523,9 @@ struct NativeArgs {
         alias = "mask-radius-scale",
         value_name = "SCALE",
         value_parser = parse_positive_f32,
-        default_value_t = 1.0,
-        help = "Scale factor for crisp multi-scale mask cell extents."
+        help = "Scale factor for crisp multi-scale mask cell extents. Defaults to 1.0."
     )]
-    mask_cell_scale: f32,
+    mask_cell_scale: Option<f32>,
 
     #[arg(
         long = "mask-visualization",
@@ -629,11 +646,27 @@ struct NativeArgs {
 
     #[arg(
         long,
+        value_name = "COUNT",
+        default_value_t = 0,
+        help = "Ignore the first COUNT inference outputs in perf summaries/traces. Useful for excluding GPU autotune and cache-fill startup."
+    )]
+    perf_summary_warmup_frames: usize,
+
+    #[arg(
+        long,
         value_name = "PATH",
         requires = "perf_summary_frames",
         help = "Write the perf summary JSON to PATH in addition to logging it."
     )]
     perf_summary_path: Option<std::path::PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "perf_summary_frames",
+        help = "Write one JSON object per processed inference output to PATH for frame pacing and stage timing analysis."
+    )]
+    perf_trace_path: Option<std::path::PathBuf>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -644,21 +677,26 @@ impl From<NativeArgs> for BevyBurnAutoGazeConfig {
         let defaults = BevyBurnAutoGazeConfig::default();
         let (inference_width, inference_height) =
             inference_dimensions_for_args(mode, args.inference_width, args.inference_height);
+        let (task_loss_requirement, disable_task_loss_requirement) = task_loss_config(
+            args.task_loss_requirement,
+            args.task_loss_requirement_db,
+            args.disable_task_loss_requirement,
+        );
         let top_k = args.top_k.unwrap_or_else(|| default_top_k(mode));
-        let max_gaze_tokens_each_frame = args
-            .max_gaze_tokens_each_frame
-            .unwrap_or_else(|| default_max_gaze_tokens_each_frame(mode));
+        let max_gaze_tokens_each_frame = args.max_gaze_tokens_each_frame.unwrap_or_else(|| {
+            default_max_gaze_tokens_for_task_loss(
+                mode,
+                task_loss_requirement,
+                disable_task_loss_requirement,
+            )
+        });
+        let mask_cell_scale = args.mask_cell_scale.unwrap_or(1.0);
         let tile_batch_size = args
             .tile_batch_size
             .unwrap_or_else(|| default_tile_batch_size(mode));
         let frames_per_clip = args
             .frames_per_clip
             .unwrap_or_else(|| default_frames_per_clip(mode));
-        let (task_loss_requirement, disable_task_loss_requirement) = task_loss_config(
-            args.task_loss_requirement,
-            args.task_loss_requirement_db,
-            args.disable_task_loss_requirement,
-        );
         BevyBurnAutoGazeConfig {
             press_esc_to_close: args.press_esc_to_close,
             show_fps: args.show_fps,
@@ -685,7 +723,7 @@ impl From<NativeArgs> for BevyBurnAutoGazeConfig {
             max_in_flight: args.max_in_flight,
             inference_width,
             inference_height: inference_height.or(defaults.inference_height),
-            mask_cell_scale: args.mask_cell_scale,
+            mask_cell_scale,
             mask_visualization_mode: args.mask_visualization_mode.into(),
             mask_geometry_mode: args.mask_geometry_mode.into(),
             blend_alpha: args.blend_alpha,
@@ -698,8 +736,10 @@ impl From<NativeArgs> for BevyBurnAutoGazeConfig {
             streaming_cache: args.streaming_cache,
             require_hardware_adapter: args.require_hardware_adapter,
             log_pipeline_timing: args.log_pipeline_timing,
+            perf_summary_warmup_frames: args.perf_summary_warmup_frames,
             perf_summary_frames: args.perf_summary_frames,
             perf_summary_path: args.perf_summary_path,
+            perf_trace_path: args.perf_trace_path,
             ..defaults
         }
         .sanitized()
@@ -731,7 +771,8 @@ fn task_loss_config(
         return (Some(task_loss_requirement_from_l1_db(f64::from(db))), false);
     }
     match arg {
-        Some(TaskLossRequirementArg::ModelDefault) | None => (None, false),
+        None => (Some(DEFAULT_BEVY_TASK_LOSS_REQUIREMENT), false),
+        Some(TaskLossRequirementArg::ModelDefault) => (None, false),
         Some(TaskLossRequirementArg::Disabled) => (None, true),
         Some(TaskLossRequirementArg::Value(value)) => (Some(value), false),
     }
@@ -882,9 +923,10 @@ fn runtime_config() -> BevyBurnAutoGazeConfig {
 mod tests {
     use super::*;
     use bevy_burn_autogaze::{
-        DEFAULT_BEVY_REALTIME_FRAMES_PER_CLIP, DEFAULT_BEVY_TILED_TOP_K,
-        DEFAULT_REALTIME_INFERENCE_WIDTH, DEFAULT_REALTIME_MAX_GAZE_TOKENS, DEFAULT_REALTIME_TOP_K,
-        DEFAULT_TILED_FRAMES_PER_CLIP, DEFAULT_TILED_INFERENCE_WIDTH,
+        DEFAULT_BEVY_REALTIME_FRAMES_PER_CLIP, DEFAULT_BEVY_TASK_LOSS_REQUIREMENT,
+        DEFAULT_BEVY_TILED_TOP_K, DEFAULT_REALTIME_INFERENCE_WIDTH,
+        DEFAULT_REALTIME_MAX_GAZE_TOKENS, DEFAULT_REALTIME_QUALITY_MAX_GAZE_TOKENS,
+        DEFAULT_REALTIME_TOP_K, DEFAULT_TILED_FRAMES_PER_CLIP, DEFAULT_TILED_INFERENCE_WIDTH,
         DEFAULT_TILED_MAX_GAZE_TOKENS, DEFAULT_TILED_TILE_BATCH_SIZE,
     };
     use clap::CommandFactory;
@@ -919,6 +961,10 @@ mod tests {
         assert_eq!(config.source, BevyFrameSource::Camera);
         assert_eq!(config.top_k, DEFAULT_REALTIME_TOP_K);
         assert_eq!(
+            config.task_loss_requirement,
+            Some(DEFAULT_BEVY_TASK_LOSS_REQUIREMENT)
+        );
+        assert_eq!(
             config.max_gaze_tokens_each_frame,
             DEFAULT_REALTIME_MAX_GAZE_TOKENS
         );
@@ -939,6 +985,41 @@ mod tests {
         assert!(config.show_psnr);
         assert!(config.warmup_model);
         assert_eq!(config.streaming_cache, DEFAULT_BEVY_STREAMING_CACHE);
+    }
+
+    #[test]
+    fn native_cli_task_loss_quality_default_uses_quality_budget() {
+        let args = NativeArgs::parse_from(["bevy_burn_autogaze", "--task-loss-requirement", "0.3"]);
+        let config = BevyBurnAutoGazeConfig::from(args);
+
+        assert_eq!(
+            config.max_gaze_tokens_each_frame,
+            DEFAULT_REALTIME_QUALITY_MAX_GAZE_TOKENS
+        );
+        assert_eq!(config.mask_cell_scale, 1.0);
+
+        let args =
+            NativeArgs::parse_from(["bevy_burn_autogaze", "--task-loss-requirement", "0.45"]);
+        let config = BevyBurnAutoGazeConfig::from(args);
+
+        assert_eq!(
+            config.max_gaze_tokens_each_frame,
+            DEFAULT_REALTIME_MAX_GAZE_TOKENS
+        );
+
+        let args = NativeArgs::parse_from([
+            "bevy_burn_autogaze",
+            "--task-loss-requirement",
+            "0.3",
+            "--max-gaze-tokens-each-frame",
+            "12",
+            "--mask-cell-scale",
+            "1.25",
+        ]);
+        let config = BevyBurnAutoGazeConfig::from(args);
+
+        assert_eq!(config.max_gaze_tokens_each_frame, 12);
+        assert_eq!(config.mask_cell_scale, 1.25);
     }
 
     #[test]
@@ -965,7 +1046,7 @@ mod tests {
             max_in_flight: bevy_burn_autogaze::DEFAULT_MAX_IN_FLIGHT,
             inference_width: None,
             inference_height: None,
-            mask_cell_scale: 1.0,
+            mask_cell_scale: Some(1.0),
             mask_visualization_mode: NativeMaskVisualizationMode::ImageMaskOnly,
             mask_geometry_mode: DEFAULT_NATIVE_MASK_GEOMETRY_MODE,
             blend_alpha: DEFAULT_BLEND_ALPHA,
@@ -981,8 +1062,10 @@ mod tests {
             streaming_cache: DEFAULT_BEVY_STREAMING_CACHE,
             require_hardware_adapter: false,
             log_pipeline_timing: false,
+            perf_summary_warmup_frames: 0,
             perf_summary_frames: None,
             perf_summary_path: None,
+            perf_trace_path: None,
         };
         let config = BevyBurnAutoGazeConfig::from(args);
 
@@ -1031,6 +1114,16 @@ mod tests {
         let config = BevyBurnAutoGazeConfig::from(args);
 
         assert_eq!(config.source, BevyFrameSource::SyntheticPan);
+
+        let args = NativeArgs::parse_from(["bevy_burn_autogaze", "--source", "synthetic-pulse"]);
+        let config = BevyBurnAutoGazeConfig::from(args);
+
+        assert_eq!(config.source, BevyFrameSource::SyntheticPulse);
+
+        let args = NativeArgs::parse_from(["bevy_burn_autogaze", "--source", "local-motion"]);
+        let config = BevyBurnAutoGazeConfig::from(args);
+
+        assert_eq!(config.source, BevyFrameSource::SyntheticLocalMotion);
     }
 
     #[test]
@@ -1054,6 +1147,14 @@ mod tests {
         assert_eq!(
             task_loss_config(Some(TaskLossRequirementArg::Value(0.7)), None, false),
             (Some(0.7), false)
+        );
+        assert_eq!(
+            task_loss_config(None, None, false),
+            (Some(DEFAULT_BEVY_TASK_LOSS_REQUIREMENT), false)
+        );
+        assert_eq!(
+            task_loss_config(Some(TaskLossRequirementArg::ModelDefault), None, false),
+            (None, false)
         );
         let (threshold, disabled) = task_loss_config(None, Some(20.0), false);
         assert!(!disabled);
