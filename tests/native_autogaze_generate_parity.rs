@@ -645,30 +645,40 @@ fn assert_native_autogaze_generate_matches_fixture(case: GenerateFixtureCase) {
         &actual_cached,
         &case.name,
     );
-    assert_eq!(
-        actual.gazing_pos[0], expected_gazing_pos,
-        "{}: generated gaze token ids diverged",
-        case.name
-    );
-    assert_eq!(
-        actual
-            .num_gazing_each_frame
-            .iter()
-            .map(|value| *value as i64)
-            .collect::<Vec<_>>(),
-        expected_num_gazing_each_frame,
-        "{}: per-frame gaze lengths diverged",
-        case.name
-    );
-    assert_eq!(
-        actual.if_padded_gazing[0]
-            .iter()
-            .map(|flag| if *flag { 1_i64 } else { 0_i64 })
-            .collect::<Vec<_>>(),
-        expected_if_padded,
-        "{}: padding mask diverged",
-        case.name
-    );
+    if case.task_loss_requirement.is_some() {
+        assert_active_generated_tokens_match_fixture(
+            &actual,
+            &expected_gazing_pos,
+            &expected_num_gazing_each_frame,
+            &expected_if_padded,
+            &case.name,
+        );
+    } else {
+        assert_eq!(
+            actual.gazing_pos[0], expected_gazing_pos,
+            "{}: generated gaze token ids diverged",
+            case.name
+        );
+        assert_eq!(
+            actual
+                .num_gazing_each_frame
+                .iter()
+                .map(|value| *value as i64)
+                .collect::<Vec<_>>(),
+            expected_num_gazing_each_frame,
+            "{}: per-frame gaze lengths diverged",
+            case.name
+        );
+        assert_eq!(
+            actual.if_padded_gazing[0]
+                .iter()
+                .map(|flag| if *flag { 1_i64 } else { 0_i64 })
+                .collect::<Vec<_>>(),
+            expected_if_padded,
+            "{}: padding mask diverged",
+            case.name
+        );
+    }
 
     let actual_scale_masks = actual.scale_token_masks(&model.config);
     assert_eq!(
@@ -744,6 +754,89 @@ fn assert_native_autogaze_generate_matches_fixture(case: GenerateFixtureCase) {
             ),
         );
     }
+}
+
+fn assert_active_generated_tokens_match_fixture(
+    actual: &AutoGazeGenerateOutput,
+    expected_gazing_pos: &[i64],
+    expected_num_gazing_each_frame: &[i64],
+    expected_if_padded: &[i64],
+    case_name: &str,
+) {
+    assert_eq!(
+        actual.gazing_pos.len(),
+        1,
+        "{case_name}: expected a single generated batch"
+    );
+    assert_eq!(
+        actual.if_padded_gazing.len(),
+        1,
+        "{case_name}: expected a single padding batch"
+    );
+    assert_eq!(
+        actual.num_gazing_each_frame.len(),
+        expected_num_gazing_each_frame.len(),
+        "{case_name}: frame count diverged"
+    );
+
+    let mut expected_cursor = 0_usize;
+    let mut actual_cursor = 0_usize;
+    for (frame_idx, expected_len) in expected_num_gazing_each_frame.iter().enumerate() {
+        let expected_len = usize::try_from((*expected_len).max(0)).expect("nonnegative length");
+        let expected_end = expected_cursor + expected_len;
+        assert!(
+            expected_end <= expected_gazing_pos.len() && expected_end <= expected_if_padded.len(),
+            "{case_name}: fixture frame {frame_idx} exceeds generated fixture tensor length"
+        );
+
+        let actual_len = actual.num_gazing_each_frame[frame_idx];
+        let actual_end = actual_cursor + actual_len;
+        assert!(
+            actual_end <= actual.gazing_pos[0].len()
+                && actual_end <= actual.if_padded_gazing[0].len(),
+            "{case_name}: actual frame {frame_idx} exceeds generated tensor length"
+        );
+
+        let expected_active = expected_gazing_pos[expected_cursor..expected_end]
+            .iter()
+            .zip(&expected_if_padded[expected_cursor..expected_end])
+            .filter_map(|(token, padded)| (*padded == 0).then_some(*token))
+            .collect::<Vec<_>>();
+        let actual_active = actual.gazing_pos[0][actual_cursor..actual_end]
+            .iter()
+            .zip(&actual.if_padded_gazing[0][actual_cursor..actual_end])
+            .filter_map(|(token, padded)| (!*padded).then_some(*token))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual_active, expected_active,
+            "{case_name}: active generated gaze token ids diverged for frame {frame_idx}"
+        );
+
+        assert!(
+            actual_len <= expected_len,
+            "{case_name}: actual frame {frame_idx} generated more slots than the fixture"
+        );
+        let omitted_fixture_tail = &expected_if_padded[expected_cursor + actual_len..expected_end];
+        assert!(
+            omitted_fixture_tail.iter().all(|padded| *padded != 0),
+            "{case_name}: actual frame {frame_idx} omitted non-padding fixture tokens"
+        );
+
+        expected_cursor = expected_end;
+        actual_cursor = actual_end;
+    }
+
+    assert!(
+        expected_if_padded[expected_cursor..]
+            .iter()
+            .all(|padded| *padded != 0),
+        "{case_name}: unconsumed fixture tail contains non-padding tokens"
+    );
+    assert_eq!(
+        actual_cursor,
+        actual.gazing_pos[0].len(),
+        "{case_name}: actual generated token cursor did not consume all tokens"
+    );
 }
 
 fn upstream_multiscale_config() -> AutoGazeConfig {

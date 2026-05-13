@@ -3546,7 +3546,6 @@ struct GreedySelectionBuilder {
     per_batch_disallowed: Vec<Vec<i64>>,
     per_batch_valid: Vec<Vec<bool>>,
     per_batch_confidences: Vec<Vec<f32>>,
-    per_batch_stopped: Vec<bool>,
 }
 
 impl GreedySelectionBuilder {
@@ -3556,7 +3555,6 @@ impl GreedySelectionBuilder {
             per_batch_disallowed: vec![Vec::new(); batch],
             per_batch_valid: vec![Vec::new(); batch],
             per_batch_confidences: vec![Vec::new(); batch],
-            per_batch_stopped: vec![false; batch],
         }
     }
 
@@ -3566,7 +3564,6 @@ impl GreedySelectionBuilder {
             .enumerate()
             .any(|(batch_idx, selected)| {
                 !context.finished.get(batch_idx).copied().unwrap_or(false)
-                    && !self.per_batch_stopped[batch_idx]
                     && context.prior_tokens[batch_idx].len() + selected.len() < context.max_tokens
             })
     }
@@ -3597,7 +3594,6 @@ impl GreedySelectionBuilder {
     ) {
         for batch_idx in 0..self.per_batch_tokens.len() {
             if context.finished.get(batch_idx).copied().unwrap_or(false)
-                || self.per_batch_stopped[batch_idx]
                 || context.prior_tokens[batch_idx].len() + self.per_batch_tokens[batch_idx].len()
                     >= context.max_tokens
             {
@@ -3636,9 +3632,6 @@ impl GreedySelectionBuilder {
                     1.0
                 }
             });
-            if meets_task_loss_requirement {
-                self.per_batch_stopped[batch_idx] = true;
-            }
         }
     }
 
@@ -3692,10 +3685,8 @@ fn greedy_select_multi_tokens_from_data(
 
     for batch_idx in 0..batch {
         let mut disallowed = prior_tokens[batch_idx].clone();
-        let mut stopped = false;
         for multi_idx in 0..num_multi {
             if finished.get(batch_idx).copied().unwrap_or(false)
-                || stopped
                 || prior_tokens[batch_idx].len() + per_batch_tokens[batch_idx].len() >= max_tokens
             {
                 break;
@@ -3739,9 +3730,6 @@ fn greedy_select_multi_tokens_from_data(
                 } else {
                     1.0
                 });
-                if meets_task_loss_requirement {
-                    stopped = true;
-                }
             } else {
                 break;
             }
@@ -4665,7 +4653,7 @@ mod tests {
 
     #[cfg(feature = "ndarray")]
     #[test]
-    fn greedy_selection_truncates_multi_token_block_after_task_loss_stop() {
+    fn greedy_selection_continues_multi_token_block_after_task_loss_stop() {
         type B = burn::backend::NdArray<f32>;
         let device = Default::default();
         let scores = vec![
@@ -4708,8 +4696,8 @@ mod tests {
             },
         );
 
-        assert_eq!(selected.0, vec![vec![0, 4]]);
-        assert_eq!(selected.1, vec![vec![true, false]]);
+        assert_eq!(selected.0, vec![vec![0, 4, 2]]);
+        assert_eq!(selected.1, vec![vec![true, false, true]]);
         assert_eq!(selected.0, reference.0);
         assert_eq!(selected.1, reference.1);
     }
