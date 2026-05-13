@@ -194,7 +194,8 @@ impl Runner {
         let mut path_prefixes = Vec::new();
         let nightly_bin =
             PathBuf::from("/home/mosure/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin");
-        let rustc = if nightly_bin.is_dir() {
+        let explicit_rustc = std::env::var_os("RUSTC").is_some();
+        let rustc = if nightly_bin.is_dir() && !explicit_rustc {
             path_prefixes.push(nightly_bin.clone());
             Some(nightly_bin.join("rustc"))
         } else {
@@ -2654,9 +2655,17 @@ fn package_dir(root: &Path) -> Result<PathBuf> {
     let manifest = fs::read_to_string(root.join("Cargo.toml"))?;
     let name = package_field(&manifest, "name")?;
     let version = package_field(&manifest, "version")?;
-    Ok(root
-        .join("target/package")
-        .join(format!("{name}-{version}")))
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                root.join(path)
+            }
+        })
+        .unwrap_or_else(|| root.join("target"));
+    Ok(target_dir.join("package").join(format!("{name}-{version}")))
 }
 
 fn package_field(manifest: &str, field: &str) -> Result<String> {

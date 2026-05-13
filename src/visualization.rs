@@ -1,8 +1,11 @@
 use crate::{
-    DEFAULT_KEYFRAME_DURATION, FixationPoint,
+    AutoGazeConfig, AutoGazeDeviceTokens, DEFAULT_KEYFRAME_DURATION, FixationPoint,
     pipeline::{AUTO_GAZE_IMAGE_MEAN, AUTO_GAZE_IMAGE_STD},
+    scale_token_layouts,
 };
 use anyhow::{Result, ensure};
+use burn::tensor::module::interpolate;
+use burn::tensor::ops::{InterpolateMode, InterpolateOptions};
 use burn::tensor::{Int, Tensor, TensorData, backend::Backend};
 use std::{collections::BTreeMap, fmt, str::FromStr};
 
@@ -966,6 +969,71 @@ impl<B: Backend> AutoGazeTensorVisualizationState<B> {
             output_rgba: output,
             mask_pixel_count,
             updated_pixel_count,
+        })
+    }
+
+    pub fn visualize_normalized_rgb_clip_device_tokens_panels(
+        &mut self,
+        tensor: Tensor<B, 5>,
+        tokens: &AutoGazeDeviceTokens<B>,
+        config: &AutoGazeConfig,
+        options: AutoGazeTensorVisualizationOptions,
+        device: &B::Device,
+    ) -> Result<AutoGazeTensorVisualizationPanels<B>> {
+        let width = options.width;
+        let height = options.height;
+        let pixels = validate_dimensions(width, height)?;
+        let input = normalized_rgb_clip_to_unit_rgba_tensor(tensor, width, height, device)?;
+        let alpha = token_alpha_mask_tensor(tokens, config, width, height, device)?;
+        let mask_pixel_count = pixels;
+        let mask = token_mask_panel_tensor(
+            input.clone(),
+            alpha.clone(),
+            width,
+            height,
+            options.blend_alpha,
+            options.mask_mode,
+            device,
+        );
+        let interframe_keyframe = matches!(self.mode, AutoGazeVisualizationMode::Interframe)
+            && self.is_keyframe(width, height);
+        let mut interframe_path = None;
+        let output = match self.mode {
+            AutoGazeVisualizationMode::FullBlend => {
+                let blend = alpha_blend_tensor(alpha, width, height, options.blend_alpha, device);
+                let inverse = Tensor::<B, 3>::ones([height, width, 4], device).sub(blend.clone());
+                input.clone().mul(inverse).add(blend)
+            }
+            AutoGazeVisualizationMode::Interframe => {
+                if interframe_keyframe {
+                    interframe_path = Some(AutoGazeTensorInterframePath::Keyframe);
+                    input.clone()
+                } else {
+                    interframe_path = Some(AutoGazeTensorInterframePath::FullFrame);
+                    let previous = self
+                        .interframe_output_rgba
+                        .clone()
+                        .unwrap_or_else(|| input.clone());
+                    dense_interframe_update_tensor(input.clone(), previous, alpha)
+                }
+            }
+        };
+
+        self.advance(width, height, output.clone());
+        self.last_interframe_path = interframe_path;
+        self.last_mask_plan_stats = Some(AutoGazeMaskPlanStats {
+            rect_count: tokens.tokens.shape().dims::<2>()[1],
+            row_span_count: height,
+            pixel_count: pixels,
+        });
+        Ok(AutoGazeTensorVisualizationPanels {
+            width,
+            height,
+            input_rgba: input,
+            mask_rgba: mask,
+            output_rgba: output,
+            mask_pixel_count,
+            updated_pixel_count: pixels,
         })
     }
 
@@ -2301,6 +2369,121 @@ fn full_frame_mask_panel_tensor<B: Backend>(
     );
     let inverse = Tensor::<B, 3>::ones([height, width, 4], device).sub(blend.clone());
     input_rgba.mul(inverse).add(mask.mul(blend))
+}
+
+fn token_alpha_mask_tensor<B: Backend>(
+    tokens: &AutoGazeDeviceTokens<B>,
+    config: &AutoGazeConfig,
+    width: usize,
+    height: usize,
+    device: &B::Device,
+) -> Result<Tensor<B, 3>> {
+    let [batch, slots] = tokens.tokens.shape().dims::<2>();
+    let layouts = scale_token_layouts(config);
+    let vocab = layouts
+        .iter()
+        .map(|layout| layout.token_count)
+        .sum::<usize>();
+    ensure!(vocab > 0, "AutoGaze token mask vocab must not be empty");
+    let grid = layouts
+        .iter()
+        .map(|layout| layout.grid.max(1))
+        .max()
+        .unwrap_or(1);
+    let basis = token_to_finest_grid_basis::<B>(&layouts, grid, device);
+    let vocab_range = Tensor::<B, 1, Int>::arange(0..vocab as i64, device)
+        .reshape([1, 1, vocab])
+        .repeat_dim(0, batch)
+        .repeat_dim(1, slots);
+    let selected = tokens
+        .tokens
+        .clone()
+        .reshape([batch, slots, 1])
+        .repeat_dim(2, vocab)
+        .equal(vocab_range)
+        .bool_and(
+            tokens
+                .valid
+                .clone()
+                .reshape([batch, slots, 1])
+                .repeat_dim(2, vocab),
+        )
+        .float()
+        .sum_dim(1)
+        .reshape([batch, vocab])
+        .clamp(0.0, 1.0);
+    let grid_mask = selected
+        .matmul(basis)
+        .clamp(0.0, 1.0)
+        .reshape([batch, 1, grid, grid]);
+    let options = InterpolateOptions::new(InterpolateMode::Nearest);
+    let alpha = interpolate(grid_mask, [height, width], options);
+    Ok(alpha
+        .slice([0..1, 0..1, 0..height, 0..width])
+        .reshape([height, width, 1]))
+}
+
+fn token_to_finest_grid_basis<B: Backend>(
+    layouts: &[crate::AutoGazeScaleTokenLayout],
+    target_grid: usize,
+    device: &B::Device,
+) -> Tensor<B, 2> {
+    let target_grid = target_grid.max(1);
+    let pixels = target_grid * target_grid;
+    let vocab = layouts
+        .iter()
+        .map(|layout| layout.token_count)
+        .sum::<usize>();
+    let mut values = vec![0.0f32; vocab * pixels];
+    let mut token_offset = 0usize;
+    for layout in layouts {
+        let grid = layout.grid.max(1);
+        for local in 0..layout.token_count {
+            let row = local / grid;
+            let col = local % grid;
+            let y0 = row.saturating_mul(target_grid) / grid;
+            let x0 = col.saturating_mul(target_grid) / grid;
+            let y1 = (row + 1).saturating_mul(target_grid).div_ceil(grid);
+            let x1 = (col + 1).saturating_mul(target_grid).div_ceil(grid);
+            let base = (token_offset + local) * pixels;
+            for y in y0.min(target_grid)..y1.min(target_grid) {
+                let row_offset = base + y * target_grid;
+                for x in x0.min(target_grid)..x1.min(target_grid) {
+                    values[row_offset + x] = 1.0;
+                }
+            }
+        }
+        token_offset += layout.token_count;
+    }
+    Tensor::<B, 2>::from_data(TensorData::new(values, [vocab, pixels]), device)
+}
+
+fn token_mask_panel_tensor<B: Backend>(
+    input_rgba: Tensor<B, 3>,
+    alpha: Tensor<B, 3>,
+    width: usize,
+    height: usize,
+    blend_alpha: f32,
+    mode: AutoGazeMaskVisualizationMode,
+    device: &B::Device,
+) -> Tensor<B, 3> {
+    if mode != AutoGazeMaskVisualizationMode::ImageOverlay
+        && mode != AutoGazeMaskVisualizationMode::ImageMaskOnly
+    {
+        return alpha.repeat_dim(2, 4);
+    }
+
+    let visible = alpha.clone().repeat_dim(2, 4);
+    let blend = alpha_blend_tensor(alpha, width, height, blend_alpha, device);
+    let inverse = Tensor::<B, 3>::ones([height, width, 4], device).sub(blend.clone());
+    let overlay = input_rgba
+        .mul(inverse)
+        .add(Tensor::<B, 3>::ones([height, width, 4], device).mul(blend));
+    if mode == AutoGazeMaskVisualizationMode::ImageMaskOnly {
+        overlay.mul(visible)
+    } else {
+        overlay
+    }
 }
 
 fn alpha_blend_tensor<B: Backend>(

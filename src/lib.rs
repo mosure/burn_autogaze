@@ -22,9 +22,10 @@ pub use metrics::{
     sanitize_gaze_ratio, task_loss_requirement_from_l1_db, task_loss_requirement_to_l1_db,
 };
 pub use model::{
-    AutoGazeCausalLmOutput, AutoGazeGazingModel, AutoGazeGenerateOutput, AutoGazeLoadOptions,
-    AutoGazeScaleTokenMask, AutoGazeStreamingCache, Connector, Conv3dBlockForStreaming,
-    NativeAutoGazeModel, ShallowVideoConvNet,
+    AutoGazeCausalLmOutput, AutoGazeDecodeStrategy, AutoGazeDeviceGenerateOutput,
+    AutoGazeDeviceTokens, AutoGazeGazingModel, AutoGazeGenerateOutput, AutoGazeLoadOptions,
+    AutoGazeScaleTokenLayout, AutoGazeScaleTokenMask, AutoGazeStreamingCache, Connector,
+    Conv3dBlockForStreaming, NativeAutoGazeModel, ShallowVideoConvNet, scale_token_layouts,
 };
 pub use nodes::{
     AutoGazeInputNode, AutoGazeOutputNode, AutoGazePipelinePacket, AutoGazeRgbaClip,
@@ -34,13 +35,13 @@ pub use nodes::{
 };
 pub use pipeline::{
     AUTO_GAZE_IMAGE_MEAN, AUTO_GAZE_IMAGE_STD, AUTO_GAZE_PROCESSOR_SHORT_EDGE,
-    AUTO_GAZE_RESCALE_FACTOR, AutoGazeClipShape, AutoGazeEmbedOutput, AutoGazeInferenceMode,
-    AutoGazePipeline, AutoGazePipelineOptions, AutoGazePreparedRun, AutoGazeReadoutRunOutput,
-    AutoGazeReadoutStats, AutoGazeRgbaClipShape, AutoGazeTaskLossOption, AutoGazeTile,
-    AutoGazeTileLayout, AutoGazeTraceRunOutput, last_rgba_frame, prepare_rgba_clip_for_trace,
-    resize_dimensions_preserving_aspect, resize_rgba_frame_to_dimensions,
-    resize_video_shortest_edge, rgba_clip_to_inference_tensor, rgba_clip_to_processor_tensor,
-    rgba_clip_to_tensor, video_frame_tensor,
+    AUTO_GAZE_RESCALE_FACTOR, AutoGazeClipShape, AutoGazeDeviceReadoutRunOutput,
+    AutoGazeEmbedOutput, AutoGazeInferenceMode, AutoGazePipeline, AutoGazePipelineOptions,
+    AutoGazePreparedRun, AutoGazeReadoutRunOutput, AutoGazeReadoutStats, AutoGazeRgbaClipShape,
+    AutoGazeTaskLossOption, AutoGazeTile, AutoGazeTileLayout, AutoGazeTraceRunOutput,
+    last_rgba_frame, prepare_rgba_clip_for_trace, resize_dimensions_preserving_aspect,
+    resize_rgba_frame_to_dimensions, resize_video_shortest_edge, rgba_clip_to_inference_tensor,
+    rgba_clip_to_processor_tensor, rgba_clip_to_tensor, video_frame_tensor,
 };
 pub use pyramid::{
     ImagePyramidLevel, ImagePyramidMask, ImagePyramidMaskOptions, ImagePyramidTokens,

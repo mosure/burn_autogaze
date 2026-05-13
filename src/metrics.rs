@@ -82,7 +82,7 @@ pub struct AutoGazePsnrStats {
 
 impl AutoGazePsnrStats {
     pub fn record(&mut self, psnr_db: f64) {
-        if !psnr_db.is_finite() && !(psnr_db.is_infinite() && psnr_db.is_sign_positive()) {
+        if !(psnr_db.is_finite() || psnr_db.is_infinite() && psnr_db.is_sign_positive()) {
             return;
         }
         self.metric.record(psnr_db);

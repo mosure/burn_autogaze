@@ -6,7 +6,6 @@ use burn::nn::conv::{Conv3d, Conv3dConfig};
 use burn::nn::{
     Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig, PaddingConfig3d,
 };
-#[cfg(not(feature = "cuda"))]
 use burn::tensor::Bool;
 use burn::tensor::activation;
 use burn::tensor::backend::{Backend, ExecutionError};
@@ -224,6 +223,16 @@ pub struct AutoGazeGenerateOutput {
     pub confidences: Vec<Vec<f32>>,
 }
 
+pub struct AutoGazeDeviceTokens<B: Backend> {
+    pub tokens: Tensor<B, 2, Int>,
+    pub valid: Tensor<B, 2, Bool>,
+}
+
+pub struct AutoGazeDeviceGenerateOutput<B: Backend> {
+    pub generated: AutoGazeGenerateOutput,
+    pub device_tokens: Option<AutoGazeDeviceTokens<B>>,
+}
+
 impl AutoGazeGenerateOutput {
     /// Decode generated AutoGaze token ids into upstream-style per-scale token masks.
     ///
@@ -260,6 +269,65 @@ pub struct AutoGazeScaleTokenMask {
     pub grid: usize,
     pub token_count: usize,
     pub frames: Vec<Vec<bool>>,
+}
+
+/// Greedy decoder readout strategy for streaming AutoGaze generation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AutoGazeDecodeStrategy {
+    /// CPU-side greedy selection with one compact logits/task-loss readback per decode step.
+    #[default]
+    HostGreedy,
+    /// Device-side greedy selection with compact token readbacks at chunk boundaries for stopping.
+    ///
+    /// Tokens and validity match host greedy selection. Confidence values are binary validity
+    /// markers so render/readout paths do not pay for a full vocab softmax on every decode step.
+    DeviceGreedy {
+        /// Maximum autoregressive decode steps before each compact token readback.
+        chunk_size: usize,
+    },
+    /// Device-side greedy selection with one compact readback after the full frame decode budget.
+    ///
+    /// Tokens and validity match host greedy selection. Confidence values are binary validity
+    /// markers so render/readout paths do not pay for a full vocab softmax on every decode step.
+    DeviceTerminalGreedy {
+        /// Maximum autoregressive decode steps per internal scheduling chunk.
+        chunk_size: usize,
+    },
+}
+
+impl AutoGazeDecodeStrategy {
+    pub const fn device_greedy(chunk_size: usize) -> Self {
+        Self::DeviceGreedy { chunk_size }
+    }
+
+    pub const fn device_terminal_greedy(chunk_size: usize) -> Self {
+        Self::DeviceTerminalGreedy { chunk_size }
+    }
+
+    pub const fn chunk_size(self) -> usize {
+        match self {
+            Self::HostGreedy => 1,
+            Self::DeviceGreedy { chunk_size } | Self::DeviceTerminalGreedy { chunk_size } => {
+                if chunk_size == 0 {
+                    1
+                } else {
+                    chunk_size
+                }
+            }
+        }
+    }
+
+    pub const fn normalized(self) -> Self {
+        match self {
+            Self::HostGreedy => Self::HostGreedy,
+            Self::DeviceGreedy { chunk_size } => Self::DeviceGreedy {
+                chunk_size: if chunk_size == 0 { 1 } else { chunk_size },
+            },
+            Self::DeviceTerminalGreedy { chunk_size } => Self::DeviceTerminalGreedy {
+                chunk_size: if chunk_size == 0 { 1 } else { chunk_size },
+            },
+        }
+    }
 }
 
 /// Stateful generation cache for advancing an AutoGaze video stream one frame at a time.
@@ -476,6 +544,45 @@ type GreedyTokenSelection = (Vec<Vec<i64>>, Vec<Vec<bool>>, Vec<Vec<f32>>);
 struct TaskLossStop {
     requirement: Option<f32>,
     is_first_token: bool,
+}
+
+struct DeviceGreedySelectionState<B: Backend> {
+    disallowed: Tensor<B, 2, Bool>,
+    finished: Tensor<B, 2, Bool>,
+    current_len: usize,
+}
+
+#[derive(Clone, Copy)]
+struct DeviceGreedySelectionConfig {
+    eos_token_id: i64,
+    max_tokens: usize,
+    task_loss_stop: TaskLossStop,
+}
+
+struct DeviceGreedySelection<B: Backend> {
+    tokens: Tensor<B, 2, Int>,
+    valid: Tensor<B, 2, Bool>,
+    finished: Tensor<B, 2, Bool>,
+    disallowed: Tensor<B, 2, Bool>,
+}
+
+struct DeviceGreedyChunkStep<B: Backend> {
+    token_embeds: Tensor<B, 3>,
+    generated_indices: Vec<Vec<usize>>,
+}
+
+struct DeviceGreedyChunkTensors<B: Backend> {
+    tokens: Tensor<B, 2, Int>,
+    valid: Tensor<B, 2, Bool>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DeviceChunkDecodeOptions {
+    max_gaze_tokens_each_frame: usize,
+    task_loss_requirement: Option<f32>,
+    coverage_stop_ratio: Option<f64>,
+    decode_chunk_size: usize,
+    collect_device_tokens: bool,
 }
 
 #[derive(Debug)]
@@ -995,7 +1102,7 @@ pub struct AutoGazeGazingModel<B: Backend> {
     pub connector: Connector<B>,
     pub gaze_decoder: AutoGazeLlamaForCausalLmMultiTokenPred<B>,
     #[module(skip)]
-    scale_layouts: Vec<ScaleTokenLayout>,
+    scale_layouts: Vec<AutoGazeScaleTokenLayout>,
     #[module(skip)]
     input_img_size: usize,
     #[module(skip)]
@@ -1013,7 +1120,7 @@ impl<B: Backend> AutoGazeGazingModel<B> {
         let token_count = config.num_vision_tokens_each_frame.max(1);
         Self::new_with_scale_layouts(
             config,
-            vec![ScaleTokenLayout {
+            vec![AutoGazeScaleTokenLayout {
                 token_count,
                 grid: square_grid(token_count),
             }],
@@ -1023,7 +1130,7 @@ impl<B: Backend> AutoGazeGazingModel<B> {
 
     pub(crate) fn new_with_scale_layouts(
         config: &GazeModelConfig,
-        scale_layouts: Vec<ScaleTokenLayout>,
+        scale_layouts: Vec<AutoGazeScaleTokenLayout>,
         device: &B::Device,
     ) -> Self {
         Self {
@@ -1363,7 +1470,6 @@ impl<B: Backend> AutoGazeGazingModel<B> {
         let mut if_padded_gazing = vec![Vec::<bool>::new(); batch];
         let mut confidences = vec![Vec::<f32>::new(); batch];
         let mut num_gazing_each_frame = Vec::with_capacity(frames);
-
         for output_frame_idx in 0..frames {
             let should_reset = cache
                 .state
@@ -2220,6 +2326,867 @@ impl<B: Backend> AutoGazeGazingModel<B> {
         })
     }
 
+    pub(crate) async fn generate_streaming_cached_async_with_decode_strategy(
+        &self,
+        video: Tensor<B, 5>,
+        cache: &mut AutoGazeStreamingCache<B>,
+        max_gaze_tokens_each_frame: usize,
+        task_loss_requirement: Option<f32>,
+        coverage_stop_ratio: Option<f64>,
+        decode_strategy: AutoGazeDecodeStrategy,
+    ) -> Result<AutoGazeGenerateOutput, ExecutionError> {
+        match decode_strategy.normalized() {
+            AutoGazeDecodeStrategy::HostGreedy => {
+                self.generate_streaming_cached_async_with_coverage_stop(
+                    video,
+                    cache,
+                    max_gaze_tokens_each_frame,
+                    task_loss_requirement,
+                    coverage_stop_ratio,
+                )
+                .await
+            }
+            AutoGazeDecodeStrategy::DeviceGreedy { chunk_size } => {
+                self.generate_streaming_cached_device_chunked_async_with_coverage_stop(
+                    video,
+                    cache,
+                    max_gaze_tokens_each_frame,
+                    task_loss_requirement,
+                    coverage_stop_ratio,
+                    chunk_size,
+                )
+                .await
+            }
+            AutoGazeDecodeStrategy::DeviceTerminalGreedy { chunk_size } => {
+                self.generate_streaming_cached_device_terminal_async_with_coverage_stop(
+                    video,
+                    cache,
+                    max_gaze_tokens_each_frame,
+                    task_loss_requirement,
+                    coverage_stop_ratio,
+                    chunk_size,
+                )
+                .await
+            }
+        }
+    }
+
+    pub(crate) async fn generate_streaming_cached_device_output_async_with_decode_strategy(
+        &self,
+        video: Tensor<B, 5>,
+        cache: &mut AutoGazeStreamingCache<B>,
+        max_gaze_tokens_each_frame: usize,
+        task_loss_requirement: Option<f32>,
+        coverage_stop_ratio: Option<f64>,
+        decode_strategy: AutoGazeDecodeStrategy,
+    ) -> Result<AutoGazeDeviceGenerateOutput<B>, ExecutionError> {
+        match decode_strategy.normalized() {
+            AutoGazeDecodeStrategy::HostGreedy => {
+                let generated = self
+                    .generate_streaming_cached_async_with_coverage_stop(
+                        video,
+                        cache,
+                        max_gaze_tokens_each_frame,
+                        task_loss_requirement,
+                        coverage_stop_ratio,
+                    )
+                    .await?;
+                Ok(AutoGazeDeviceGenerateOutput {
+                    generated,
+                    device_tokens: None,
+                })
+            }
+            AutoGazeDecodeStrategy::DeviceGreedy { chunk_size } => {
+                self.generate_streaming_cached_device_chunked_output_async_with_coverage_stop(
+                    video,
+                    cache,
+                    DeviceChunkDecodeOptions {
+                        max_gaze_tokens_each_frame,
+                        task_loss_requirement,
+                        coverage_stop_ratio,
+                        decode_chunk_size: chunk_size,
+                        collect_device_tokens: true,
+                    },
+                )
+                .await
+            }
+            AutoGazeDecodeStrategy::DeviceTerminalGreedy { chunk_size } => {
+                self.generate_streaming_cached_device_terminal_output_async_with_coverage_stop(
+                    video,
+                    cache,
+                    DeviceChunkDecodeOptions {
+                        max_gaze_tokens_each_frame,
+                        task_loss_requirement,
+                        coverage_stop_ratio,
+                        decode_chunk_size: chunk_size,
+                        collect_device_tokens: true,
+                    },
+                )
+                .await
+            }
+        }
+    }
+
+    async fn generate_streaming_cached_device_chunked_async_with_coverage_stop(
+        &self,
+        video: Tensor<B, 5>,
+        cache: &mut AutoGazeStreamingCache<B>,
+        max_gaze_tokens_each_frame: usize,
+        task_loss_requirement: Option<f32>,
+        coverage_stop_ratio: Option<f64>,
+        decode_chunk_size: usize,
+    ) -> Result<AutoGazeGenerateOutput, ExecutionError> {
+        self.generate_streaming_cached_device_chunked_output_async_with_coverage_stop(
+            video,
+            cache,
+            DeviceChunkDecodeOptions {
+                max_gaze_tokens_each_frame,
+                task_loss_requirement,
+                coverage_stop_ratio,
+                decode_chunk_size,
+                collect_device_tokens: false,
+            },
+        )
+        .await
+        .map(|output| output.generated)
+    }
+
+    async fn generate_streaming_cached_device_chunked_output_async_with_coverage_stop(
+        &self,
+        video: Tensor<B, 5>,
+        cache: &mut AutoGazeStreamingCache<B>,
+        options: DeviceChunkDecodeOptions,
+    ) -> Result<AutoGazeDeviceGenerateOutput<B>, ExecutionError> {
+        let video = self.resize_video(video);
+        let [batch, frames, _channels, _height, _width] = video.shape().dims::<5>();
+        let max_tokens = self.effective_max_gaze_tokens(
+            options.max_gaze_tokens_each_frame,
+            options.coverage_stop_ratio,
+        );
+        let horizon_frames = cache.horizon_frames.max(1);
+        if cache
+            .state
+            .as_ref()
+            .map(|state| !state.matches_runtime(batch, max_tokens, horizon_frames, frames))
+            .unwrap_or(false)
+        {
+            cache.state = None;
+        }
+
+        let past_conv_values = cache
+            .state
+            .as_mut()
+            .and_then(|state| state.past_conv_values.take());
+        let (video_embeds, new_past_conv_values) = self.embed_video(video, true, past_conv_values);
+        let [batch, frames, vision_tokens, dim] = video_embeds.shape().dims::<4>();
+        let device = video_embeds.device();
+        let decode_chunk_size = options.decode_chunk_size.max(1);
+
+        let mut gazing_pos = vec![Vec::<i64>::new(); batch];
+        let mut if_padded_gazing = vec![Vec::<bool>::new(); batch];
+        let mut confidences = vec![Vec::<f32>::new(); batch];
+        let mut num_gazing_each_frame = Vec::with_capacity(frames);
+        let mut device_token_chunks = options.collect_device_tokens.then(Vec::new);
+        let mut device_valid_chunks = options.collect_device_tokens.then(Vec::new);
+        let coverage_stop_ratio = options.coverage_stop_ratio;
+
+        for output_frame_idx in 0..frames {
+            let should_reset = cache
+                .state
+                .as_ref()
+                .map(|state| !state.matches(batch, vision_tokens, dim, max_tokens, horizon_frames))
+                .unwrap_or(true);
+            if should_reset {
+                cache.state = None;
+            }
+            let state = cache.state.get_or_insert_with(|| {
+                AutoGazeStreamingCacheState::new(
+                    batch,
+                    vision_tokens,
+                    dim,
+                    max_tokens,
+                    horizon_frames,
+                )
+            });
+
+            state.commit_pending_position_ids();
+            state.clear_pending_position_indices();
+            state.compact_for_next_frame(vision_tokens + max_tokens, horizon_frames);
+
+            let frame_embed = video_embeds
+                .clone()
+                .slice_dim(1, output_frame_idx..(output_frame_idx + 1))
+                .reshape([batch, vision_tokens, dim]);
+            state.append_frame_positions(vision_tokens);
+            let initial_query_embeds = if let Some(pending) = state.pending_query_embeds.take() {
+                Tensor::cat(vec![pending, frame_embed], 1)
+            } else {
+                frame_embed
+            };
+
+            let mut frame_tokens = vec![Vec::<i64>::new(); batch];
+            let mut frame_padded = vec![Vec::<bool>::new(); batch];
+            let mut frame_confidences = vec![Vec::<f32>::new(); batch];
+            let mut finished = vec![false; batch];
+            let mut coverage_trackers =
+                generation_coverage_trackers(batch, coverage_stop_ratio, &self.scale_layouts);
+            let mut is_first_token = true;
+            let generation_prefix_len = state
+                .prefix_attention_mask
+                .first()
+                .map(Vec::len)
+                .unwrap_or(0);
+            let generation_tail_positions =
+                generation_tail_positions(&state.prefix_position_ids, self.num_multi_token_pred);
+            let mut last_generated_indices = vec![Vec::<usize>::new(); batch];
+            let mut next_query_embeds = Some(initial_query_embeds);
+            let mut disallowed = disallowed_token_mask::<B>(
+                &frame_tokens,
+                self.eos_token_id,
+                self.gaze_decoder.vocab_size,
+                &device,
+            );
+            let mut device_finished = finished_token_mask::<B>(&finished, &device);
+
+            while frame_tokens.iter().map(Vec::len).max().unwrap_or(0) < max_tokens
+                && finished.iter().any(|done| !done)
+            {
+                let current_len = frame_tokens.first().map(Vec::len).unwrap_or(0);
+                let remaining_slots = max_tokens.saturating_sub(current_len);
+                if remaining_slots == 0 {
+                    break;
+                }
+                let requested_steps = decode_chunk_size
+                    .min(remaining_slots.div_ceil(self.num_multi_token_pred.max(1)))
+                    .max(1);
+                let mut query_embeds = next_query_embeds.take();
+                let mut token_steps = Vec::with_capacity(requested_steps);
+                let mut valid_steps = Vec::with_capacity(requested_steps);
+                let mut chunk_steps = Vec::with_capacity(requested_steps);
+
+                for step_idx in 0..requested_steps {
+                    let Some(query) = query_embeds.take() else {
+                        break;
+                    };
+                    let query_len = query.shape().dims::<3>()[1];
+                    let query_start = cached_sequence_len(&state.past_key_values);
+                    let key_len = query_start + query_len;
+                    let attention_mask = attention_mask_tensor_or_none::<B>(
+                        &state.prefix_attention_mask,
+                        key_len,
+                        &device,
+                    );
+                    let position_ids = position_ids_slice_tensor_optimized::<B>(
+                        &state.prefix_position_ids,
+                        query_start,
+                        query_len,
+                        &device,
+                    );
+                    let outputs = self.gaze_decoder.forward_cached(
+                        query,
+                        attention_mask,
+                        position_ids,
+                        state.past_key_values.take(),
+                        state.cache_capacity,
+                    );
+                    state.past_key_values = Some(outputs.past_key_values);
+                    let last_logits = outputs
+                        .logits
+                        .slice_dim(1, query_len.saturating_sub(1)..query_len)
+                        .reshape([
+                            batch,
+                            self.num_multi_token_pred,
+                            self.gaze_decoder.vocab_size,
+                        ]);
+                    let last_task = outputs
+                        .task_loss_prediction
+                        .slice_dim(1, query_len.saturating_sub(1)..query_len)
+                        .reshape([batch, self.num_multi_token_pred]);
+                    let selected = device_select_multi_tokens(
+                        last_logits,
+                        last_task,
+                        DeviceGreedySelectionState {
+                            disallowed,
+                            finished: device_finished,
+                            current_len: current_len + step_idx * self.num_multi_token_pred,
+                        },
+                        DeviceGreedySelectionConfig {
+                            eos_token_id: self.eos_token_id,
+                            max_tokens,
+                            task_loss_stop: TaskLossStop {
+                                requirement: options.task_loss_requirement,
+                                is_first_token,
+                            },
+                        },
+                    );
+                    let next_device_finished = device_finished_after_selection_block(
+                        selected.finished,
+                        selected.valid.clone(),
+                    );
+                    let token_embeds = self
+                        .gaze_decoder
+                        .model
+                        .embed_tokens
+                        .forward(selected.tokens.clone());
+                    let generated_indices = append_generated_position_slots(
+                        &mut state.prefix_attention_mask,
+                        &mut state.prefix_position_ids,
+                        &generation_tail_positions,
+                        self.num_multi_token_pred,
+                    );
+                    token_steps.push(selected.tokens);
+                    valid_steps.push(selected.valid);
+                    disallowed = selected.disallowed;
+                    device_finished = next_device_finished;
+                    query_embeds = Some(token_embeds.clone());
+                    chunk_steps.push(DeviceGreedyChunkStep {
+                        token_embeds,
+                        generated_indices,
+                    });
+                    is_first_token = false;
+                }
+
+                if chunk_steps.is_empty() {
+                    break;
+                }
+                next_query_embeds = query_embeds;
+
+                let generated_slots = chunk_steps.len() * self.num_multi_token_pred;
+                let device_sequence =
+                    options
+                        .collect_device_tokens
+                        .then(|| DeviceGreedyChunkTensors {
+                            tokens: Tensor::cat(token_steps.clone(), 1),
+                            valid: Tensor::cat(valid_steps.clone(), 1),
+                        });
+                let packed = pack_device_greedy_chunk(token_steps, valid_steps);
+                let (selected_tokens, selected_valid, selected_confidences) =
+                    read_device_greedy_chunk_async(packed, generated_slots, self.eos_token_id)
+                        .await?;
+
+                let mut actual_slots = 0usize;
+                let mut actual_steps = 0usize;
+                let mut last_actual_new_tokens = 0usize;
+                for (step_idx, decode_step) in chunk_steps.iter().enumerate() {
+                    if frame_tokens.first().map(Vec::len).unwrap_or(0) >= max_tokens
+                        || finished.iter().all(|done| *done)
+                    {
+                        break;
+                    }
+                    let new_tokens = self
+                        .num_multi_token_pred
+                        .min(max_tokens - frame_tokens.first().map(Vec::len).unwrap_or(0));
+                    let slot_offset = step_idx * self.num_multi_token_pred;
+                    last_generated_indices = decode_step
+                        .generated_indices
+                        .iter()
+                        .map(|indices| indices.iter().copied().take(new_tokens).collect())
+                        .collect();
+
+                    let mut finish_after_step = vec![false; batch];
+                    for batch_idx in 0..batch {
+                        let was_finished = finished[batch_idx];
+                        for local_idx in 0..new_tokens {
+                            let slot = slot_offset + local_idx;
+                            let (token, valid, confidence) = if was_finished {
+                                (self.eos_token_id, false, 0.0)
+                            } else {
+                                (
+                                    selected_tokens[batch_idx][slot],
+                                    selected_valid[batch_idx][slot],
+                                    selected_confidences[batch_idx][slot],
+                                )
+                            };
+                            frame_tokens[batch_idx].push(token);
+                            frame_padded[batch_idx].push(!valid);
+                            frame_confidences[batch_idx].push(confidence);
+                            let coverage_stop = valid
+                                && observe_generation_coverage(
+                                    &mut coverage_trackers,
+                                    batch_idx,
+                                    token,
+                                );
+                            if !valid || coverage_stop {
+                                finish_after_step[batch_idx] = true;
+                            }
+                        }
+                    }
+                    for (done, finish_after_step) in finished.iter_mut().zip(finish_after_step) {
+                        *done |= finish_after_step;
+                    }
+
+                    actual_slots += new_tokens;
+                    actual_steps = step_idx + 1;
+                    last_actual_new_tokens = new_tokens;
+                }
+
+                if actual_slots == 0 {
+                    truncate_generation_rows(
+                        &mut state.prefix_attention_mask,
+                        &mut state.prefix_position_ids,
+                        &mut last_generated_indices,
+                        generated_slots,
+                    );
+                    truncate_past_key_values_tail(&mut state.past_key_values, generated_slots);
+                } else if generated_slots > actual_slots {
+                    truncate_generation_rows(
+                        &mut state.prefix_attention_mask,
+                        &mut state.prefix_position_ids,
+                        &mut last_generated_indices,
+                        generated_slots - actual_slots,
+                    );
+                    truncate_past_key_values_tail(
+                        &mut state.past_key_values,
+                        generated_slots - actual_slots,
+                    );
+                }
+
+                if let Some(device_sequence) = device_sequence
+                    && let (Some(tokens), Some(valid)) =
+                        (device_token_chunks.as_mut(), device_valid_chunks.as_mut())
+                {
+                    tokens.push(device_sequence.tokens.slice_dim(1, 0..actual_slots));
+                    valid.push(device_sequence.valid.slice_dim(1, 0..actual_slots));
+                }
+
+                if actual_steps > 0 {
+                    let last_step = &chunk_steps[actual_steps - 1];
+                    next_query_embeds = Some(
+                        last_step
+                            .token_embeds
+                            .clone()
+                            .slice_dim(1, 0..last_actual_new_tokens),
+                    );
+                }
+            }
+
+            let frame_count = frame_tokens.first().map(Vec::len).unwrap_or(0);
+            num_gazing_each_frame.push(frame_count);
+            let frame_offset = (output_frame_idx * self.num_vision_tokens_each_frame) as i64;
+            for batch_idx in 0..batch {
+                for (local_idx, padded) in frame_padded[batch_idx].iter().copied().enumerate() {
+                    if padded {
+                        state.prefix_attention_mask[batch_idx][generation_prefix_len + local_idx] =
+                            0;
+                    }
+                }
+                gazing_pos[batch_idx].extend(
+                    frame_tokens[batch_idx]
+                        .iter()
+                        .map(|token| token + frame_offset),
+                );
+                if_padded_gazing[batch_idx].extend(frame_padded[batch_idx].iter().copied());
+                confidences[batch_idx].extend(frame_confidences[batch_idx].iter().copied());
+            }
+            state.pending_position_indices = last_generated_indices;
+            state.pending_query_embeds = next_query_embeds;
+            state.record_completed_frame(vision_tokens + frame_count);
+            state.processed_frames = state.processed_frames.saturating_add(1);
+        }
+
+        if let Some(state) = cache.state.as_mut() {
+            state.past_conv_values = Some(new_past_conv_values);
+        }
+
+        let generated = AutoGazeGenerateOutput {
+            gazing_pos,
+            num_gazing_each_frame,
+            if_padded_gazing,
+            confidences,
+        };
+        let device_tokens = match (device_token_chunks, device_valid_chunks) {
+            (Some(tokens), Some(valid)) if !tokens.is_empty() => Some(AutoGazeDeviceTokens {
+                tokens: Tensor::cat(tokens, 1),
+                valid: Tensor::cat(valid, 1),
+            }),
+            _ => None,
+        };
+
+        Ok(AutoGazeDeviceGenerateOutput {
+            generated,
+            device_tokens,
+        })
+    }
+
+    async fn generate_streaming_cached_device_terminal_async_with_coverage_stop(
+        &self,
+        video: Tensor<B, 5>,
+        cache: &mut AutoGazeStreamingCache<B>,
+        max_gaze_tokens_each_frame: usize,
+        task_loss_requirement: Option<f32>,
+        coverage_stop_ratio: Option<f64>,
+        decode_chunk_size: usize,
+    ) -> Result<AutoGazeGenerateOutput, ExecutionError> {
+        self.generate_streaming_cached_device_terminal_output_async_with_coverage_stop(
+            video,
+            cache,
+            DeviceChunkDecodeOptions {
+                max_gaze_tokens_each_frame,
+                task_loss_requirement,
+                coverage_stop_ratio,
+                decode_chunk_size,
+                collect_device_tokens: false,
+            },
+        )
+        .await
+        .map(|output| output.generated)
+    }
+
+    async fn generate_streaming_cached_device_terminal_output_async_with_coverage_stop(
+        &self,
+        video: Tensor<B, 5>,
+        cache: &mut AutoGazeStreamingCache<B>,
+        options: DeviceChunkDecodeOptions,
+    ) -> Result<AutoGazeDeviceGenerateOutput<B>, ExecutionError> {
+        let video = self.resize_video(video);
+        let [batch, frames, _channels, _height, _width] = video.shape().dims::<5>();
+        let max_tokens = self.effective_max_gaze_tokens(
+            options.max_gaze_tokens_each_frame,
+            options.coverage_stop_ratio,
+        );
+        let horizon_frames = cache.horizon_frames.max(1);
+        if cache
+            .state
+            .as_ref()
+            .map(|state| !state.matches_runtime(batch, max_tokens, horizon_frames, frames))
+            .unwrap_or(false)
+        {
+            cache.state = None;
+        }
+
+        let past_conv_values = cache
+            .state
+            .as_mut()
+            .and_then(|state| state.past_conv_values.take());
+        let (video_embeds, new_past_conv_values) = self.embed_video(video, true, past_conv_values);
+        let [batch, frames, vision_tokens, dim] = video_embeds.shape().dims::<4>();
+        let device = video_embeds.device();
+        let decode_chunk_size = options.decode_chunk_size.max(1);
+
+        let mut gazing_pos = vec![Vec::<i64>::new(); batch];
+        let mut if_padded_gazing = vec![Vec::<bool>::new(); batch];
+        let mut confidences = vec![Vec::<f32>::new(); batch];
+        let mut num_gazing_each_frame = Vec::with_capacity(frames);
+        let mut device_token_chunks = options.collect_device_tokens.then(Vec::new);
+        let mut device_valid_chunks = options.collect_device_tokens.then(Vec::new);
+        let coverage_stop_ratio = options.coverage_stop_ratio;
+
+        for output_frame_idx in 0..frames {
+            let should_reset = cache
+                .state
+                .as_ref()
+                .map(|state| !state.matches(batch, vision_tokens, dim, max_tokens, horizon_frames))
+                .unwrap_or(true);
+            if should_reset {
+                cache.state = None;
+            }
+            let state = cache.state.get_or_insert_with(|| {
+                AutoGazeStreamingCacheState::new(
+                    batch,
+                    vision_tokens,
+                    dim,
+                    max_tokens,
+                    horizon_frames,
+                )
+            });
+
+            state.commit_pending_position_ids();
+            state.clear_pending_position_indices();
+            state.compact_for_next_frame(vision_tokens + max_tokens, horizon_frames);
+
+            let frame_embed = video_embeds
+                .clone()
+                .slice_dim(1, output_frame_idx..(output_frame_idx + 1))
+                .reshape([batch, vision_tokens, dim]);
+            state.append_frame_positions(vision_tokens);
+            let initial_query_embeds = if let Some(pending) = state.pending_query_embeds.take() {
+                Tensor::cat(vec![pending, frame_embed], 1)
+            } else {
+                frame_embed
+            };
+
+            let mut frame_tokens = vec![Vec::<i64>::new(); batch];
+            let mut frame_padded = vec![Vec::<bool>::new(); batch];
+            let mut frame_confidences = vec![Vec::<f32>::new(); batch];
+            let mut finished = vec![false; batch];
+            let mut coverage_trackers =
+                generation_coverage_trackers(batch, coverage_stop_ratio, &self.scale_layouts);
+            let mut is_first_token = true;
+            let generation_prefix_len = state
+                .prefix_attention_mask
+                .first()
+                .map(Vec::len)
+                .unwrap_or(0);
+            let generation_tail_positions =
+                generation_tail_positions(&state.prefix_position_ids, self.num_multi_token_pred);
+            let mut last_generated_indices = vec![Vec::<usize>::new(); batch];
+            let mut next_query_embeds = Some(initial_query_embeds);
+
+            let mut disallowed = disallowed_token_mask::<B>(
+                &frame_tokens,
+                self.eos_token_id,
+                self.gaze_decoder.vocab_size,
+                &device,
+            );
+            let mut device_finished = finished_token_mask::<B>(&finished, &device);
+            let mut token_steps = Vec::new();
+            let mut valid_steps = Vec::new();
+            let mut decode_steps = Vec::new();
+
+            while token_steps.len() * self.num_multi_token_pred < max_tokens {
+                let current_len = token_steps.len() * self.num_multi_token_pred;
+                let remaining_slots = max_tokens.saturating_sub(current_len);
+                let requested_steps = decode_chunk_size
+                    .min(remaining_slots.div_ceil(self.num_multi_token_pred.max(1)))
+                    .max(1);
+                let mut query_embeds = next_query_embeds.take();
+                let steps_before_chunk = decode_steps.len();
+
+                for step_idx in 0..requested_steps {
+                    let Some(query) = query_embeds.take() else {
+                        break;
+                    };
+                    let query_len = query.shape().dims::<3>()[1];
+                    let query_start = cached_sequence_len(&state.past_key_values);
+                    let key_len = query_start + query_len;
+                    let attention_mask = attention_mask_tensor_or_none::<B>(
+                        &state.prefix_attention_mask,
+                        key_len,
+                        &device,
+                    );
+                    let position_ids = position_ids_slice_tensor_optimized::<B>(
+                        &state.prefix_position_ids,
+                        query_start,
+                        query_len,
+                        &device,
+                    );
+                    let outputs = self.gaze_decoder.forward_cached(
+                        query,
+                        attention_mask,
+                        position_ids,
+                        state.past_key_values.take(),
+                        state.cache_capacity,
+                    );
+                    state.past_key_values = Some(outputs.past_key_values);
+                    let last_logits = outputs
+                        .logits
+                        .slice_dim(1, query_len.saturating_sub(1)..query_len)
+                        .reshape([
+                            batch,
+                            self.num_multi_token_pred,
+                            self.gaze_decoder.vocab_size,
+                        ]);
+                    let last_task = outputs
+                        .task_loss_prediction
+                        .slice_dim(1, query_len.saturating_sub(1)..query_len)
+                        .reshape([batch, self.num_multi_token_pred]);
+                    let selected = device_select_multi_tokens(
+                        last_logits,
+                        last_task,
+                        DeviceGreedySelectionState {
+                            disallowed,
+                            finished: device_finished,
+                            current_len: current_len + step_idx * self.num_multi_token_pred,
+                        },
+                        DeviceGreedySelectionConfig {
+                            eos_token_id: self.eos_token_id,
+                            max_tokens,
+                            task_loss_stop: TaskLossStop {
+                                requirement: options.task_loss_requirement,
+                                is_first_token,
+                            },
+                        },
+                    );
+                    let next_device_finished = device_finished_after_selection_block(
+                        selected.finished,
+                        selected.valid.clone(),
+                    );
+                    let token_embeds = self
+                        .gaze_decoder
+                        .model
+                        .embed_tokens
+                        .forward(selected.tokens.clone());
+                    let generated_indices = append_generated_position_slots(
+                        &mut state.prefix_attention_mask,
+                        &mut state.prefix_position_ids,
+                        &generation_tail_positions,
+                        self.num_multi_token_pred,
+                    );
+                    token_steps.push(selected.tokens);
+                    valid_steps.push(selected.valid);
+                    disallowed = selected.disallowed;
+                    device_finished = next_device_finished;
+                    query_embeds = Some(token_embeds.clone());
+                    decode_steps.push(DeviceGreedyChunkStep {
+                        token_embeds,
+                        generated_indices,
+                    });
+                    is_first_token = false;
+                }
+
+                if decode_steps.len() == steps_before_chunk {
+                    break;
+                }
+                next_query_embeds = query_embeds;
+            }
+
+            let generated_slots = decode_steps.len() * self.num_multi_token_pred;
+            let device_sequence = options
+                .collect_device_tokens
+                .then(|| DeviceGreedyChunkTensors {
+                    tokens: Tensor::cat(token_steps.clone(), 1),
+                    valid: Tensor::cat(valid_steps.clone(), 1),
+                });
+            if generated_slots > 0 {
+                let packed = pack_device_greedy_chunk(token_steps, valid_steps);
+                let (selected_tokens, selected_valid, selected_confidences) =
+                    read_device_greedy_chunk_async(packed, generated_slots, self.eos_token_id)
+                        .await?;
+
+                let mut actual_slots = 0usize;
+                let mut actual_steps = 0usize;
+                let mut last_actual_new_tokens = 0usize;
+                for (step_idx, decode_step) in decode_steps.iter().enumerate() {
+                    if frame_tokens.first().map(Vec::len).unwrap_or(0) >= max_tokens
+                        || finished.iter().all(|done| *done)
+                    {
+                        break;
+                    }
+                    let new_tokens = self
+                        .num_multi_token_pred
+                        .min(max_tokens - frame_tokens.first().map(Vec::len).unwrap_or(0));
+                    let slot_offset = step_idx * self.num_multi_token_pred;
+                    last_generated_indices = decode_step
+                        .generated_indices
+                        .iter()
+                        .map(|indices| indices.iter().copied().take(new_tokens).collect())
+                        .collect();
+
+                    let mut finish_after_step = vec![false; batch];
+                    for batch_idx in 0..batch {
+                        let was_finished = finished[batch_idx];
+                        for local_idx in 0..new_tokens {
+                            let slot = slot_offset + local_idx;
+                            let (token, valid, confidence) = if was_finished {
+                                (self.eos_token_id, false, 0.0)
+                            } else {
+                                (
+                                    selected_tokens[batch_idx][slot],
+                                    selected_valid[batch_idx][slot],
+                                    selected_confidences[batch_idx][slot],
+                                )
+                            };
+                            frame_tokens[batch_idx].push(token);
+                            frame_padded[batch_idx].push(!valid);
+                            frame_confidences[batch_idx].push(confidence);
+                            let coverage_stop = valid
+                                && observe_generation_coverage(
+                                    &mut coverage_trackers,
+                                    batch_idx,
+                                    token,
+                                );
+                            if !valid || coverage_stop {
+                                finish_after_step[batch_idx] = true;
+                            }
+                        }
+                    }
+                    for (done, finish_after_step) in finished.iter_mut().zip(finish_after_step) {
+                        *done |= finish_after_step;
+                    }
+
+                    actual_slots += new_tokens;
+                    actual_steps = step_idx + 1;
+                    last_actual_new_tokens = new_tokens;
+                }
+
+                if actual_slots == 0 {
+                    truncate_generation_rows(
+                        &mut state.prefix_attention_mask,
+                        &mut state.prefix_position_ids,
+                        &mut last_generated_indices,
+                        generated_slots,
+                    );
+                    truncate_past_key_values_tail(&mut state.past_key_values, generated_slots);
+                } else if generated_slots > actual_slots {
+                    truncate_generation_rows(
+                        &mut state.prefix_attention_mask,
+                        &mut state.prefix_position_ids,
+                        &mut last_generated_indices,
+                        generated_slots - actual_slots,
+                    );
+                    truncate_past_key_values_tail(
+                        &mut state.past_key_values,
+                        generated_slots - actual_slots,
+                    );
+                }
+
+                if let Some(device_sequence) = device_sequence
+                    && let (Some(tokens), Some(valid)) =
+                        (device_token_chunks.as_mut(), device_valid_chunks.as_mut())
+                {
+                    tokens.push(device_sequence.tokens.slice_dim(1, 0..actual_slots));
+                    valid.push(device_sequence.valid.slice_dim(1, 0..actual_slots));
+                }
+
+                if actual_steps > 0 {
+                    let last_step = &decode_steps[actual_steps - 1];
+                    next_query_embeds = Some(
+                        last_step
+                            .token_embeds
+                            .clone()
+                            .slice_dim(1, 0..last_actual_new_tokens),
+                    );
+                }
+            }
+
+            let frame_count = frame_tokens.first().map(Vec::len).unwrap_or(0);
+            num_gazing_each_frame.push(frame_count);
+            let frame_offset = (output_frame_idx * self.num_vision_tokens_each_frame) as i64;
+            for batch_idx in 0..batch {
+                for (local_idx, padded) in frame_padded[batch_idx].iter().copied().enumerate() {
+                    if padded {
+                        state.prefix_attention_mask[batch_idx][generation_prefix_len + local_idx] =
+                            0;
+                    }
+                }
+                gazing_pos[batch_idx].extend(
+                    frame_tokens[batch_idx]
+                        .iter()
+                        .map(|token| token + frame_offset),
+                );
+                if_padded_gazing[batch_idx].extend(frame_padded[batch_idx].iter().copied());
+                confidences[batch_idx].extend(frame_confidences[batch_idx].iter().copied());
+            }
+            state.pending_position_indices = last_generated_indices;
+            state.pending_query_embeds = next_query_embeds;
+            state.record_completed_frame(vision_tokens + frame_count);
+            state.processed_frames = state.processed_frames.saturating_add(1);
+        }
+
+        if let Some(state) = cache.state.as_mut() {
+            state.past_conv_values = Some(new_past_conv_values);
+        }
+
+        let generated = AutoGazeGenerateOutput {
+            gazing_pos,
+            num_gazing_each_frame,
+            if_padded_gazing,
+            confidences,
+        };
+        let device_tokens = match (device_token_chunks, device_valid_chunks) {
+            (Some(tokens), Some(valid)) if !tokens.is_empty() => Some(AutoGazeDeviceTokens {
+                tokens: Tensor::cat(tokens, 1),
+                valid: Tensor::cat(valid, 1),
+            }),
+            _ => None,
+        };
+
+        Ok(AutoGazeDeviceGenerateOutput {
+            generated,
+            device_tokens,
+        })
+    }
+
     pub async fn generate_uncached_async(
         &self,
         video: Tensor<B, 5>,
@@ -2705,6 +3672,48 @@ impl<B: Backend> NativeAutoGazeModel<B> {
                 max_gaze_tokens_each_frame,
                 task_loss_requirement,
                 coverage_stop_ratio,
+            )
+            .await
+    }
+
+    pub async fn generate_streaming_with_decode_strategy_async(
+        &self,
+        video: Tensor<B, 5>,
+        cache: &mut AutoGazeStreamingCache<B>,
+        max_gaze_tokens_each_frame: usize,
+        task_loss_requirement: Option<f32>,
+        coverage_stop_ratio: Option<f64>,
+        decode_strategy: AutoGazeDecodeStrategy,
+    ) -> Result<AutoGazeGenerateOutput, ExecutionError> {
+        self.gazing_model
+            .generate_streaming_cached_async_with_decode_strategy(
+                video,
+                cache,
+                max_gaze_tokens_each_frame,
+                task_loss_requirement,
+                coverage_stop_ratio,
+                decode_strategy,
+            )
+            .await
+    }
+
+    pub async fn generate_streaming_device_output_with_decode_strategy_async(
+        &self,
+        video: Tensor<B, 5>,
+        cache: &mut AutoGazeStreamingCache<B>,
+        max_gaze_tokens_each_frame: usize,
+        task_loss_requirement: Option<f32>,
+        coverage_stop_ratio: Option<f64>,
+        decode_strategy: AutoGazeDecodeStrategy,
+    ) -> Result<AutoGazeDeviceGenerateOutput<B>, ExecutionError> {
+        self.gazing_model
+            .generate_streaming_cached_device_output_async_with_decode_strategy(
+                video,
+                cache,
+                max_gaze_tokens_each_frame,
+                task_loss_requirement,
+                coverage_stop_ratio,
+                decode_strategy,
             )
             .await
     }
@@ -3332,6 +4341,65 @@ fn commit_pending_position_ids_with_offsets(
     }
 }
 
+fn append_generated_position_slots(
+    mask_rows: &mut [Vec<i64>],
+    position_rows: &mut [Vec<i64>],
+    generation_tail_positions: &[Vec<i64>],
+    new_tokens: usize,
+) -> Vec<Vec<usize>> {
+    let mut generated_indices = vec![Vec::new(); mask_rows.len()];
+    for batch_idx in 0..mask_rows.len() {
+        let tail = generation_tail_positions
+            .get(batch_idx)
+            .filter(|tail| !tail.is_empty());
+        for local_idx in 0..new_tokens {
+            generated_indices[batch_idx].push(mask_rows[batch_idx].len());
+            mask_rows[batch_idx].push(1);
+            let position = tail
+                .map(|tail| tail[local_idx % tail.len()])
+                .unwrap_or(local_idx as i64);
+            position_rows[batch_idx].push(position);
+        }
+    }
+    generated_indices
+}
+
+fn truncate_generation_rows(
+    mask_rows: &mut [Vec<i64>],
+    position_rows: &mut [Vec<i64>],
+    pending_rows: &mut [Vec<usize>],
+    drop: usize,
+) {
+    if drop == 0 {
+        return;
+    }
+    for ((mask_row, position_row), pending) in mask_rows
+        .iter_mut()
+        .zip(position_rows.iter_mut())
+        .zip(pending_rows.iter_mut())
+    {
+        let new_len = mask_row.len().saturating_sub(drop);
+        mask_row.truncate(new_len);
+        position_row.truncate(new_len);
+        pending.retain(|idx| *idx < new_len);
+    }
+}
+
+fn truncate_past_key_values_tail<B: Backend>(
+    past_key_values: &mut Option<AutoGazePastKeyValues<B>>,
+    drop: usize,
+) {
+    if drop == 0 {
+        return;
+    }
+    let Some(values) = past_key_values.as_mut() else {
+        return;
+    };
+    for past in values {
+        past.len = past.len.saturating_sub(drop);
+    }
+}
+
 fn next_valid_position_with_offset(mask_row: &[i64], position_offset: i64) -> i64 {
     let valid_count = mask_row.iter().filter(|mask| **mask != 0).count() as i64;
     position_offset.saturating_add(valid_count)
@@ -3388,6 +4456,172 @@ async fn greedy_select_multi_tokens_async<B: Backend>(
         greedy_select_multi_tokens_from_packed_data(data, batch, num_multi, vocab, context)
             .unwrap_or_else(|| GreedySelectionBuilder::new(batch).finish(eos_token_id)),
     )
+}
+
+fn device_select_multi_tokens<B: Backend>(
+    logits: Tensor<B, 3>,
+    task_loss: Tensor<B, 2>,
+    state: DeviceGreedySelectionState<B>,
+    config: DeviceGreedySelectionConfig,
+) -> DeviceGreedySelection<B> {
+    let [batch, num_multi, vocab] = logits.shape().dims::<3>();
+    let device = logits.device();
+    let vocab_range = Tensor::<B, 1, Int>::arange(0..vocab as i64, &device)
+        .reshape([1, vocab])
+        .repeat_dim(0, batch);
+    let eos_tokens = Tensor::<B, 2, Int>::full([batch, 1], config.eos_token_id, &device);
+    let false_column = bool_tensor_from_values::<B, 2>(vec![false; batch], [batch, 1], &device);
+    let mut disallowed = state.disallowed;
+    let mut finished = state.finished;
+    let mut token_columns = Vec::with_capacity(num_multi);
+    let mut valid_columns = Vec::with_capacity(num_multi);
+
+    for multi_idx in 0..num_multi {
+        let capacity_active = state.current_len.saturating_add(multi_idx) < config.max_tokens;
+        let active =
+            bool_tensor_from_values::<B, 2>(vec![capacity_active; batch], [batch, 1], &device)
+                .bool_and(finished.clone().bool_not());
+        let logits_step = logits
+            .clone()
+            .slice_dim(1, multi_idx..(multi_idx + 1))
+            .reshape([batch, vocab]);
+        let inactive_or_disallowed = disallowed
+            .clone()
+            .bool_or(active.clone().bool_not().repeat_dim(1, vocab));
+        let masked_logits = logits_step.mask_fill(inactive_or_disallowed, -1.0e30_f32);
+        let (best_scores, best_indices) = masked_logits.clone().max_dim_with_indices(1);
+        let has_score = best_scores.clone().greater_elem(-1.0e29_f32);
+        let task_stop = if let Some(threshold) = config.task_loss_stop.requirement {
+            if config.task_loss_stop.is_first_token && multi_idx == 0 {
+                false_column.clone()
+            } else {
+                task_loss
+                    .clone()
+                    .slice_dim(1, multi_idx..(multi_idx + 1))
+                    .lower_equal_elem(threshold)
+                    .bool_and(active.clone())
+                    .bool_and(has_score.clone())
+            }
+        } else {
+            false_column.clone()
+        };
+        let valid = active
+            .clone()
+            .bool_and(has_score.clone())
+            .bool_and(task_stop.clone().bool_not());
+        let tokens = best_indices
+            .clone()
+            .mask_where(valid.clone().bool_not(), eos_tokens.clone());
+        let selected_for_disallow = best_indices.repeat_dim(1, vocab).equal(vocab_range.clone());
+        disallowed = disallowed.bool_or(
+            selected_for_disallow.bool_and(
+                active
+                    .clone()
+                    .bool_and(has_score.clone())
+                    .repeat_dim(1, vocab),
+            ),
+        );
+        finished = finished.bool_or(has_score.clone().bool_not().bool_and(active));
+
+        token_columns.push(tokens);
+        valid_columns.push(valid);
+    }
+
+    DeviceGreedySelection {
+        tokens: Tensor::cat(token_columns, 1),
+        valid: Tensor::cat(valid_columns, 1),
+        finished,
+        disallowed,
+    }
+}
+
+fn device_finished_after_selection_block<B: Backend>(
+    finished: Tensor<B, 2, Bool>,
+    valid: Tensor<B, 2, Bool>,
+) -> Tensor<B, 2, Bool> {
+    let invalid_selected = valid.bool_not().float().sum_dim(1).greater_elem(0.0_f32);
+    finished.bool_or(invalid_selected)
+}
+
+fn pack_device_greedy_chunk<B: Backend>(
+    token_steps: Vec<Tensor<B, 2, Int>>,
+    valid_steps: Vec<Tensor<B, 2, Bool>>,
+) -> Tensor<B, 2> {
+    let tokens = Tensor::cat(token_steps, 1).float();
+    let valid = Tensor::cat(valid_steps, 1).float();
+    Tensor::cat(vec![tokens, valid], 1)
+}
+
+async fn read_device_greedy_chunk_async<B: Backend>(
+    packed: Tensor<B, 2>,
+    slots: usize,
+    eos_token_id: i64,
+) -> Result<GreedyTokenSelection, ExecutionError> {
+    let batch = packed.shape().dims::<2>()[0];
+    let data = packed.into_data_async().await?;
+    Ok(
+        device_greedy_chunk_from_packed_data(data, batch, slots, eos_token_id)
+            .unwrap_or_else(|| GreedySelectionBuilder::new(batch).finish(eos_token_id)),
+    )
+}
+
+fn device_greedy_chunk_from_packed_data(
+    data: TensorData,
+    batch: usize,
+    slots: usize,
+    eos_token_id: i64,
+) -> Option<GreedyTokenSelection> {
+    let values = data.to_vec::<f32>().ok()?;
+    let row_stride = slots.checked_mul(2)?;
+    if values.len() < batch.saturating_mul(row_stride) {
+        return None;
+    }
+
+    let mut tokens = vec![vec![eos_token_id; slots]; batch];
+    let mut valid = vec![vec![false; slots]; batch];
+    let mut confidences = vec![vec![0.0; slots]; batch];
+    for batch_idx in 0..batch {
+        let row = batch_idx * row_stride;
+        for slot in 0..slots {
+            tokens[batch_idx][slot] = values[row + slot].round() as i64;
+            valid[batch_idx][slot] = values[row + slots + slot] > 0.5;
+            confidences[batch_idx][slot] = if valid[batch_idx][slot] { 1.0 } else { 0.0 };
+        }
+    }
+    Some((tokens, valid, confidences))
+}
+
+fn disallowed_token_mask<B: Backend>(
+    prior_tokens: &[Vec<i64>],
+    eos_token_id: i64,
+    vocab: usize,
+    device: &B::Device,
+) -> Tensor<B, 2, Bool> {
+    let batch = prior_tokens.len().max(1);
+    let mut values = vec![false; batch * vocab];
+    for (batch_idx, row) in prior_tokens.iter().enumerate() {
+        for token in row.iter().copied().chain(std::iter::once(eos_token_id)) {
+            if token >= 0 {
+                let token = token as usize;
+                if token < vocab {
+                    values[batch_idx * vocab + token] = true;
+                }
+            }
+        }
+    }
+    bool_tensor_from_values(values, [batch, vocab], device)
+}
+
+fn finished_token_mask<B: Backend>(finished: &[bool], device: &B::Device) -> Tensor<B, 2, Bool> {
+    bool_tensor_from_values(finished.to_vec(), [finished.len().max(1), 1], device)
+}
+
+fn bool_tensor_from_values<B: Backend, const D: usize>(
+    values: Vec<bool>,
+    shape: [usize; D],
+    device: &B::Device,
+) -> Tensor<B, D, Bool> {
+    Tensor::<B, D, Bool>::from_bool(TensorData::new(values, shape), device)
 }
 
 fn pack_greedy_logits_task<B: Backend>(
@@ -3832,7 +5066,7 @@ fn generated_frame_fixations_from_layouts(
     frame_idx: usize,
     cursor: usize,
     frame_len: usize,
-    scale_layouts: &[ScaleTokenLayout],
+    scale_layouts: &[AutoGazeScaleTokenLayout],
 ) -> GeneratedFrameFixations {
     let tokens = generated.gazing_pos.get(batch_idx);
     let padded = generated.if_padded_gazing.get(batch_idx);
@@ -3944,14 +5178,14 @@ fn generated_scale_token_masks(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ScaleTokenLayout {
-    token_count: usize,
-    grid: usize,
+pub struct AutoGazeScaleTokenLayout {
+    pub token_count: usize,
+    pub grid: usize,
 }
 
 #[derive(Clone, Debug)]
 struct GenerationCoverageTracker {
-    scale_layouts: Vec<ScaleTokenLayout>,
+    scale_layouts: Vec<AutoGazeScaleTokenLayout>,
     grid: usize,
     covered: Vec<bool>,
     covered_count: usize,
@@ -3959,7 +5193,7 @@ struct GenerationCoverageTracker {
 }
 
 impl GenerationCoverageTracker {
-    fn new(scale_layouts: &[ScaleTokenLayout], stop_ratio: f64) -> Option<Self> {
+    fn new(scale_layouts: &[AutoGazeScaleTokenLayout], stop_ratio: f64) -> Option<Self> {
         if !stop_ratio.is_finite() || stop_ratio <= 0.0 {
             return None;
         }
@@ -4012,7 +5246,7 @@ impl GenerationCoverageTracker {
 fn generation_coverage_trackers(
     batch: usize,
     stop_ratio: Option<f64>,
-    scale_layouts: &[ScaleTokenLayout],
+    scale_layouts: &[AutoGazeScaleTokenLayout],
 ) -> Option<Vec<GenerationCoverageTracker>> {
     let tracker = GenerationCoverageTracker::new(scale_layouts, stop_ratio?)?;
     Some(vec![tracker; batch])
@@ -4033,7 +5267,7 @@ fn observe_generation_coverage(
 fn effective_generation_max_tokens(
     configured_max_tokens: usize,
     coverage_stop_ratio: Option<f64>,
-    scale_layouts: &[ScaleTokenLayout],
+    scale_layouts: &[AutoGazeScaleTokenLayout],
     num_multi_token_pred: usize,
 ) -> usize {
     let configured_max_tokens = configured_max_tokens.max(1);
@@ -4060,13 +5294,13 @@ fn effective_generation_max_tokens(
 }
 
 fn normalize_scale_layouts(
-    mut layouts: Vec<ScaleTokenLayout>,
+    mut layouts: Vec<AutoGazeScaleTokenLayout>,
     fallback_token_count: usize,
-) -> Vec<ScaleTokenLayout> {
+) -> Vec<AutoGazeScaleTokenLayout> {
     layouts.retain(|layout| layout.token_count > 0);
     if layouts.is_empty() {
         let token_count = fallback_token_count.max(1);
-        return vec![ScaleTokenLayout {
+        return vec![AutoGazeScaleTokenLayout {
             token_count,
             grid: square_grid(token_count),
         }];
@@ -4078,7 +5312,7 @@ fn normalize_scale_layouts(
     layouts
 }
 
-fn coverage_grid_for_layouts(layouts: &[ScaleTokenLayout]) -> usize {
+fn coverage_grid_for_layouts(layouts: &[AutoGazeScaleTokenLayout]) -> usize {
     const MAX_COVERAGE_GRID: usize = 256;
     let max_grid = layouts.iter().map(|layout| layout.grid).max().unwrap_or(1);
     let mut grid = 1usize;
@@ -4107,7 +5341,10 @@ fn gcd(mut left: usize, mut right: usize) -> usize {
     left.max(1)
 }
 
-fn scale_token_index(token: usize, scale_layouts: &[ScaleTokenLayout]) -> Option<(usize, usize)> {
+fn scale_token_index(
+    token: usize,
+    scale_layouts: &[AutoGazeScaleTokenLayout],
+) -> Option<(usize, usize)> {
     let mut offset = 0usize;
     for (scale_idx, layout) in scale_layouts.iter().enumerate() {
         if token < offset + layout.token_count {
@@ -4120,7 +5357,7 @@ fn scale_token_index(token: usize, scale_layouts: &[ScaleTokenLayout]) -> Option
 
 fn token_to_fixation_point(
     token: usize,
-    scale_layouts: &[ScaleTokenLayout],
+    scale_layouts: &[AutoGazeScaleTokenLayout],
     confidence: f32,
 ) -> Option<FixationPoint> {
     let (scale_idx, local) = scale_token_index(token, scale_layouts)?;
@@ -4135,11 +5372,11 @@ fn token_to_fixation_point(
     ))
 }
 
-fn scale_token_layouts(config: &AutoGazeConfig) -> Vec<ScaleTokenLayout> {
+pub fn scale_token_layouts(config: &AutoGazeConfig) -> Vec<AutoGazeScaleTokenLayout> {
     let scales = config.scale_values();
     if scales.is_empty() {
         let token_count = config.num_vision_tokens_each_frame.max(1);
-        return vec![ScaleTokenLayout {
+        return vec![AutoGazeScaleTokenLayout {
             token_count,
             grid: square_grid(token_count),
         }];
@@ -4154,7 +5391,7 @@ fn scale_token_layouts(config: &AutoGazeConfig) -> Vec<ScaleTokenLayout> {
         .iter()
         .map(|scale| {
             let grid = (scale / patch_size).max(1);
-            ScaleTokenLayout {
+            AutoGazeScaleTokenLayout {
                 token_count: grid * grid,
                 grid,
             }
@@ -4184,7 +5421,7 @@ fn scale_token_layouts(config: &AutoGazeConfig) -> Vec<ScaleTokenLayout> {
     }
     counts
         .into_iter()
-        .map(|token_count| ScaleTokenLayout {
+        .map(|token_count| AutoGazeScaleTokenLayout {
             token_count,
             grid: square_grid(token_count),
         })
@@ -4215,19 +5452,19 @@ mod tests {
         assert_eq!(
             scale_layouts,
             vec![
-                ScaleTokenLayout {
+                AutoGazeScaleTokenLayout {
                     token_count: 4,
                     grid: 2
                 },
-                ScaleTokenLayout {
+                AutoGazeScaleTokenLayout {
                     token_count: 16,
                     grid: 4
                 },
-                ScaleTokenLayout {
+                AutoGazeScaleTokenLayout {
                     token_count: 49,
                     grid: 7
                 },
-                ScaleTokenLayout {
+                AutoGazeScaleTokenLayout {
                     token_count: 196,
                     grid: 14
                 }
@@ -4468,6 +5705,77 @@ mod tests {
 
     #[cfg(feature = "ndarray")]
     #[test]
+    fn streaming_device_chunked_decode_matches_host_async_generation() {
+        type B = burn::backend::NdArray<f32>;
+        let device = Default::default();
+        let config = tiny_cache_test_config();
+        let mut mapper = DeterministicParamMapper { cursor: 0 };
+        let model = NativeAutoGazeModel::<B>::new(&config, &device).map(&mut mapper);
+        let frames = 2;
+        let values = (0..(frames * 3 * 16 * 16))
+            .map(|idx| ((idx % 251) as f32 / 125.0) - 1.0)
+            .collect::<Vec<_>>();
+        let video =
+            Tensor::<B, 5>::from_data(TensorData::new(values, [1, frames, 3, 16, 16]), &device);
+
+        let mut host_cache = AutoGazeStreamingCache::new(frames);
+        let host =
+            futures_lite::future::block_on(model.generate_streaming_with_decode_strategy_async(
+                video.clone(),
+                &mut host_cache,
+                4,
+                None,
+                None,
+                AutoGazeDecodeStrategy::HostGreedy,
+            ))
+            .expect("host async generation");
+        for strategy in [
+            AutoGazeDecodeStrategy::DeviceGreedy { chunk_size: 2 },
+            AutoGazeDecodeStrategy::DeviceTerminalGreedy { chunk_size: 2 },
+        ] {
+            let mut device_cache = AutoGazeStreamingCache::new(frames);
+            let device = futures_lite::future::block_on(
+                model.generate_streaming_with_decode_strategy_async(
+                    video.clone(),
+                    &mut device_cache,
+                    4,
+                    None,
+                    None,
+                    strategy,
+                ),
+            )
+            .expect("device async generation");
+
+            assert_eq!(device.gazing_pos, host.gazing_pos, "{strategy:?}");
+            assert_eq!(
+                device.num_gazing_each_frame, host.num_gazing_each_frame,
+                "{strategy:?}"
+            );
+            assert_eq!(
+                device.if_padded_gazing, host.if_padded_gazing,
+                "{strategy:?}"
+            );
+            assert_eq!(device.confidences[0].len(), host.confidences[0].len());
+            for ((confidence, padded), host_confidence) in device.confidences[0]
+                .iter()
+                .zip(&device.if_padded_gazing[0])
+                .zip(&host.confidences[0])
+            {
+                if *padded {
+                    assert_eq!(*confidence, 0.0, "{strategy:?}");
+                } else {
+                    assert!(*confidence > 0.0, "{strategy:?}");
+                    assert!(
+                        *host_confidence > 0.0,
+                        "host should report positive confidence for valid token"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "ndarray")]
+    #[test]
     fn streaming_cache_rolls_past_horizon_without_resetting() {
         type B = burn::backend::NdArray<f32>;
         let device = Default::default();
@@ -4700,6 +6008,66 @@ mod tests {
         assert_eq!(selected.1, vec![vec![true, false, true]]);
         assert_eq!(selected.0, reference.0);
         assert_eq!(selected.1, reference.1);
+    }
+
+    #[cfg(feature = "ndarray")]
+    #[test]
+    fn device_greedy_selection_matches_host_selection_for_one_step() {
+        type B = burn::backend::NdArray<f32>;
+        let device = Default::default();
+        let scores = vec![
+            8.0, 1.0, 0.0, -1.0, -2.0, //
+            0.0, 9.0, 2.0, 1.0, -2.0, //
+            0.0, 9.0, 8.0, 1.0, -2.0,
+        ];
+        let task_losses = vec![1.0, 0.1, 1.0];
+        let logits = Tensor::<B, 3>::from_data(TensorData::new(scores.clone(), [1, 3, 5]), &device);
+        let task_loss =
+            Tensor::<B, 2>::from_data(TensorData::new(task_losses.clone(), [1, 3]), &device);
+        let context = GreedySelectionContext {
+            prior_tokens: &[Vec::new()],
+            finished: &[false],
+            eos_token_id: 4,
+            max_tokens: 3,
+            task_loss_stop: TaskLossStop {
+                requirement: Some(0.5),
+                is_first_token: true,
+            },
+        };
+        let reference = greedy_select_multi_tokens_from_data(scores, task_losses, 1, 3, 5, context);
+
+        let selected = device_select_multi_tokens(
+            logits,
+            task_loss,
+            DeviceGreedySelectionState {
+                disallowed: disallowed_token_mask::<B>(
+                    context.prior_tokens,
+                    context.eos_token_id,
+                    5,
+                    &device,
+                ),
+                finished: finished_token_mask::<B>(context.finished, &device),
+                current_len: 0,
+            },
+            DeviceGreedySelectionConfig {
+                eos_token_id: context.eos_token_id,
+                max_tokens: context.max_tokens,
+                task_loss_stop: context.task_loss_stop,
+            },
+        );
+        let packed = pack_device_greedy_chunk(vec![selected.tokens], vec![selected.valid]);
+        let actual = device_greedy_chunk_from_packed_data(packed.into_data(), 1, 3, 4)
+            .expect("device greedy chunk");
+
+        assert_eq!(actual.0, reference.0);
+        assert_eq!(actual.1, reference.1);
+        for (confidence, valid) in actual.2[0].iter().zip(&actual.1[0]) {
+            if *valid {
+                assert_eq!(*confidence, 1.0);
+            } else {
+                assert_eq!(*confidence, 0.0);
+            }
+        }
     }
 
     #[test]

@@ -26,20 +26,22 @@ use bevy::{
 };
 use bevy_burn::{BevyBurnBridgePlugin, BevyBurnHandle, BurnDevice};
 use burn::tensor::Tensor;
-#[cfg(target_arch = "wasm32")]
-use burn_autogaze::{AutoGazeConfig, AutoGazeLoadOptions, NativeAutoGazeModel};
 use burn_autogaze::{
-    AutoGazeGazeRatioStats, AutoGazeInferenceMode, AutoGazeInferenceSequencer,
-    AutoGazeMaskGeometryMode, AutoGazeMaskPlanStats, AutoGazeMaskVisualizationMode,
-    AutoGazePipeline, AutoGazePipelineOptions, AutoGazePreparedRun as CoreAutoGazePreparedRun,
-    AutoGazePsnrStats, AutoGazeReadoutRunOutput, AutoGazeRgbaClipShape, AutoGazeRgbaFrameClip,
-    AutoGazeRgbaFrameQueue, AutoGazeRgbaVisualizationBuffers, AutoGazeRgbaVisualizationOptions,
-    AutoGazeStreamingCache, AutoGazeTensorInterframePath, AutoGazeTensorVisualizationOptions,
+    AutoGazeConfig, AutoGazeDeviceReadoutRunOutput, AutoGazeDeviceTokens, AutoGazeGazeRatioStats,
+    AutoGazeInferenceMode, AutoGazeInferenceSequencer, AutoGazeMaskGeometryMode,
+    AutoGazeMaskPlanStats, AutoGazeMaskVisualizationMode, AutoGazePipeline,
+    AutoGazePipelineOptions, AutoGazePreparedRun as CoreAutoGazePreparedRun, AutoGazePsnrStats,
+    AutoGazeReadoutRunOutput, AutoGazeRgbaClipShape, AutoGazeRgbaFrameClip, AutoGazeRgbaFrameQueue,
+    AutoGazeRgbaVisualizationBuffers, AutoGazeRgbaVisualizationOptions, AutoGazeStreamingCache,
+    AutoGazeTensorInterframePath, AutoGazeTensorVisualizationOptions,
     AutoGazeTensorVisualizationState, AutoGazeVisualizationMode, AutoGazeVisualizationState,
-    FixationPoint, format_fps, format_gaze_ratio_percent, format_psnr_db, fps_from_millis,
-    prepare_rgba_clip_for_trace, resize_rgba_frame_to_dimensions, rgba_clip_to_tensor,
-    should_use_streaming_cache, video_frame_tensor,
+    FixationPoint, fixation_deduplicated_sparse_update_plan, fixation_effective_sparse_update_plan,
+    fixation_sparse_update_plan, format_fps, format_gaze_ratio_percent, format_psnr_db,
+    fps_from_millis, prepare_rgba_clip_for_trace, resize_rgba_frame_to_dimensions,
+    rgba_clip_to_tensor, should_use_streaming_cache, video_frame_tensor,
 };
+#[cfg(target_arch = "wasm32")]
+use burn_autogaze::{AutoGazeLoadOptions, NativeAutoGazeModel};
 #[cfg(test)]
 use burn_autogaze::{
     AutoGazeTaskLossOption, fixation_alpha_mask, fixation_scale_mask_rgba,
@@ -61,12 +63,13 @@ pub mod platform;
 use config::MODEL_INPUT_SIZE;
 pub use config::{
     BevyAutoGazeMode, BevyBurnAutoGazeConfig, BevyDisplayTransfer, BevyFrameSource,
-    DEFAULT_BEVY_MASK_GEOMETRY_MODE, DEFAULT_BEVY_MODE, DEFAULT_BEVY_REALTIME_FRAMES_PER_CLIP,
-    DEFAULT_BEVY_STREAMING_CACHE, DEFAULT_BEVY_TASK_LOSS_REQUIREMENT, DEFAULT_BEVY_TILED_TOP_K,
-    DEFAULT_BIRDS_BLEND_ALPHA, DEFAULT_BIRDS_FRAMES_PER_CLIP, DEFAULT_BIRDS_INFERENCE_HEIGHT,
-    DEFAULT_BIRDS_INFERENCE_WIDTH, DEFAULT_BIRDS_KEYFRAME_DURATION, DEFAULT_BIRDS_MAX_GAZE_TOKENS,
-    DEFAULT_BIRDS_TILE_BATCH_SIZE, DEFAULT_BIRDS_TOP_K, DEFAULT_CONFIG_URL,
-    DEFAULT_NATIVE_MODEL_DIR, DEFAULT_REALTIME_INFERENCE_WIDTH, DEFAULT_REALTIME_MAX_GAZE_TOKENS,
+    DEFAULT_BEVY_DECODE_CHUNK_SIZE, DEFAULT_BEVY_DECODE_STRATEGY, DEFAULT_BEVY_MASK_GEOMETRY_MODE,
+    DEFAULT_BEVY_MODE, DEFAULT_BEVY_REALTIME_FRAMES_PER_CLIP, DEFAULT_BEVY_STREAMING_CACHE,
+    DEFAULT_BEVY_TASK_LOSS_REQUIREMENT, DEFAULT_BEVY_TILED_TOP_K, DEFAULT_BIRDS_BLEND_ALPHA,
+    DEFAULT_BIRDS_FRAMES_PER_CLIP, DEFAULT_BIRDS_INFERENCE_HEIGHT, DEFAULT_BIRDS_INFERENCE_WIDTH,
+    DEFAULT_BIRDS_KEYFRAME_DURATION, DEFAULT_BIRDS_MAX_GAZE_TOKENS, DEFAULT_BIRDS_TILE_BATCH_SIZE,
+    DEFAULT_BIRDS_TOP_K, DEFAULT_CONFIG_URL, DEFAULT_NATIVE_MODEL_DIR,
+    DEFAULT_REALTIME_INFERENCE_WIDTH, DEFAULT_REALTIME_MAX_GAZE_TOKENS,
     DEFAULT_REALTIME_QUALITY_MAX_GAZE_TOKENS, DEFAULT_TILED_INFERENCE_WIDTH, DEFAULT_WEIGHTS_URL,
     ImplicitModeDefaults, default_frames_per_clip, default_inference_dimensions,
     default_max_gaze_tokens_each_frame, default_max_gaze_tokens_for_task_loss,
@@ -2003,6 +2006,7 @@ fn pipeline_options_from_config(config: &BevyBurnAutoGazeConfig) -> AutoGazePipe
         options =
             options.with_generation_coverage_stop_ratio(config.tensor_full_frame_update_min_ratio);
     }
+    options = options.with_decode_strategy(config.decode_strategy);
     options
 }
 
@@ -2069,6 +2073,8 @@ fn prepare_autogaze_run(
 
 struct FinishedReadout {
     points: Vec<Vec<Vec<FixationPoint>>>,
+    device_tokens: Option<AutoGazeDeviceTokens<AutoGazeBevyBackend>>,
+    model_config: Option<AutoGazeConfig>,
     frame_index: usize,
     model_frames: usize,
     model_ms: f64,
@@ -2085,6 +2091,27 @@ fn finished_readout_from_run_output(
 ) -> FinishedReadout {
     FinishedReadout {
         points: output.points,
+        device_tokens: None,
+        model_config: None,
+        frame_index: output.frame_index,
+        model_frames: output.model_frames,
+        model_ms,
+        effective_generation_budget,
+        generated_tokens: output.stats.generated_tokens,
+        active_generated_tokens: output.stats.active_generated_tokens,
+        padded_generated_tokens: output.stats.padded_generated_tokens,
+    }
+}
+
+fn finished_readout_from_device_run_output(
+    output: AutoGazeDeviceReadoutRunOutput<AutoGazeBevyBackend>,
+    model_ms: f64,
+    effective_generation_budget: usize,
+) -> FinishedReadout {
+    FinishedReadout {
+        points: output.points,
+        device_tokens: output.device_tokens,
+        model_config: None,
         frame_index: output.frame_index,
         model_frames: output.model_frames,
         model_ms,
@@ -2122,6 +2149,8 @@ async fn finish_autogaze_visualization(
     let height = clip.height();
     let FinishedReadout {
         points: batch_points,
+        device_tokens,
+        model_config,
         frame_index,
         model_frames,
         model_ms,
@@ -2139,7 +2168,7 @@ async fn finish_autogaze_visualization(
     let active_trace_points = points.iter().filter(|point| point.confidence > 0.0).count();
     let calculate_psnr = visualization_options.calculate_psnr;
     let visualize_start = timestamp_now();
-    let mut visualization = visualize_frame_rgba(
+    let mut visualization = visualize_frame_rgba_with_device_tokens(
         FrameVisualInput {
             rgba: clip.last_frame_rgba()?,
             width,
@@ -2147,6 +2176,8 @@ async fn finish_autogaze_visualization(
             tensor: prepared.visualization_tensor,
         },
         &points,
+        device_tokens.as_ref(),
+        model_config.as_ref(),
         visualization_options,
         &mut visualization_state,
         &device,
@@ -2251,22 +2282,39 @@ async fn run_autogaze_readout(
         .map_err(|_| "AutoGaze model lock was poisoned".to_string())?
         .clone();
     let effective_generation_budget = pipeline.effective_max_gaze_tokens_each_frame();
+    let model_config = pipeline.config().clone();
     let model_start = timestamp_now();
-    let run_output = if use_streaming_cache {
-        pipeline
-            .readout_prepared_run_async(trace_input, top_k, Some(streaming_state.cache_mut()))
+    let mut finished = if use_streaming_cache {
+        let run_output = pipeline
+            .device_readout_prepared_run_async(
+                trace_input,
+                top_k,
+                Some(streaming_state.cache_mut()),
+            )
             .await
+            .map_err(|err| {
+                format!("failed to read AutoGaze tensor data asynchronously: {err:?}")
+            })?;
+        finished_readout_from_device_run_output(
+            run_output,
+            elapsed_ms(model_start),
+            effective_generation_budget,
+        )
     } else {
-        pipeline
+        let run_output = pipeline
             .readout_prepared_run_async(trace_input, top_k, None)
             .await
-    }
-    .map_err(|err| format!("failed to read AutoGaze tensor data asynchronously: {err:?}"))?;
-    Ok(finished_readout_from_run_output(
-        run_output,
-        elapsed_ms(model_start),
-        effective_generation_budget,
-    ))
+            .map_err(|err| {
+                format!("failed to read AutoGaze tensor data asynchronously: {err:?}")
+            })?;
+        finished_readout_from_run_output(
+            run_output,
+            elapsed_ms(model_start),
+            effective_generation_budget,
+        )
+    };
+    finished.model_config = Some(model_config);
+    Ok(finished)
 }
 
 #[derive(Clone, Copy)]
@@ -2344,6 +2392,7 @@ struct FrameVisualInput<'a> {
     tensor: Option<Tensor<AutoGazeBevyBackend, 5>>,
 }
 
+#[cfg(test)]
 fn visualize_frame_rgba(
     input: FrameVisualInput<'_>,
     points: &[FixationPoint],
@@ -2351,8 +2400,36 @@ fn visualize_frame_rgba(
     visualization_state: &mut BevyVisualizationState,
     device: &AutoGazeBevyDevice,
 ) -> Result<Visualization, String> {
+    visualize_frame_rgba_with_device_tokens(
+        input,
+        points,
+        None,
+        None,
+        options,
+        visualization_state,
+        device,
+    )
+}
+
+fn visualize_frame_rgba_with_device_tokens(
+    input: FrameVisualInput<'_>,
+    points: &[FixationPoint],
+    device_tokens: Option<&AutoGazeDeviceTokens<AutoGazeBevyBackend>>,
+    model_config: Option<&AutoGazeConfig>,
+    options: VisualizationOptions,
+    visualization_state: &mut BevyVisualizationState,
+    device: &AutoGazeBevyDevice,
+) -> Result<Visualization, String> {
     if uses_tensor_display_transfer(options.display_transfer, input.width, input.height) {
-        visualize_rgba_tensor(input, points, options, visualization_state, device)
+        visualize_rgba_tensor(
+            input,
+            points,
+            device_tokens,
+            model_config,
+            options,
+            visualization_state,
+            device,
+        )
     } else {
         visualize_rgba_bytes(
             input.rgba,
@@ -2490,6 +2567,8 @@ async fn tensor_psnr_db(
 fn visualize_rgba_tensor(
     input: FrameVisualInput<'_>,
     points: &[FixationPoint],
+    device_tokens: Option<&AutoGazeDeviceTokens<AutoGazeBevyBackend>>,
+    model_config: Option<&AutoGazeConfig>,
     options: VisualizationOptions,
     visualization_state: &mut BevyVisualizationState,
     device: &AutoGazeBevyDevice,
@@ -2513,40 +2592,56 @@ fn visualize_rgba_tensor(
     let tensor = input
         .tensor
         .ok_or_else(|| "GPU display transfer requires a model input tensor".to_string())?;
-    let tensor_panels = visualization_state
-        .gpu
-        .visualize_normalized_rgb_clip_panels(
-            tensor,
-            points,
-            AutoGazeTensorVisualizationOptions::new(
-                width,
-                height,
-                options.cell_scale,
-                options.blend_alpha,
-            )
-            .with_mask_visualization_mode(options.mask_visualization_mode)
-            .with_mask_geometry_mode(options.mask_geometry_mode)
-            .with_sparse_update_policy(
-                options.sparse_update_max_rects,
-                options.sparse_update_max_ratio,
-            )
-            .with_full_frame_update_policy(options.full_frame_update_min_ratio),
-            device,
-        )
+    let tensor_options = AutoGazeTensorVisualizationOptions::new(
+        width,
+        height,
+        options.cell_scale,
+        options.blend_alpha,
+    )
+    .with_mask_visualization_mode(options.mask_visualization_mode)
+    .with_mask_geometry_mode(options.mask_geometry_mode)
+    .with_sparse_update_policy(
+        options.sparse_update_max_rects,
+        options.sparse_update_max_ratio,
+    )
+    .with_full_frame_update_policy(options.full_frame_update_min_ratio);
+    let used_device_tokens = device_tokens.is_some() && model_config.is_some();
+    let tensor_panels =
+        if let (Some(device_tokens), Some(model_config)) = (device_tokens, model_config) {
+            visualization_state
+                .gpu
+                .visualize_normalized_rgb_clip_device_tokens_panels(
+                    tensor,
+                    device_tokens,
+                    model_config,
+                    tensor_options,
+                    device,
+                )
+        } else {
+            visualization_state
+                .gpu
+                .visualize_normalized_rgb_clip_panels(tensor, points, tensor_options, device)
+        }
         .map_err(|err| format!("failed to visualize AutoGaze tensor output: {err:#}"))?;
     let tensor_ms = elapsed_ms(tensor_start);
     let tensor_interframe_path = visualization_state.gpu.last_interframe_path();
-    let mask_plan_stats = visualization_state
-        .gpu
-        .last_mask_plan_stats()
+    let device_mask_plan_stats = used_device_tokens
+        .then(|| mask_plan_stats_for_points(width, height, points, options))
+        .transpose()?;
+    let mask_plan_stats = device_mask_plan_stats
+        .or_else(|| visualization_state.gpu.last_mask_plan_stats())
         .unwrap_or_default();
-    let output_update_ratio = tensor_panels.update_ratio();
-    let gaze_update_ratio =
-        gaze_ratio_from_mask_stats(tensor_panels.width, tensor_panels.height, mask_plan_stats);
     let interframe_keyframe = matches!(
         tensor_interframe_path,
         Some(AutoGazeTensorInterframePath::Keyframe)
     );
+    let gaze_update_ratio =
+        gaze_ratio_from_mask_stats(tensor_panels.width, tensor_panels.height, mask_plan_stats);
+    let output_update_ratio = if used_device_tokens && !interframe_keyframe {
+        gaze_update_ratio
+    } else {
+        tensor_panels.update_ratio()
+    };
     let output_matches_input = is_interframe_full_output_match(
         visualization_state.gpu.mode(),
         interframe_keyframe,
@@ -2787,6 +2882,27 @@ fn gaze_ratio_from_mask_stats(
     mask_plan_stats: AutoGazeMaskPlanStats,
 ) -> f64 {
     mask_plan_stats.update_ratio(width, height)
+}
+
+fn mask_plan_stats_for_points(
+    width: usize,
+    height: usize,
+    points: &[FixationPoint],
+    options: VisualizationOptions,
+) -> Result<AutoGazeMaskPlanStats, String> {
+    let plan = match options.mask_geometry_mode {
+        AutoGazeMaskGeometryMode::Native => {
+            fixation_sparse_update_plan(width, height, points, options.cell_scale)
+        }
+        AutoGazeMaskGeometryMode::Deduplicated => {
+            fixation_deduplicated_sparse_update_plan(width, height, points, options.cell_scale)
+        }
+        AutoGazeMaskGeometryMode::Effective => {
+            fixation_effective_sparse_update_plan(width, height, points, options.cell_scale)
+        }
+    }
+    .map_err(|err| format!("failed to derive AutoGaze mask stats: {err:#}"))?;
+    Ok(plan.stats())
 }
 
 fn is_interframe_full_output_match(
@@ -3442,6 +3558,7 @@ mod tests {
         assert!(config.show_psnr);
         assert_eq!(config.max_in_flight, DEFAULT_MAX_IN_FLIGHT);
         assert!(config.streaming_cache);
+        assert_eq!(config.decode_strategy, DEFAULT_BEVY_DECODE_STRATEGY);
         assert!(should_use_streaming_cache(
             config.streaming_cache,
             config.frames_per_clip,
@@ -3455,6 +3572,10 @@ mod tests {
         assert_eq!(
             pipeline_options_from_config(&config).task_loss_requirement(),
             AutoGazeTaskLossOption::Value(DEFAULT_BEVY_TASK_LOSS_REQUIREMENT)
+        );
+        assert_eq!(
+            pipeline_options_from_config(&config).decode_strategy(),
+            config.decode_strategy
         );
     }
 
@@ -4887,6 +5008,7 @@ mod tests {
 
         let options = pipeline_options_from_config(&config);
         assert_eq!(options.max_gaze_tokens_each_frame(), Some(12));
+        assert_eq!(options.decode_strategy(), config.decode_strategy);
         assert_eq!(
             options.task_loss_requirement(),
             burn_autogaze::AutoGazeTaskLossOption::Value(0.7)

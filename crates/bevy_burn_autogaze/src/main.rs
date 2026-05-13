@@ -1,16 +1,17 @@
 use bevy::app::AppExit;
 #[cfg(not(target_arch = "wasm32"))]
 use bevy_burn_autogaze::{
-    BevyAutoGazeMode, BevyDisplayTransfer, BevyFrameSource, DEFAULT_BEVY_STREAMING_CACHE,
-    DEFAULT_BEVY_TASK_LOSS_REQUIREMENT, DEFAULT_BIRDS_KEYFRAME_DURATION, DEFAULT_BLEND_ALPHA,
-    DEFAULT_TILED_INFERENCE_WIDTH, default_frames_per_clip, default_inference_dimensions,
-    default_max_gaze_tokens_for_task_loss, default_tile_batch_size, default_top_k,
+    BevyAutoGazeMode, BevyDisplayTransfer, BevyFrameSource, DEFAULT_BEVY_DECODE_CHUNK_SIZE,
+    DEFAULT_BEVY_STREAMING_CACHE, DEFAULT_BEVY_TASK_LOSS_REQUIREMENT,
+    DEFAULT_BIRDS_KEYFRAME_DURATION, DEFAULT_BLEND_ALPHA, DEFAULT_TILED_INFERENCE_WIDTH,
+    default_frames_per_clip, default_inference_dimensions, default_max_gaze_tokens_for_task_loss,
+    default_tile_batch_size, default_top_k,
 };
 use bevy_burn_autogaze::{BevyBurnAutoGazeConfig, run_app};
 #[cfg(not(target_arch = "wasm32"))]
 use burn_autogaze::{
-    AutoGazeMaskGeometryMode, AutoGazeMaskVisualizationMode, AutoGazeVisualizationMode,
-    task_loss_requirement_from_l1_db,
+    AutoGazeDecodeStrategy, AutoGazeMaskGeometryMode, AutoGazeMaskVisualizationMode,
+    AutoGazeVisualizationMode, task_loss_requirement_from_l1_db,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -58,6 +59,42 @@ impl From<NativeInferenceMode> for BevyAutoGazeMode {
         match mode {
             NativeInferenceMode::Realtime => Self::Resize224,
             NativeInferenceMode::Tiled => Self::Tile224,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum NativeDecodeStrategy {
+    #[value(name = "host", alias = "cpu", help = "CPU greedy selection baseline.")]
+    Host,
+    #[value(
+        name = "device",
+        alias = "gpu",
+        alias = "chunked",
+        help = "Device-side greedy selection with chunk-boundary compact stopping readbacks."
+    )]
+    Device,
+    #[value(
+        name = "terminal",
+        alias = "device-terminal",
+        alias = "terminal-device",
+        help = "Device-side greedy selection with one terminal compact readback after the full decode budget."
+    )]
+    Terminal,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<NativeDecodeStrategy> for AutoGazeDecodeStrategy {
+    fn from(value: NativeDecodeStrategy) -> Self {
+        match value {
+            NativeDecodeStrategy::Host => AutoGazeDecodeStrategy::HostGreedy,
+            NativeDecodeStrategy::Device => AutoGazeDecodeStrategy::DeviceGreedy {
+                chunk_size: DEFAULT_BEVY_DECODE_CHUNK_SIZE,
+            },
+            NativeDecodeStrategy::Terminal => AutoGazeDecodeStrategy::DeviceTerminalGreedy {
+                chunk_size: DEFAULT_BEVY_DECODE_CHUNK_SIZE,
+            },
         }
     }
 }
@@ -493,6 +530,23 @@ struct NativeArgs {
 
     #[arg(
         long,
+        value_enum,
+        default_value_t = NativeDecodeStrategy::Terminal,
+        help = "Autoregressive token selection path. terminal is the Bevy default for GPU-resident mask rendering; host is the CPU-readback baseline."
+    )]
+    decode_strategy: NativeDecodeStrategy,
+
+    #[arg(
+        long,
+        value_name = "COUNT",
+        value_parser = parse_nonzero_usize,
+        default_value_t = DEFAULT_BEVY_DECODE_CHUNK_SIZE,
+        help = "Autoregressive decode steps per chunk for device and terminal decode strategies."
+    )]
+    decode_chunk_size: usize,
+
+    #[arg(
+        long,
         value_name = "COUNT",
         value_parser = parse_nonzero_usize,
         default_value_t = bevy_burn_autogaze::DEFAULT_MAX_IN_FLIGHT,
@@ -697,6 +751,17 @@ impl From<NativeArgs> for BevyBurnAutoGazeConfig {
         let frames_per_clip = args
             .frames_per_clip
             .unwrap_or_else(|| default_frames_per_clip(mode));
+        let decode_strategy = match AutoGazeDecodeStrategy::from(args.decode_strategy) {
+            AutoGazeDecodeStrategy::HostGreedy => AutoGazeDecodeStrategy::HostGreedy,
+            AutoGazeDecodeStrategy::DeviceGreedy { .. } => AutoGazeDecodeStrategy::DeviceGreedy {
+                chunk_size: args.decode_chunk_size,
+            },
+            AutoGazeDecodeStrategy::DeviceTerminalGreedy { .. } => {
+                AutoGazeDecodeStrategy::DeviceTerminalGreedy {
+                    chunk_size: args.decode_chunk_size,
+                }
+            }
+        };
         BevyBurnAutoGazeConfig {
             press_esc_to_close: args.press_esc_to_close,
             show_fps: args.show_fps,
@@ -720,6 +785,7 @@ impl From<NativeArgs> for BevyBurnAutoGazeConfig {
             task_loss_requirement,
             disable_task_loss_requirement,
             frames_per_clip,
+            decode_strategy,
             max_in_flight: args.max_in_flight,
             inference_width,
             inference_height: inference_height.or(defaults.inference_height),
@@ -1060,6 +1126,8 @@ mod tests {
             tensor_full_frame_update_min_ratio:
                 bevy_burn_autogaze::DEFAULT_TENSOR_FULL_FRAME_UPDATE_MIN_RATIO,
             streaming_cache: DEFAULT_BEVY_STREAMING_CACHE,
+            decode_strategy: NativeDecodeStrategy::Terminal,
+            decode_chunk_size: DEFAULT_BEVY_DECODE_CHUNK_SIZE,
             require_hardware_adapter: false,
             log_pipeline_timing: false,
             perf_summary_warmup_frames: 0,
@@ -1085,6 +1153,10 @@ mod tests {
         assert_eq!(config.inference_height, None);
         assert_eq!(config.blend_alpha, DEFAULT_BLEND_ALPHA);
         assert_eq!(config.keyframe_duration, DEFAULT_BIRDS_KEYFRAME_DURATION);
+        assert_eq!(
+            config.decode_strategy,
+            bevy_burn_autogaze::DEFAULT_BEVY_DECODE_STRATEGY
+        );
         assert_eq!(config.display_transfer, BevyDisplayTransfer::Auto);
         assert_eq!(
             config.tensor_sparse_update_max_rects,

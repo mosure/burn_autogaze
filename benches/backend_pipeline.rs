@@ -1,19 +1,21 @@
 use burn::module::{Module, ModuleMapper, Param};
 use burn::tensor::backend::Backend;
-use burn::tensor::{Tensor, TensorData};
+use burn::tensor::{Bool, Int, Tensor, TensorData};
 use burn_autogaze::{
-    AutoGazeConfig, AutoGazeInferenceMode, AutoGazePipeline, AutoGazeRgbaClipShape,
-    AutoGazeStreamingCache, AutoGazeTensorVisualizationOptions, AutoGazeTensorVisualizationState,
+    AutoGazeConfig, AutoGazeDecodeStrategy, AutoGazeDeviceTokens, AutoGazeInferenceMode,
+    AutoGazePipeline, AutoGazeRgbaClipShape, AutoGazeStreamingCache,
+    AutoGazeTensorVisualizationOptions, AutoGazeTensorVisualizationState,
     AutoGazeVisualizationMode, AutoGazeVisualizationState, ConnectorConfig, FixationPoint,
     GazeDecoderConfig, GazeModelConfig, NativeAutoGazeModel, SparseReadoutGrid,
     SparseReadoutOptions, SparseVideoReadoutGrid, SparseVideoReadoutOptions, VisionModelConfig,
-    fixation_points_to_readout_tokens, frame_readout_tokens_to_video_coords,
+    fixation_points_to_readout_tokens, frame_readout_tokens_to_video_coords, scale_token_layouts,
     video_readout_coords_to_tensor,
 };
 use criterion::{
     BatchSize, BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
     measurement::WallTime,
 };
+use futures_lite::future::block_on;
 use std::panic::{self, AssertUnwindSafe};
 #[cfg(feature = "webgpu")]
 use std::sync::OnceLock;
@@ -142,6 +144,43 @@ impl TensorFixationCase {
 }
 
 #[derive(Clone, Copy, Debug)]
+enum TensorTokenRenderPath {
+    PointPanels,
+    DeviceTokenPanels,
+}
+
+impl TensorTokenRenderPath {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::PointPanels => "point-panels",
+            Self::DeviceTokenPanels => "device-token-panels",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TensorDeviceTokenCase {
+    ModelDefault,
+    AllModelTokens,
+}
+
+impl TensorDeviceTokenCase {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::ModelDefault => "model-tokens",
+            Self::AllModelTokens => "all-model-tokens",
+        }
+    }
+
+    fn points(self, model: ModelCase) -> Vec<FixationPoint> {
+        match self {
+            Self::ModelDefault => deterministic_fixations(model),
+            Self::AllModelTokens => all_model_token_fixations(model),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 struct CacheCase {
     name: &'static str,
     width: usize,
@@ -257,6 +296,14 @@ const TENSOR_FIXATION_CASES: &[TensorFixationCase] = &[
     TensorFixationCase::DenseGrid64,
     TensorFixationCase::DenseGrid128,
 ];
+const TENSOR_TOKEN_RENDER_PATHS: &[TensorTokenRenderPath] = &[
+    TensorTokenRenderPath::PointPanels,
+    TensorTokenRenderPath::DeviceTokenPanels,
+];
+const TENSOR_DEVICE_TOKEN_CASES: &[TensorDeviceTokenCase] = &[
+    TensorDeviceTokenCase::ModelDefault,
+    TensorDeviceTokenCase::AllModelTokens,
+];
 const MODEL_INPUT_SIZE: usize = 224;
 const PATCH_SIZE: usize = 16;
 const MODEL_GRID: usize = MODEL_INPUT_SIZE / PATCH_SIZE;
@@ -265,6 +312,7 @@ const BATCH: usize = 1;
 const FRAMES: usize = 2;
 const CHANNELS: usize = 3;
 const REAL_TOP_K: usize = 10;
+const REAL_DECODE_CHUNK_SIZE: usize = 4;
 const REAL_TILE_BATCH_CASES: &[(usize, usize)] = &[(2, 64), (10, 8), (10, 64), (24, 8), (24, 64)];
 const REAL_TILE_VIDEO_CASES: &[TileVideoCase] = &[
     TileVideoCase {
@@ -641,6 +689,29 @@ fn bench_tensor_visualization(c: &mut Criterion) {
     #[cfg(feature = "cuda")]
     {
         register_tensor_visualization::<burn::backend::Cuda<f32, i32>>(
+            &mut group,
+            "cuda",
+            burn::backend::cuda::CudaDevice::default(),
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_tensor_device_tokens(c: &mut Criterion) {
+    let mut group = c.benchmark_group("autogaze_tensor_device_tokens");
+    group.sample_size(10);
+
+    #[cfg(feature = "webgpu")]
+    if let Some(device) = webgpu_device() {
+        register_tensor_device_tokens::<burn::backend::WebGpu<f32, i32>>(
+            &mut group, "webgpu", device,
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    {
+        register_tensor_device_tokens::<burn::backend::Cuda<f32, i32>>(
             &mut group,
             "cuda",
             burn::backend::cuda::CudaDevice::default(),
@@ -1189,6 +1260,121 @@ fn register_real_kv_cache<B>(
 
         group.bench_with_input(
             BenchmarkId::new(
+                format!("{backend}/streaming-host-async/max-{}", case.max_tokens),
+                case.name,
+            ),
+            &case,
+            |b, _| {
+                b.iter_batched(
+                    || {
+                        (
+                            stream_frames.clone(),
+                            AutoGazeStreamingCache::new(case.frames),
+                        )
+                    },
+                    |(stream_frames, mut cache)| {
+                        for frame in stream_frames {
+                            black_box(
+                                block_on(model.generate_streaming_with_decode_strategy_async(
+                                    frame,
+                                    &mut cache,
+                                    case.max_tokens,
+                                    None,
+                                    None,
+                                    AutoGazeDecodeStrategy::HostGreedy,
+                                ))
+                                .expect("host async streaming generation"),
+                            );
+                        }
+                        B::sync(&device).expect("backend sync");
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new(
+                format!(
+                    "{backend}/streaming-device-chunk-{REAL_DECODE_CHUNK_SIZE}/max-{}",
+                    case.max_tokens
+                ),
+                case.name,
+            ),
+            &case,
+            |b, _| {
+                b.iter_batched(
+                    || {
+                        (
+                            stream_frames.clone(),
+                            AutoGazeStreamingCache::new(case.frames),
+                        )
+                    },
+                    |(stream_frames, mut cache)| {
+                        for frame in stream_frames {
+                            black_box(
+                                block_on(model.generate_streaming_with_decode_strategy_async(
+                                    frame,
+                                    &mut cache,
+                                    case.max_tokens,
+                                    None,
+                                    None,
+                                    AutoGazeDecodeStrategy::DeviceGreedy {
+                                        chunk_size: REAL_DECODE_CHUNK_SIZE,
+                                    },
+                                ))
+                                .expect("device streaming generation"),
+                            );
+                        }
+                        B::sync(&device).expect("backend sync");
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new(
+                format!(
+                    "{backend}/streaming-device-terminal-readback-chunk-{REAL_DECODE_CHUNK_SIZE}/max-{}",
+                    case.max_tokens
+                ),
+                case.name,
+            ),
+            &case,
+            |b, _| {
+                b.iter_batched(
+                    || {
+                        (
+                            stream_frames.clone(),
+                            AutoGazeStreamingCache::new(case.frames),
+                        )
+                    },
+                    |(stream_frames, mut cache)| {
+                        for frame in stream_frames {
+                            black_box(
+                                block_on(model.generate_streaming_with_decode_strategy_async(
+                                    frame,
+                                    &mut cache,
+                                    case.max_tokens,
+                                    None,
+                                    None,
+                                    AutoGazeDecodeStrategy::DeviceTerminalGreedy {
+                                        chunk_size: REAL_DECODE_CHUNK_SIZE,
+                                    },
+                                ))
+                                .expect("terminal device streaming generation"),
+                            );
+                        }
+                        B::sync(&device).expect("backend sync");
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new(
                 format!("{backend}/kv-cache/max-{}", case.max_tokens),
                 case.name,
             ),
@@ -1723,6 +1909,165 @@ fn bench_tensor_visualization_case<B>(
     );
 }
 
+fn register_tensor_device_tokens<B>(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    backend: &str,
+    device: B::Device,
+) where
+    B: Backend,
+    B::Device: Clone,
+{
+    for &case in VIDEO_CASES {
+        group.throughput(Throughput::Elements((case.width * case.height) as u64));
+        for &model in MODEL_CASES {
+            for &visualization in VISUALIZATION_CASES {
+                if matches!(visualization.mode, AutoGazeVisualizationMode::Interframe)
+                    && !visualization.force_delta_frame
+                {
+                    continue;
+                }
+                for &token_case in TENSOR_DEVICE_TOKEN_CASES {
+                    for &path in TENSOR_TOKEN_RENDER_PATHS {
+                        bench_tensor_device_token_case::<B>(
+                            group,
+                            backend,
+                            TensorDeviceTokenBenchCase {
+                                video: case,
+                                model,
+                                visualization,
+                                token_case,
+                                path,
+                            },
+                            device.clone(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TensorDeviceTokenBenchCase {
+    video: VideoCase,
+    model: ModelCase,
+    visualization: VisualizationCase,
+    token_case: TensorDeviceTokenCase,
+    path: TensorTokenRenderPath,
+}
+
+fn bench_tensor_device_token_case<B>(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    backend: &str,
+    case: TensorDeviceTokenBenchCase,
+    device: B::Device,
+) where
+    B: Backend,
+    B::Device: Clone,
+{
+    let config = tiny_config(case.model);
+    let current =
+        deterministic_video::<B>(1, 1, CHANNELS, case.video.height, case.video.width, &device);
+    let previous =
+        deterministic_video::<B>(1, 1, CHANNELS, case.video.height, case.video.width, &device);
+    let points = case.token_case.points(case.model);
+    let device_tokens = device_tokens_from_points::<B>(&points, &config, &device);
+    let options = AutoGazeTensorVisualizationOptions::new(
+        case.video.width,
+        case.video.height,
+        1.0,
+        BLEND_ALPHA,
+    )
+    .with_full_frame_update_policy(0.0);
+    group.bench_with_input(
+        BenchmarkId::new(
+            format!(
+                "{backend}/{}/{}/{}/{}",
+                case.model.name,
+                case.visualization.name,
+                case.token_case.name(),
+                case.path.name(),
+            ),
+            case.video.name,
+        ),
+        &case.video,
+        |b, _| {
+            b.iter_batched(
+                || {
+                    let mut state = AutoGazeTensorVisualizationState::<B>::new(
+                        case.visualization.mode,
+                        if case.visualization.force_delta_frame {
+                            usize::MAX
+                        } else {
+                            KEYFRAME_DURATION
+                        },
+                    );
+                    if case.visualization.force_delta_frame {
+                        match case.path {
+                            TensorTokenRenderPath::PointPanels => {
+                                let _ = state
+                                    .visualize_normalized_rgb_clip_panels(
+                                        previous.clone(),
+                                        &points,
+                                        options,
+                                        &device,
+                                    )
+                                    .expect("prime point tensor visualization state");
+                            }
+                            TensorTokenRenderPath::DeviceTokenPanels => {
+                                let _ = state
+                                    .visualize_normalized_rgb_clip_device_tokens_panels(
+                                        previous.clone(),
+                                        &device_tokens,
+                                        &config,
+                                        options,
+                                        &device,
+                                    )
+                                    .expect("prime device-token tensor visualization state");
+                            }
+                        }
+                    }
+                    state
+                },
+                |mut state| {
+                    match case.path {
+                        TensorTokenRenderPath::PointPanels => {
+                            let output = state
+                                .visualize_normalized_rgb_clip_panels(
+                                    current.clone(),
+                                    &points,
+                                    options,
+                                    &device,
+                                )
+                                .expect("visualize point tensor panels");
+                            black_box(output.mask_ratio());
+                            black_box(output.update_ratio());
+                            black_box(output.output_rgba.shape());
+                        }
+                        TensorTokenRenderPath::DeviceTokenPanels => {
+                            let output = state
+                                .visualize_normalized_rgb_clip_device_tokens_panels(
+                                    current.clone(),
+                                    &device_tokens,
+                                    &config,
+                                    options,
+                                    &device,
+                                )
+                                .expect("visualize device-token tensor panels");
+                            black_box(output.mask_ratio());
+                            black_box(output.update_ratio());
+                            black_box(output.output_rgba.shape());
+                        }
+                    }
+                    black_box(state.last_interframe_path().map(|path| path.as_str()));
+                    B::sync(&device).expect("backend sync");
+                },
+                BatchSize::SmallInput,
+            );
+        },
+    );
+}
+
 fn bench_rgba_e2e_case<B>(
     group: &mut BenchmarkGroup<'_, WallTime>,
     backend: &str,
@@ -1927,6 +2272,28 @@ fn deterministic_fixations(model: ModelCase) -> Vec<FixationPoint> {
     }
 }
 
+fn all_model_token_fixations(model: ModelCase) -> Vec<FixationPoint> {
+    let config = tiny_config(model);
+    let mut points = Vec::new();
+    for layout in scale_token_layouts(&config) {
+        let grid = layout.grid.max(1);
+        let extent = 1.0 / grid as f32;
+        for row in 0..grid {
+            for col in 0..grid {
+                points.push(FixationPoint::with_grid_extent(
+                    (col as f32 + 0.5) * extent,
+                    (row as f32 + 0.5) * extent,
+                    extent,
+                    extent,
+                    1.0,
+                    grid,
+                ));
+            }
+        }
+    }
+    points
+}
+
 fn dense_grid_fixations(grid: usize) -> Vec<FixationPoint> {
     let extent = 1.0 / grid as f32;
     (0..grid)
@@ -1943,6 +2310,49 @@ fn dense_grid_fixations(grid: usize) -> Vec<FixationPoint> {
             })
         })
         .collect()
+}
+
+fn device_tokens_from_points<B: Backend>(
+    points: &[FixationPoint],
+    config: &AutoGazeConfig,
+    device: &B::Device,
+) -> AutoGazeDeviceTokens<B> {
+    let layouts = scale_token_layouts(config);
+    let mut offset = 0usize;
+    let offsets = layouts
+        .iter()
+        .map(|layout| {
+            let start = offset;
+            offset = offset.saturating_add(layout.token_count);
+            (layout.grid, start)
+        })
+        .collect::<Vec<_>>();
+    let mut tokens = Vec::new();
+    for point in points {
+        let grid = point.cell_grid().unwrap_or_else(|| {
+            (1.0 / point.cell_width().max(point.cell_height()))
+                .round()
+                .max(1.0) as usize
+        });
+        let Some((_, start)) = offsets.iter().find(|(candidate, _)| *candidate == grid) else {
+            continue;
+        };
+        let col = ((point.x * grid as f32).floor() as usize).min(grid.saturating_sub(1));
+        let row = ((point.y * grid as f32).floor() as usize).min(grid.saturating_sub(1));
+        tokens.push((*start + row * grid + col) as i64);
+    }
+
+    let slots = tokens.len().max(1);
+    let mut valid = vec![true; tokens.len()];
+    if tokens.is_empty() {
+        tokens.push(config.num_vision_tokens_each_frame as i64);
+        valid.push(false);
+    }
+
+    AutoGazeDeviceTokens {
+        tokens: Tensor::<B, 2, Int>::from_data(TensorData::new(tokens, [1, slots]), device),
+        valid: Tensor::<B, 2, Bool>::from_bool(TensorData::new(valid, [1, slots]), device),
+    }
 }
 
 fn deterministic_video<B: Backend>(
@@ -2145,6 +2555,7 @@ criterion_group!(
     bench_rgba_e2e_video,
     bench_visualization,
     bench_tensor_visualization,
+    bench_tensor_device_tokens,
     bench_sparse_readout_adapter,
     bench_tile_batch_size,
     bench_real_tile_batch_size,

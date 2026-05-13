@@ -6,7 +6,7 @@ resolver = "3"
 [package]
 name = "burn_autogaze"
 description = "AutoGaze inference, fixation traces, and crisp mask visualization for Burn"
-version = "0.21.3"
+version = "0.21.4"
 edition = "2024"
 rust-version = "1.92"
 authors = ["mosure <mitchell@mosure.me>"]
@@ -68,6 +68,7 @@ features = [
 
 [dev-dependencies]
 criterion = "0.8.2"
+futures-lite = "2"
 gif = "0.13"
 image = { version = "0.25", default-features = false, features = ["png"] }
 tempfile = "3"

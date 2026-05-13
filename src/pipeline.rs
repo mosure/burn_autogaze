@@ -1,8 +1,8 @@
 use crate::model::generated_to_frame_points;
 use crate::{
-    AutoGazeConfig, AutoGazeGenerateOutput, AutoGazeLoadOptions, AutoGazeStreamingCache,
-    DEFAULT_TILED_TILE_BATCH_SIZE, FixationPoint, FixationSet, FrameFixationTrace,
-    NativeAutoGazeModel,
+    AutoGazeConfig, AutoGazeDecodeStrategy, AutoGazeDeviceTokens, AutoGazeGenerateOutput,
+    AutoGazeLoadOptions, AutoGazeStreamingCache, DEFAULT_TILED_TILE_BATCH_SIZE, FixationPoint,
+    FixationSet, FrameFixationTrace, NativeAutoGazeModel,
 };
 use anyhow::{Result, anyhow, ensure};
 use burn::tensor::backend::{Backend, ExecutionError};
@@ -151,6 +151,14 @@ pub struct AutoGazeReadoutStats {
 /// `[batch][frame][point]`.
 pub struct AutoGazeReadoutRunOutput {
     pub points: Vec<Vec<Vec<FixationPoint>>>,
+    pub frame_index: usize,
+    pub model_frames: usize,
+    pub stats: AutoGazeReadoutStats,
+}
+
+pub struct AutoGazeDeviceReadoutRunOutput<B: Backend> {
+    pub points: Vec<Vec<Vec<FixationPoint>>>,
+    pub device_tokens: Option<AutoGazeDeviceTokens<B>>,
     pub frame_index: usize,
     pub model_frames: usize,
     pub stats: AutoGazeReadoutStats,
@@ -558,6 +566,7 @@ pub struct AutoGazePipelineOptions {
     task_loss_requirement: AutoGazeTaskLossOption,
     tile_batch_size: Option<usize>,
     generation_coverage_stop_ratio: Option<f64>,
+    decode_strategy: AutoGazeDecodeStrategy,
 }
 
 impl AutoGazePipelineOptions {
@@ -567,6 +576,7 @@ impl AutoGazePipelineOptions {
             task_loss_requirement: AutoGazeTaskLossOption::ModelDefault,
             tile_batch_size: None,
             generation_coverage_stop_ratio: None,
+            decode_strategy: AutoGazeDecodeStrategy::HostGreedy,
         }
     }
 
@@ -584,6 +594,10 @@ impl AutoGazePipelineOptions {
 
     pub const fn generation_coverage_stop_ratio(&self) -> Option<f64> {
         self.generation_coverage_stop_ratio
+    }
+
+    pub const fn decode_strategy(&self) -> AutoGazeDecodeStrategy {
+        self.decode_strategy
     }
 
     pub const fn with_max_gaze_tokens_each_frame(
@@ -628,6 +642,11 @@ impl AutoGazePipelineOptions {
         self.generation_coverage_stop_ratio = None;
         self
     }
+
+    pub const fn with_decode_strategy(mut self, decode_strategy: AutoGazeDecodeStrategy) -> Self {
+        self.decode_strategy = decode_strategy;
+        self
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -645,6 +664,7 @@ pub struct AutoGazePipeline<B: Backend> {
     task_loss_requirement: Option<f32>,
     tile_batch_size: usize,
     generation_coverage_stop_ratio: Option<f64>,
+    decode_strategy: AutoGazeDecodeStrategy,
 }
 
 struct TileTraceAccumulator<'a> {
@@ -665,6 +685,7 @@ impl<B: Backend> AutoGazePipeline<B> {
             task_loss_requirement,
             tile_batch_size: DEFAULT_TILED_TILE_BATCH_SIZE,
             generation_coverage_stop_ratio: None,
+            decode_strategy: AutoGazeDecodeStrategy::HostGreedy,
         }
     }
 
@@ -706,6 +727,14 @@ impl<B: Backend> AutoGazePipeline<B> {
         self.generation_coverage_stop_ratio
     }
 
+    pub const fn decode_strategy(&self) -> AutoGazeDecodeStrategy {
+        self.decode_strategy
+    }
+
+    pub const fn config(&self) -> &AutoGazeConfig {
+        &self.model.config
+    }
+
     pub fn effective_max_gaze_tokens_each_frame(&self) -> usize {
         self.model.effective_max_gaze_tokens_each_frame(
             self.max_gaze_tokens_each_frame,
@@ -736,6 +765,7 @@ impl<B: Backend> AutoGazePipeline<B> {
         }
 
         self.set_generation_coverage_stop_ratio(options.generation_coverage_stop_ratio);
+        self.set_decode_strategy(options.decode_strategy);
     }
 
     pub fn with_max_gaze_tokens_each_frame(mut self, max_gaze_tokens_each_frame: usize) -> Self {
@@ -755,6 +785,11 @@ impl<B: Backend> AutoGazePipeline<B> {
 
     pub fn with_generation_coverage_stop_ratio(mut self, ratio: Option<f64>) -> Self {
         self.set_generation_coverage_stop_ratio(ratio);
+        self
+    }
+
+    pub fn with_decode_strategy(mut self, decode_strategy: AutoGazeDecodeStrategy) -> Self {
+        self.set_decode_strategy(decode_strategy);
         self
     }
 
@@ -781,6 +816,10 @@ impl<B: Backend> AutoGazePipeline<B> {
     pub fn set_generation_coverage_stop_ratio(&mut self, ratio: Option<f64>) {
         self.generation_coverage_stop_ratio =
             ratio.filter(|value| value.is_finite() && *value > 0.0);
+    }
+
+    pub fn set_decode_strategy(&mut self, decode_strategy: AutoGazeDecodeStrategy) {
+        self.decode_strategy = decode_strategy.normalized();
     }
 
     pub const fn model(&self) -> &NativeAutoGazeModel<B> {
@@ -1161,12 +1200,13 @@ impl<B: Backend> AutoGazePipeline<B> {
         cache: &mut AutoGazeStreamingCache<B>,
     ) -> std::result::Result<Vec<FrameFixationTrace>, ExecutionError> {
         self.model
-            .generate_streaming_with_task_loss_requirement_and_coverage_stop_async(
+            .generate_streaming_with_decode_strategy_async(
                 video,
                 cache,
                 self.max_gaze_tokens_each_frame.max(k.max(1)),
                 self.task_loss_requirement,
                 self.generation_coverage_stop_ratio,
+                self.decode_strategy,
             )
             .await
             .map(|generated| {
@@ -1287,12 +1327,13 @@ impl<B: Backend> AutoGazePipeline<B> {
         let (points, stats) = if let Some(cache) = cache {
             let generated = self
                 .model
-                .generate_streaming_with_task_loss_requirement_and_coverage_stop_async(
+                .generate_streaming_with_decode_strategy_async(
                     video,
                     cache,
                     self.max_gaze_tokens_each_frame.max(k.max(1)),
                     self.task_loss_requirement,
                     self.generation_coverage_stop_ratio,
+                    self.decode_strategy,
                 )
                 .await?;
             let stats = generated_readout_stats(&generated, frame_index);
@@ -1310,6 +1351,52 @@ impl<B: Backend> AutoGazePipeline<B> {
             model_frames,
             stats,
         })
+    }
+
+    pub async fn device_readout_prepared_run_async(
+        &self,
+        prepared: AutoGazePreparedRun<B>,
+        k: usize,
+        cache: Option<&mut AutoGazeStreamingCache<B>>,
+    ) -> std::result::Result<AutoGazeDeviceReadoutRunOutput<B>, ExecutionError> {
+        let AutoGazePreparedRun {
+            video,
+            mode,
+            frame_index,
+            model_frames,
+        } = prepared;
+        if let Some(cache) = cache {
+            let generated = self
+                .model
+                .generate_streaming_device_output_with_decode_strategy_async(
+                    video,
+                    cache,
+                    self.max_gaze_tokens_each_frame.max(k.max(1)),
+                    self.task_loss_requirement,
+                    self.generation_coverage_stop_ratio,
+                    self.decode_strategy,
+                )
+                .await?;
+            let stats = generated_readout_stats(&generated.generated, frame_index);
+            Ok(AutoGazeDeviceReadoutRunOutput {
+                points: generated_to_frame_points(&generated.generated, &self.model.config),
+                device_tokens: generated.device_tokens,
+                frame_index,
+                model_frames,
+                stats,
+            })
+        } else {
+            let (points, stats) = self
+                .readout_points_with_mode_and_stats_async(video, k, mode, frame_index)
+                .await?;
+            Ok(AutoGazeDeviceReadoutRunOutput {
+                points,
+                device_tokens: None,
+                frame_index,
+                model_frames,
+                stats,
+            })
+        }
     }
 
     fn embed_tiled_video(

@@ -2,13 +2,13 @@ use std::{fmt, path::PathBuf, str::FromStr};
 
 use bevy::prelude::Resource;
 use burn_autogaze::{
-    AutoGazeInferenceMode, AutoGazeMaskGeometryMode, AutoGazeMaskVisualizationMode,
-    AutoGazeRealtimePolicy, AutoGazeVisualizationMode, DEFAULT_BLEND_ALPHA, DEFAULT_MAX_IN_FLIGHT,
-    DEFAULT_MODEL_GENERATION_BUDGET, DEFAULT_REALTIME_TOP_K,
-    DEFAULT_TENSOR_FULL_FRAME_UPDATE_MIN_RATIO, DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RATIO,
-    DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RECTS, DEFAULT_TILED_FRAMES_PER_CLIP,
-    DEFAULT_TILED_MAX_GAZE_TOKENS, DEFAULT_TILED_TILE_BATCH_SIZE, DEFAULT_TILED_TOP_K,
-    should_use_streaming_cache, task_loss_requirement_from_l1_db,
+    AutoGazeDecodeStrategy, AutoGazeInferenceMode, AutoGazeMaskGeometryMode,
+    AutoGazeMaskVisualizationMode, AutoGazeRealtimePolicy, AutoGazeVisualizationMode,
+    DEFAULT_BLEND_ALPHA, DEFAULT_MAX_IN_FLIGHT, DEFAULT_MODEL_GENERATION_BUDGET,
+    DEFAULT_REALTIME_TOP_K, DEFAULT_TENSOR_FULL_FRAME_UPDATE_MIN_RATIO,
+    DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RATIO, DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RECTS,
+    DEFAULT_TILED_FRAMES_PER_CLIP, DEFAULT_TILED_MAX_GAZE_TOKENS, DEFAULT_TILED_TILE_BATCH_SIZE,
+    DEFAULT_TILED_TOP_K, should_use_streaming_cache, task_loss_requirement_from_l1_db,
 };
 
 pub const DEFAULT_NATIVE_MODEL_DIR: &str = "/home/mosure/.cache/huggingface/hub/models--nvidia--AutoGaze/snapshots/5100fae739ec1bf3f875914fa1b703846a18943a";
@@ -23,6 +23,11 @@ pub const DEFAULT_REALTIME_QUALITY_MAX_GAZE_TOKENS: usize = DEFAULT_TILED_MAX_GA
 pub const DEFAULT_BEVY_REALTIME_FRAMES_PER_CLIP: usize = 16;
 pub const DEFAULT_BEVY_STREAMING_CACHE: bool = true;
 pub const DEFAULT_BEVY_TASK_LOSS_REQUIREMENT: f32 = 0.45;
+pub const DEFAULT_BEVY_DECODE_CHUNK_SIZE: usize = 4;
+pub const DEFAULT_BEVY_DECODE_STRATEGY: AutoGazeDecodeStrategy =
+    AutoGazeDecodeStrategy::DeviceTerminalGreedy {
+        chunk_size: DEFAULT_BEVY_DECODE_CHUNK_SIZE,
+    };
 pub const DEFAULT_BEVY_TILED_TOP_K: usize = DEFAULT_TILED_TOP_K;
 pub const DEFAULT_BIRDS_INFERENCE_WIDTH: u32 = 1920;
 pub const DEFAULT_BIRDS_INFERENCE_HEIGHT: u32 = 1080;
@@ -233,6 +238,7 @@ pub struct BevyBurnAutoGazeConfig {
     pub tensor_sparse_update_max_ratio: f64,
     pub tensor_full_frame_update_min_ratio: f64,
     pub streaming_cache: bool,
+    pub decode_strategy: AutoGazeDecodeStrategy,
     pub require_hardware_adapter: bool,
     pub log_pipeline_timing: bool,
     pub perf_summary_warmup_frames: usize,
@@ -278,6 +284,7 @@ impl Default for BevyBurnAutoGazeConfig {
             tensor_sparse_update_max_ratio: DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RATIO,
             tensor_full_frame_update_min_ratio: DEFAULT_TENSOR_FULL_FRAME_UPDATE_MIN_RATIO,
             streaming_cache: DEFAULT_BEVY_STREAMING_CACHE,
+            decode_strategy: DEFAULT_BEVY_DECODE_STRATEGY,
             require_hardware_adapter: false,
             log_pipeline_timing: false,
             perf_summary_warmup_frames: 0,
@@ -461,6 +468,20 @@ impl BevyBurnAutoGazeConfig {
                 self.streaming_cache = parse_bool_option(&key, value)?;
                 Ok(())
             }
+            "decode-strategy" | "decode" | "decoder" => {
+                self.decode_strategy = parse_decode_strategy(value, self.decode_strategy)?;
+                Ok(())
+            }
+            "decode-chunk-size" | "decoder-chunk-size" | "generation-chunk-size" => {
+                let chunk_size = parse_usize_option(&key, value)?.max(1);
+                self.decode_strategy = match self.decode_strategy.normalized() {
+                    AutoGazeDecodeStrategy::DeviceTerminalGreedy { .. } => {
+                        AutoGazeDecodeStrategy::DeviceTerminalGreedy { chunk_size }
+                    }
+                    _ => AutoGazeDecodeStrategy::DeviceGreedy { chunk_size },
+                };
+                Ok(())
+            }
             "require-hardware-adapter" | "require-gpu" | "fail-on-cpu-adapter" => {
                 self.require_hardware_adapter = parse_bool_option(&key, value)?;
                 Ok(())
@@ -633,6 +654,7 @@ impl BevyBurnAutoGazeConfig {
         self.task_loss_requirement = self
             .task_loss_requirement
             .filter(|value| value.is_finite() && *value >= 0.0);
+        self.decode_strategy = self.decode_strategy.normalized();
     }
 
     pub fn sanitized(mut self) -> Self {
@@ -778,6 +800,46 @@ fn parse_usize_option(key: &str, value: &str) -> Result<usize, String> {
         .map_err(|_| format!("invalid usize for `{key}`: `{value}`"))
 }
 
+fn parse_decode_strategy(
+    value: &str,
+    current: AutoGazeDecodeStrategy,
+) -> Result<AutoGazeDecodeStrategy, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "host" | "cpu" | "host-greedy" | "baseline" => Ok(AutoGazeDecodeStrategy::HostGreedy),
+        "device" | "gpu" | "device-greedy" | "chunked" => Ok(AutoGazeDecodeStrategy::DeviceGreedy {
+            chunk_size: current.chunk_size().max(DEFAULT_BEVY_DECODE_CHUNK_SIZE),
+        }),
+        "terminal" | "device-terminal" | "terminal-device" => {
+            Ok(AutoGazeDecodeStrategy::DeviceTerminalGreedy {
+                chunk_size: current.chunk_size().max(DEFAULT_BEVY_DECODE_CHUNK_SIZE),
+            })
+        }
+        other => other
+            .strip_prefix("device:")
+            .or_else(|| other.strip_prefix("chunked:"))
+            .map(|chunk| AutoGazeDecodeStrategy::DeviceGreedy {
+                chunk_size: chunk.parse::<usize>().unwrap_or(DEFAULT_BEVY_DECODE_CHUNK_SIZE).max(1),
+            })
+            .or_else(|| {
+                other
+                    .strip_prefix("terminal:")
+                    .or_else(|| other.strip_prefix("device-terminal:"))
+                    .or_else(|| other.strip_prefix("terminal-device:"))
+                    .map(|chunk| AutoGazeDecodeStrategy::DeviceTerminalGreedy {
+                        chunk_size: chunk
+                            .parse::<usize>()
+                            .unwrap_or(DEFAULT_BEVY_DECODE_CHUNK_SIZE)
+                            .max(1),
+                    })
+            })
+            .ok_or_else(|| {
+                format!(
+                    "unsupported decode strategy `{value}`; expected host, device, terminal, device:<chunk-size>, or terminal:<chunk-size>"
+                )
+            }),
+    }
+}
+
 fn parse_optional_u32_option(key: &str, value: &str) -> Result<Option<u32>, String> {
     if value.trim().is_empty() || value.eq_ignore_ascii_case("native") {
         return Ok(None);
@@ -865,8 +927,8 @@ mod tests {
     use std::path::PathBuf;
 
     use burn_autogaze::{
-        AutoGazeInferenceMode, DEFAULT_BLEND_ALPHA, DEFAULT_MAX_IN_FLIGHT, DEFAULT_REALTIME_TOP_K,
-        DEFAULT_TILED_FRAMES_PER_CLIP, DEFAULT_TILED_MAX_GAZE_TOKENS,
+        AutoGazeDecodeStrategy, AutoGazeInferenceMode, DEFAULT_BLEND_ALPHA, DEFAULT_MAX_IN_FLIGHT,
+        DEFAULT_REALTIME_TOP_K, DEFAULT_TILED_FRAMES_PER_CLIP, DEFAULT_TILED_MAX_GAZE_TOKENS,
         DEFAULT_TILED_TILE_BATCH_SIZE, should_use_streaming_cache,
     };
 
@@ -876,7 +938,7 @@ mod tests {
     fn applies_url_query_to_viewer_config() {
         let mut config = BevyBurnAutoGazeConfig::default();
         let errors = config.apply_query_string(
-            "?mode=full-res&source=synthetic-pulse&top_k=2&frames-per-clip=3&max-in-flight=2&inference-width=1920&inference-height=1080&show-fps=false&show-psnr=false&task-loss-requirement=0.65&tile-batch-size=4&config-url=%2Fconfig.json&weights-url=%2Fmodel.safetensors&load-model=false&mask-cell-scale=2.5&mask-visualization=overlay&mask-geometry=native&blend-alpha=0.5&visualization-mode=interframe&keyframe-duration=7&display-transfer=cpu&tensor-sparse-update-max-rects=8&tensor-sparse-update-max-ratio=0.05&tensor-full-frame-update-min-ratio=0.45&streaming-cache=false&require-hardware-adapter=true&perf-summary-warmup-frames=2&perf-summary-frames=5&perf-summary-path=target%2Fperf.json&perf-trace-path=target%2Fperf.jsonl",
+            "?mode=full-res&source=synthetic-pulse&top_k=2&frames-per-clip=3&max-in-flight=2&inference-width=1920&inference-height=1080&show-fps=false&show-psnr=false&task-loss-requirement=0.65&tile-batch-size=4&config-url=%2Fconfig.json&weights-url=%2Fmodel.safetensors&load-model=false&mask-cell-scale=2.5&mask-visualization=overlay&mask-geometry=native&blend-alpha=0.5&visualization-mode=interframe&keyframe-duration=7&display-transfer=cpu&tensor-sparse-update-max-rects=8&tensor-sparse-update-max-ratio=0.05&tensor-full-frame-update-min-ratio=0.45&streaming-cache=false&decode-strategy=device:8&require-hardware-adapter=true&perf-summary-warmup-frames=2&perf-summary-frames=5&perf-summary-path=target%2Fperf.json&perf-trace-path=target%2Fperf.jsonl",
         );
 
         assert!(errors.is_empty(), "{errors:?}");
@@ -913,6 +975,10 @@ mod tests {
         assert_eq!(config.tensor_sparse_update_max_ratio, 0.05);
         assert_eq!(config.tensor_full_frame_update_min_ratio, 0.45);
         assert!(!config.streaming_cache);
+        assert_eq!(
+            config.decode_strategy,
+            AutoGazeDecodeStrategy::DeviceGreedy { chunk_size: 8 }
+        );
         assert!(config.require_hardware_adapter);
         assert_eq!(config.perf_summary_warmup_frames, 2);
         assert_eq!(config.perf_summary_frames, Some(5));
@@ -946,6 +1012,45 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(config.task_loss_requirement, None);
         assert!(config.disable_task_loss_requirement);
+    }
+
+    #[test]
+    fn decode_strategy_query_controls_readback_strategy() {
+        let config = BevyBurnAutoGazeConfig::default();
+        assert_eq!(config.decode_strategy, DEFAULT_BEVY_DECODE_STRATEGY);
+
+        let mut config = BevyBurnAutoGazeConfig::default();
+        let errors = config.apply_query_string("?decode-strategy=host");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(config.decode_strategy, AutoGazeDecodeStrategy::HostGreedy);
+
+        let errors = config.apply_query_string("?decode-strategy=device&decode-chunk-size=6");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            config.decode_strategy,
+            AutoGazeDecodeStrategy::DeviceGreedy { chunk_size: 6 }
+        );
+
+        let errors = config.apply_query_string("?decode-strategy=chunked:0");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            config.decode_strategy,
+            AutoGazeDecodeStrategy::DeviceGreedy { chunk_size: 1 }
+        );
+
+        let errors = config.apply_query_string("?decode-strategy=terminal:5");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            config.decode_strategy,
+            AutoGazeDecodeStrategy::DeviceTerminalGreedy { chunk_size: 5 }
+        );
+
+        let errors = config.apply_query_string("?decode-chunk-size=7");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            config.decode_strategy,
+            AutoGazeDecodeStrategy::DeviceTerminalGreedy { chunk_size: 7 }
+        );
     }
 
     #[test]

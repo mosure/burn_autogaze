@@ -2457,13 +2457,14 @@ dependencies = [
 
 [[package]]
 name = "burn_autogaze"
-version = "0.21.3"
+version = "0.21.4"
 dependencies = [
  "anyhow",
  "burn",
  "burn-store",
  "console_error_panic_hook",
  "criterion",
+ "futures-lite",
  "gif 0.13.3",
  "half",
  "image",
