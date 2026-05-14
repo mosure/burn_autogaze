@@ -383,7 +383,7 @@ impl FromStr for TaskLossRequirementArg {
 #[command(
     about = "native Bevy viewer for burn_autogaze",
     version,
-    long_about = "Runs the burn_autogaze video pipeline with camera or static-image input and renders Input | Mask | Output through Bevy. The default path is a continuous realtime streaming configuration: 640px source resize, 16-frame rolling KV window, bounded realtime generated-token budget, deduplicated native mask geometry, adaptive display transfer, PSNR overlay, interframe output, a live quality slider, and no periodic visualization keyframes. Use --max-gaze-tokens-each-frame 0 or --limit-generation-budget=false for the NVIDIA model's full configured budget, --mask-geometry native for exact decoded-cell diagnostics, --display-transfer gpu to force Bevy/Burn tensor interop, --streaming-cache=false for full-window comparison, or --mode tiled plus explicit 1080p/docs settings for full-resolution inspection."
+    long_about = "Runs the burn_autogaze video pipeline with camera or static-image input and renders Input | Mask | Output through Bevy. The default path is a continuous realtime streaming configuration: 640px source resize, 16-frame rolling KV window, bounded realtime generated-token budget, deduplicated native mask geometry, adaptive display transfer, PSNR overlay, interframe output, a live quality slider, and no periodic visualization keyframes. Camera preview frames continue with the latest accepted mask while the next model decode is in flight. Use --max-gaze-tokens-each-frame 0 or --limit-generation-budget=false for the NVIDIA model's full configured budget, --mask-geometry native for exact decoded-cell diagnostics, --display-transfer gpu to force Bevy/Burn tensor interop, --streaming-cache=false for full-window comparison, or --mode tiled plus explicit 1080p/docs settings for full-resolution inspection."
 )]
 struct NativeArgs {
     #[arg(
@@ -398,7 +398,7 @@ struct NativeArgs {
         long,
         default_value_t = true,
         action = ArgAction::Set,
-        help = "Show inference FPS overlay."
+        help = "Show render FPS and accepted model-output FPS overlay."
     )]
     show_fps: bool,
 
@@ -491,7 +491,7 @@ struct NativeArgs {
         long,
         value_name = "COUNT",
         value_parser = parse_usize,
-        help = "Model-side generated-token cap. Default is 10 in realtime and 24 in tiled mode. Pass 0 to use the NVIDIA model config budget."
+        help = "Model-side generated-token cap. Default is 16 in realtime and 24 in tiled mode. Pass 0 to use the NVIDIA model config budget."
     )]
     max_gaze_tokens_each_frame: Option<usize>,
 
@@ -499,7 +499,7 @@ struct NativeArgs {
         long,
         default_value_t = DEFAULT_BEVY_LIMIT_GENERATION_BUDGET,
         action = ArgAction::Set,
-        help = "Use bounded generated-token caps: 10 in realtime and 24 in tiled mode unless --max-gaze-tokens-each-frame is set. Disable for full-budget quality inspection."
+        help = "Use bounded generated-token caps: 16 in realtime and 24 in tiled mode unless --max-gaze-tokens-each-frame is set. Disable for full-budget quality inspection."
     )]
     limit_generation_budget: bool,
 

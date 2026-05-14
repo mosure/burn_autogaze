@@ -20,7 +20,9 @@ The no-arg default is the realtime camera profile:
 - Deduplicated mask geometry.
 - Adaptive CPU/GPU display transfer.
 - Interframe output with PSNR enabled.
-- Live quality slider for the task-loss threshold.
+- Async camera preview: new frames draw with the latest accepted mask while the
+  next decode is in flight.
+- Live quality slider for the task-loss threshold and decode budget.
 - No periodic visualization keyframes.
 
 Point at local model assets with:
@@ -44,8 +46,8 @@ model.
 | `--max-in-flight` | `1` in realtime | Drops stale inference jobs instead of queueing old camera frames. |
 | `--task-loss-requirement` | `0.45` | Viewer L1 reconstruction-loss threshold. Lower values such as `0.3` ask the model for more reconstruction quality. |
 | `--task-loss-requirement-db` | unset | PSNR-like interface for the same task-loss threshold: `10^(-dB / 20)`. |
-| `--show-task-loss-slider` | enabled | Bevy UI slider for live quality/threshold tuning. |
-| `--max-gaze-tokens-each-frame` | `10` realtime, `24` tiled | `0` delegates to the NVIDIA config value, currently `198`. Set a positive count for explicit capped experiments. |
+| `--show-task-loss-slider` | enabled | Bevy UI slider for live quality/threshold tuning; right is higher quality and the far-right end delegates to the full model budget. |
+| `--max-gaze-tokens-each-frame` | `16` realtime, `24` tiled | `0` delegates to the NVIDIA config value, currently `198`. Set a positive count for explicit capped experiments. |
 | `--limit-generation-budget` | enabled | Uses bounded generated-token caps unless `--max-gaze-tokens-each-frame` is set. Disable for full-budget quality inspection. |
 | `--top-k` | mode-specific | Number of gaze candidates considered per step. |
 | `--inference-width`, `--inference-height` | mode-specific | Source resize before inference/visualization. |
@@ -54,7 +56,7 @@ model.
 | `--mask-geometry` | `deduplicated` | `native`, `deduplicated`, or `effective`. |
 | `--mask-visualization` | `image-mask-only` | `image-mask-only`, `image-overlay`, `overlay`, or `scale-rows`. |
 | `--visualization-mode` | `interframe` | `interframe` or `full-blend`. |
-| `--show-fps`, `--show-gaze-ratio`, `--show-psnr` | enabled where useful | Text overlays; PSNR work is skipped when disabled. |
+| `--show-fps`, `--show-gaze-ratio`, `--show-psnr` | enabled where useful | Text overlays; FPS shows render cadence and accepted model-output cadence separately. PSNR work is skipped when disabled. |
 
 Run `cargo run -p bevy_burn_autogaze -- --help` for the complete list and
 aliases.

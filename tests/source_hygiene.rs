@@ -596,9 +596,15 @@ fn bevy_metrics_delegate_to_core_metric_helpers() {
     let psnr_stats = function_body_after(production, "impl PsnrStats", "fn record");
     assert!(psnr_stats.contains("self.0.record(psnr_db)"));
 
-    let fps_text = function_body_after(production, "fn fps_update_system", "fn fps_update_system");
-    assert!(fps_text.contains("format_fps(timing.e2e_fps())"));
-    assert!(fps_text.contains("format_fps(value)"));
+    let fps_update =
+        function_body_after(production, "fn fps_update_system", "fn fps_update_system");
+    assert!(fps_update.contains("FrameTimeDiagnosticsPlugin::FPS"));
+    assert!(fps_update.contains("MODEL_FPS"));
+    assert!(fps_update.contains("stable_fps_text(render_fps, model_fps)"));
+
+    let fps_text = function_body_after(production, "fn stable_fps_text", "fn stable_fps_text");
+    assert!(fps_text.contains("format_fps(render_fps.unwrap_or(f64::NAN))"));
+    assert!(fps_text.contains("format_fps(model_fps.unwrap_or(f64::NAN))"));
 
     let gaze_text = function_body_after(
         production,

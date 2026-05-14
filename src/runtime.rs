@@ -62,9 +62,8 @@ impl AutoGazeInferenceSequencer {
 /// Frontend admission policy for realtime AutoGaze streams.
 ///
 /// The default keeps one model task in flight. New camera frames can still be
-/// buffered while the model is busy, but frontends should avoid drawing raw
-/// previews once the model is ready so processed output is not overwritten by a
-/// stale camera preview.
+/// buffered and displayed while the model is busy, but processed mask results
+/// should be sequence-gated so an older decode cannot overwrite a newer mask.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AutoGazeRealtimePolicy {
     max_in_flight: usize,
@@ -101,6 +100,14 @@ impl AutoGazeRealtimePolicy {
 
     pub const fn should_draw_live_preview(&self, model_ready: bool) -> bool {
         !model_ready
+    }
+
+    pub const fn should_draw_async_stream_preview(
+        &self,
+        _model_ready: bool,
+        _in_flight: usize,
+    ) -> bool {
+        true
     }
 }
 
@@ -140,6 +147,9 @@ mod tests {
 
         assert!(policy.should_draw_live_preview(false));
         assert!(!policy.should_draw_live_preview(true));
+        assert!(policy.should_draw_async_stream_preview(false, 0));
+        assert!(policy.should_draw_async_stream_preview(true, 0));
+        assert!(policy.should_draw_async_stream_preview(true, 1));
     }
 
     #[test]

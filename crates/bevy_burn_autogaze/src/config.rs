@@ -18,7 +18,7 @@ pub const DEFAULT_WEIGHTS_URL: &str =
     "https://huggingface.co/nvidia/AutoGaze/resolve/main/model.safetensors";
 pub(crate) const MODEL_INPUT_SIZE: usize = 224;
 pub const DEFAULT_REALTIME_INFERENCE_WIDTH: u32 = 640;
-pub const DEFAULT_REALTIME_MAX_GAZE_TOKENS: usize = DEFAULT_REALTIME_TOP_K;
+pub const DEFAULT_REALTIME_MAX_GAZE_TOKENS: usize = 16;
 pub const DEFAULT_REALTIME_QUALITY_MAX_GAZE_TOKENS: usize = DEFAULT_TILED_MAX_GAZE_TOKENS;
 pub const DEFAULT_BEVY_REALTIME_FRAMES_PER_CLIP: usize = 16;
 pub const DEFAULT_BEVY_STREAMING_CACHE: bool = true;
@@ -1394,6 +1394,9 @@ mod tests {
         assert!(!policy.should_start_inference(1));
         assert!(policy.should_draw_live_preview(false));
         assert!(!policy.should_draw_live_preview(true));
+        assert!(policy.should_draw_async_stream_preview(false, 0));
+        assert!(policy.should_draw_async_stream_preview(true, 0));
+        assert!(policy.should_draw_async_stream_preview(true, 1));
 
         let policy = realtime_policy_from_config(&BevyBurnAutoGazeConfig {
             max_in_flight: 2,

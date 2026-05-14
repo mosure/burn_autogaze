@@ -73,8 +73,9 @@ pub use config::{
     DEFAULT_NATIVE_MODEL_DIR, DEFAULT_REALTIME_INFERENCE_WIDTH, DEFAULT_REALTIME_MAX_GAZE_TOKENS,
     DEFAULT_REALTIME_QUALITY_MAX_GAZE_TOKENS, DEFAULT_TILED_INFERENCE_WIDTH, DEFAULT_WEIGHTS_URL,
     ImplicitModeDefaults, default_frames_per_clip, default_inference_dimensions,
-    default_max_gaze_tokens_each_frame, default_max_gaze_tokens_for_limit, default_tile_batch_size,
-    default_top_k, realtime_policy_from_config,
+    default_max_gaze_tokens_each_frame, default_max_gaze_tokens_for_limit,
+    default_model_config_max_gaze_tokens_each_frame, default_tile_batch_size, default_top_k,
+    realtime_policy_from_config,
 };
 use display::{
     AutoGazeTexture, OneShotGpuUpload, TensorPanelVisualizationData, Visualization,
@@ -102,7 +103,8 @@ const TASK_LOSS_SLIDER_MIN: f32 = 0.0;
 const TASK_LOSS_SLIDER_MAX: f32 = 1.0;
 const TASK_LOSS_SLIDER_STEP: f32 = 0.01;
 const TASK_LOSS_SLIDER_WIDTH: f32 = 180.0;
-const INFERENCE_FPS: DiagnosticPath = DiagnosticPath::const_new("autogaze_inference_fps");
+const TASK_LOSS_SLIDER_FULL_BUDGET_PERCENT: f32 = 0.98;
+const MODEL_FPS: DiagnosticPath = DiagnosticPath::const_new("autogaze_model_fps");
 const AUTO_GPU_DISPLAY_MAX_PIXELS: usize = 224 * 224;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -122,23 +124,44 @@ struct AutoGazeModelState {
 #[derive(Resource)]
 struct FrameQueue {
     inner: AutoGazeRgbaFrameQueue,
+    latest_source_ms: f64,
+    latest_prepare_ms: f64,
 }
 
 impl Default for FrameQueue {
     fn default() -> Self {
         Self {
             inner: AutoGazeRgbaFrameQueue::new(MAX_SPARE_CLIP_BUFFERS),
+            latest_source_ms: 0.0,
+            latest_prepare_ms: 0.0,
         }
     }
 }
 
 impl FrameQueue {
+    #[cfg(test)]
     fn push(&mut self, frame: Arc<RgbaImage>, max_len: usize) {
+        self.push_timed(frame, max_len, 0.0, 0.0);
+    }
+
+    fn push_timed(
+        &mut self,
+        frame: Arc<RgbaImage>,
+        max_len: usize,
+        source_ms: f64,
+        prepare_ms: f64,
+    ) {
         self.inner.push(frame, max_len);
+        self.latest_source_ms = source_ms;
+        self.latest_prepare_ms = prepare_ms;
     }
 
     fn latest(&self) -> Option<&RgbaImage> {
         self.inner.latest()
+    }
+
+    fn latest_timing(&self) -> (f64, f64) {
+        (self.latest_source_ms, self.latest_prepare_ms)
     }
 
     fn build_clip(&mut self, max_len: usize) -> Result<Option<FrameClip>, String> {
@@ -329,6 +352,7 @@ impl BevyVisualizationState {
 struct TaskLossSliderState {
     value: f32,
     pending_value: Option<f32>,
+    pending_decode_budget: Option<usize>,
     dragging: bool,
 }
 
@@ -340,8 +364,24 @@ impl TaskLossSliderState {
         Self {
             value: quantize_task_loss_slider_value(value),
             pending_value: None,
+            pending_decode_budget: None,
             dragging: false,
         }
+    }
+}
+
+#[derive(Resource, Clone, Debug, Default)]
+struct LatestMaskPrediction {
+    points: Vec<FixationPoint>,
+}
+
+impl LatestMaskPrediction {
+    fn update(&mut self, points: Vec<FixationPoint>) {
+        self.points = points;
+    }
+
+    fn points(&self) -> &[FixationPoint] {
+        &self.points
     }
 }
 
@@ -1164,6 +1204,7 @@ struct FrameInputParams<'w> {
     inference_sequencer: ResMut<'w, InferenceSequencer>,
     visualization_state: ResMut<'w, BevyVisualizationState>,
     streaming_state: ResMut<'w, BevyStreamingGenerationState>,
+    latest_mask: Res<'w, LatestMaskPrediction>,
     gaze_ratio_stats: ResMut<'w, GazeRatioStats>,
     psnr_stats: ResMut<'w, PsnrStats>,
     timing_stats: Res<'w, InferenceTimingStats>,
@@ -1209,6 +1250,7 @@ pub fn viewer_app(mut config: BevyBurnAutoGazeConfig) -> App {
     app.insert_resource(GazeRatioStats::default());
     app.insert_resource(PsnrStats::default());
     app.insert_resource(TaskLossSliderState::new(&config));
+    app.insert_resource(LatestMaskPrediction::default());
     app.insert_resource(InferenceTimingStats::default());
     app.insert_resource(InferenceSequencer::default());
     app.insert_resource(AutoGazeModelState {
@@ -1243,7 +1285,7 @@ pub fn viewer_app(mut config: BevyBurnAutoGazeConfig) -> App {
 
     if config.show_fps {
         app.add_plugins(FrameTimeDiagnosticsPlugin::default());
-        app.register_diagnostic(Diagnostic::new(INFERENCE_FPS));
+        app.register_diagnostic(Diagnostic::new(MODEL_FPS));
         app.add_systems(Startup, fps_display_setup);
         app.add_systems(Update, fps_update_system);
     }
@@ -1516,17 +1558,6 @@ fn process_frames(
         return;
     }
 
-    let frame = next_source_frame(
-        &frame_input.config,
-        &frame_input.static_frame,
-        &mut frame_input.synthetic_source,
-    );
-    let Some((frame, source_ms, prepare_ms)) = frame else {
-        return;
-    };
-    frame_input
-        .frame_queue
-        .push(frame, frame_input.config.frames_per_clip);
     let mode = frame_input.config.mode.inference_mode();
     let use_streaming_cache = should_use_streaming_cache(
         frame_input.config.streaming_cache,
@@ -1547,6 +1578,7 @@ fn process_frames(
             return;
         }
     };
+    let (source_ms, prepare_ms) = frame_input.frame_queue.latest_timing();
     clip.source_ms = source_ms;
     clip.prepare_ms = prepare_ms;
 
@@ -1626,7 +1658,7 @@ fn process_frames(
             }
 
             match result {
-                Ok((visualization, visualization_state, streaming_state)) => {
+                Ok((visualization, visualization_state, streaming_state, points)) => {
                     let Visualization {
                         width,
                         height,
@@ -1658,6 +1690,11 @@ fn process_frames(
                         world.get_resource_mut::<BevyStreamingGenerationState>()
                     {
                         *state = streaming_state;
+                    }
+
+                    if let Some(mut latest_mask) = world.get_resource_mut::<LatestMaskPrediction>()
+                    {
+                        latest_mask.update(points);
                     }
 
                     if !interframe_keyframe
@@ -1727,11 +1764,7 @@ fn preview_frames(
 ) {
     let model_ready = model.pipeline.is_some();
     let realtime_policy = realtime_policy_from_config(&frame_input.config);
-    let inference_busy = realtime_policy.inference_busy(active_tasks.iter().count());
-    if model_ready && !inference_busy {
-        return;
-    }
-
+    let active_task_count = active_tasks.iter().count();
     if texture.entity.is_none() {
         return;
     }
@@ -1740,25 +1773,42 @@ fn preview_frames(
         &frame_input.config,
         &frame_input.static_frame,
         &mut frame_input.synthetic_source,
-    )
-    .map(|(frame, _, _)| frame);
+    );
 
-    let Some(frame) = frame else {
+    let Some((frame, source_ms, prepare_ms)) = frame else {
         return;
     };
 
-    frame_input
-        .frame_queue
-        .push(frame, frame_input.config.frames_per_clip);
+    frame_input.frame_queue.push_timed(
+        frame,
+        frame_input.config.frames_per_clip,
+        source_ms,
+        prepare_ms,
+    );
     let Some(frame) = frame_input.frame_queue.latest() else {
         return;
     };
 
-    if !realtime_policy.should_draw_live_preview(model_ready) {
+    if !realtime_policy.should_draw_async_stream_preview(model_ready, active_task_count) {
         return;
     }
 
-    let visualization = match live_preview_visualization(frame, frame_input.config.show_psnr) {
+    let latest_points = if model_ready {
+        frame_input.latest_mask.points().to_vec()
+    } else {
+        Vec::new()
+    };
+    let visualization = if model_ready {
+        async_mask_preview_visualization(
+            frame,
+            &latest_points,
+            &frame_input.config,
+            &mut frame_input.visualization_state,
+        )
+    } else {
+        live_preview_visualization(frame, frame_input.config.show_psnr)
+    };
+    let visualization = match visualization {
         Ok(visualization) => visualization,
         Err(err) => {
             log(&format!("failed to draw AutoGaze preview: {err}"));
@@ -1786,7 +1836,7 @@ fn handle_tasks(
             if let Some(last_frame) = *last_frame {
                 let delta_seconds = elapsed_between_ms(last_frame, now) / 1000.0;
                 if delta_seconds.is_finite() && delta_seconds > 0.0 {
-                    diagnostics.add_measurement(&INFERENCE_FPS, || 1.0 / delta_seconds);
+                    diagnostics.add_measurement(&MODEL_FPS, || 1.0 / delta_seconds);
                 }
             }
             *last_frame = Some(now);
@@ -2164,6 +2214,7 @@ async fn finish_autogaze_visualization(
         Visualization,
         BevyVisualizationState,
         BevyStreamingGenerationState,
+        Vec<FixationPoint>,
     ),
     String,
 > {
@@ -2255,7 +2306,7 @@ async fn finish_autogaze_visualization(
         tensor_interframe_path: visualization.tensor_interframe_path,
         mask_plan_stats: visualization.mask_plan_stats,
     });
-    Ok((visualization, visualization_state, streaming_state))
+    Ok((visualization, visualization_state, streaming_state, points))
 }
 
 async fn run_autogaze_visualization(
@@ -2266,6 +2317,7 @@ async fn run_autogaze_visualization(
         Visualization,
         BevyVisualizationState,
         BevyStreamingGenerationState,
+        Vec<FixationPoint>,
     ),
     String,
 > {
@@ -2936,6 +2988,26 @@ fn live_preview_visualization(
     Ok(visualization)
 }
 
+fn async_mask_preview_visualization(
+    rgba: &RgbaImage,
+    points: &[FixationPoint],
+    config: &BevyBurnAutoGazeConfig,
+    visualization_state: &mut BevyVisualizationState,
+) -> Result<Visualization, String> {
+    visualization_state.configure(config.visualization_mode, config.keyframe_duration);
+    let visualization_options = VisualizationOptions::new(
+        config.mask_cell_scale,
+        config.blend_alpha,
+        config.show_psnr,
+        BevyDisplayTransfer::Cpu,
+    )
+    .with_full_frame_update_policy(config.tensor_full_frame_update_min_ratio)
+    .with_mask_visualization_mode(config.mask_visualization_mode)
+    .with_mask_geometry_mode(config.mask_geometry_mode)
+    .with_cpu_panels();
+    visualize_points(rgba, points, visualization_options, visualization_state)
+}
+
 fn gaze_ratio_from_mask_stats(
     width: usize,
     height: usize,
@@ -3383,7 +3455,7 @@ fn fps_display_setup(mut commands: Commands) {
                 font_size: bevy::text::FontSize::Px(28.0),
                 ..Default::default()
             },
-            TextSpan::new(format_fps(f64::NAN)),
+            TextSpan::new(stable_fps_text(None, None)),
         ));
 }
 
@@ -3395,15 +3467,19 @@ fn fps_update_system(
     timing: Res<InferenceTimingStats>,
     mut query: Query<&mut TextSpan, With<FpsText>>,
 ) {
+    let render_fps = diagnostic_fps(&diagnostics, &FrameTimeDiagnosticsPlugin::FPS);
+    let model_fps = diagnostic_fps(&diagnostics, &MODEL_FPS)
+        .or_else(|| timing.latest.map(|timing| timing.e2e_fps()));
     for mut text in &mut query {
-        if let Some(timing) = timing.latest {
-            **text = format_fps(timing.e2e_fps());
-        } else if let Some(fps) = diagnostics.get(&INFERENCE_FPS)
-            && let Some(value) = fps.smoothed()
-        {
-            **text = format_fps(value);
-        }
+        **text = stable_fps_text(render_fps, model_fps);
     }
+}
+
+fn diagnostic_fps(diagnostics: &DiagnosticsStore, path: &DiagnosticPath) -> Option<f64> {
+    diagnostics
+        .get(path)
+        .and_then(|diagnostic| diagnostic.smoothed().or_else(|| diagnostic.value()))
+        .filter(|value| value.is_finite() && *value >= 0.0)
 }
 
 fn gaze_ratio_display_setup(mut commands: Commands, config: Res<BevyBurnAutoGazeConfig>) {
@@ -3623,12 +3699,18 @@ fn task_loss_slider_update_system(
     if let Some(value) = next_value
         && (value - slider.value).abs() >= TASK_LOSS_SLIDER_STEP * 0.5
     {
+        let decode_budget = task_loss_slider_decode_budget(value, config.mode);
         slider.value = value;
         slider.pending_value = Some(value);
+        slider.pending_decode_budget = Some(decode_budget);
         config.task_loss_requirement = Some(value);
         config.disable_task_loss_requirement = false;
+        config.max_gaze_tokens_each_frame = decode_budget;
+        config.limit_generation_budget = decode_budget > 0;
         model.config.task_loss_requirement = Some(value);
         model.config.disable_task_loss_requirement = false;
+        model.config.max_gaze_tokens_each_frame = decode_budget;
+        model.config.limit_generation_budget = decode_budget > 0;
     }
 
     if let Some(value) = slider.pending_value {
@@ -3637,7 +3719,15 @@ fn task_loss_slider_update_system(
         };
         if let Ok(mut pipeline) = pipeline.try_lock() {
             pipeline.set_task_loss_requirement(Some(value));
+            if let Some(decode_budget) = slider.pending_decode_budget {
+                if decode_budget == 0 {
+                    pipeline.reset_max_gaze_tokens_each_frame();
+                } else {
+                    pipeline.set_max_gaze_tokens_each_frame(decode_budget);
+                }
+            }
             slider.pending_value = None;
+            slider.pending_decode_budget = None;
         }
     }
 }
@@ -3669,18 +3759,41 @@ fn quantize_task_loss_slider_value(value: f32) -> f32 {
 }
 
 fn task_loss_slider_percent(value: f32) -> f32 {
-    ((value - TASK_LOSS_SLIDER_MIN) / (TASK_LOSS_SLIDER_MAX - TASK_LOSS_SLIDER_MIN)).clamp(0.0, 1.0)
+    ((TASK_LOSS_SLIDER_MAX - value) / (TASK_LOSS_SLIDER_MAX - TASK_LOSS_SLIDER_MIN)).clamp(0.0, 1.0)
 }
 
 fn task_loss_slider_value_from_normalized_x(normalized_x: f32) -> f32 {
-    let percent = (normalized_x + 0.5).clamp(0.0, 1.0);
+    let quality = (normalized_x + 0.5).clamp(0.0, 1.0);
     quantize_task_loss_slider_value(
-        TASK_LOSS_SLIDER_MIN + percent * (TASK_LOSS_SLIDER_MAX - TASK_LOSS_SLIDER_MIN),
+        TASK_LOSS_SLIDER_MAX - quality * (TASK_LOSS_SLIDER_MAX - TASK_LOSS_SLIDER_MIN),
     )
 }
 
+fn task_loss_slider_decode_budget(value: f32, mode: BevyAutoGazeMode) -> usize {
+    let quality = task_loss_slider_percent(value);
+    if quality >= TASK_LOSS_SLIDER_FULL_BUDGET_PERCENT {
+        return default_model_config_max_gaze_tokens_each_frame();
+    }
+    let min_budget = default_max_gaze_tokens_each_frame(mode).max(1);
+    let max_budget = match mode {
+        BevyAutoGazeMode::Resize224 => DEFAULT_REALTIME_QUALITY_MAX_GAZE_TOKENS,
+        BevyAutoGazeMode::Tile224 => DEFAULT_TILED_MAX_GAZE_TOKENS,
+    }
+    .max(min_budget);
+    let scaled = min_budget as f32 + quality * (max_budget - min_budget) as f32;
+    scaled.round().max(1.0) as usize
+}
+
 fn task_loss_slider_label(value: f32) -> String {
-    format!("{value:>4.2}")
+    format!("{:>5.1}%", task_loss_slider_percent(value) * 100.0)
+}
+
+fn stable_fps_text(render_fps: Option<f64>, model_fps: Option<f64>) -> String {
+    format!(
+        "render {} model {}",
+        format_fps(render_fps.unwrap_or(f64::NAN)),
+        format_fps(model_fps.unwrap_or(f64::NAN))
+    )
 }
 
 fn stable_gaze_ratio_text(current: Option<f64>, ema: Option<f64>) -> String {
@@ -4698,6 +4811,54 @@ mod tests {
         assert_eq!(visualization.psnr_db, None);
     }
 
+    #[test]
+    fn async_mask_preview_applies_latest_mask_to_new_frame() {
+        let width = 4;
+        let height = 4;
+        let first = RgbaImage::from_pixel(width as u32, height as u32, image::Rgba([8, 8, 8, 255]));
+        let second = RgbaImage::from_pixel(
+            width as u32,
+            height as u32,
+            image::Rgba([220, 120, 40, 255]),
+        );
+        let points = vec![FixationPoint::with_extent(0.5, 0.5, 0.5, 0.5, 1.0)];
+        let config = BevyBurnAutoGazeConfig {
+            visualization_mode: AutoGazeVisualizationMode::Interframe,
+            keyframe_duration: 0,
+            show_psnr: true,
+            ..Default::default()
+        };
+        let mut state =
+            BevyVisualizationState::new(config.visualization_mode, config.keyframe_duration);
+
+        async_mask_preview_visualization(&first, &[], &config, &mut state)
+            .expect("initial preview keyframe");
+        let visualization = async_mask_preview_visualization(&second, &points, &config, &mut state)
+            .expect("masked preview");
+
+        match visualization.image_data {
+            VisualizationImageData::PanelsRgba {
+                mask_rgba,
+                output_rgba,
+                ..
+            } => {
+                let masked_pixels = mask_rgba
+                    .chunks_exact(4)
+                    .filter(|pixel| pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0)
+                    .count();
+                let updated_pixels = output_rgba
+                    .chunks_exact(4)
+                    .filter(|pixel| pixel[0] == 220)
+                    .count();
+
+                assert!(masked_pixels > 0);
+                assert_eq!(updated_pixels, masked_pixels);
+                assert!(visualization.psnr_db.is_some());
+            }
+            _ => panic!("expected panel visualization payload"),
+        }
+    }
+
     fn assert_gpu_cpu_visualization_match(
         rgba: &[u8],
         width: usize,
@@ -4881,6 +5042,15 @@ mod tests {
         assert_eq!(format_fps(51.25), "051.2");
         assert_eq!(format_fps(1000.0), "999.9");
 
+        let empty_fps = stable_fps_text(None, None);
+        let mixed_fps = stable_fps_text(Some(60.0), Some(12.5));
+        let saturated_fps = stable_fps_text(Some(1000.0), Some(1000.0));
+        assert_eq!(empty_fps, "render ---.- model ---.-");
+        assert_eq!(mixed_fps, "render 060.0 model 012.5");
+        assert_eq!(saturated_fps, "render 999.9 model 999.9");
+        assert_eq!(empty_fps.len(), mixed_fps.len());
+        assert_eq!(mixed_fps.len(), saturated_fps.len());
+
         let empty_gaze = stable_gaze_ratio_text(None, None);
         let low_gaze = stable_gaze_ratio_text(Some(0.0), Some(0.125));
         let high_gaze = stable_gaze_ratio_text(Some(1.0), Some(0.875));
@@ -4898,6 +5068,38 @@ mod tests {
         assert_eq!(infinite_psnr, "999.9 dB ema 999.9 dB");
         assert_eq!(empty_psnr.len(), finite_psnr.len());
         assert_eq!(finite_psnr.len(), infinite_psnr.len());
+    }
+
+    #[test]
+    fn task_loss_slider_maps_right_to_higher_quality_and_budget() {
+        assert_eq!(task_loss_slider_percent(TASK_LOSS_SLIDER_MAX), 0.0);
+        assert_eq!(task_loss_slider_percent(TASK_LOSS_SLIDER_MIN), 1.0);
+        assert_eq!(
+            task_loss_slider_value_from_normalized_x(-0.5),
+            TASK_LOSS_SLIDER_MAX
+        );
+        assert_eq!(
+            task_loss_slider_value_from_normalized_x(0.5),
+            TASK_LOSS_SLIDER_MIN
+        );
+        assert!(
+            task_loss_slider_value_from_normalized_x(0.25)
+                < task_loss_slider_value_from_normalized_x(-0.25)
+        );
+        assert_eq!(task_loss_slider_label(TASK_LOSS_SLIDER_MIN), "100.0%");
+        assert_eq!(task_loss_slider_label(TASK_LOSS_SLIDER_MAX), "  0.0%");
+        assert_eq!(
+            task_loss_slider_decode_budget(TASK_LOSS_SLIDER_MAX, BevyAutoGazeMode::Resize224),
+            DEFAULT_REALTIME_MAX_GAZE_TOKENS
+        );
+        assert_eq!(
+            task_loss_slider_decode_budget(TASK_LOSS_SLIDER_MIN, BevyAutoGazeMode::Resize224),
+            default_model_config_max_gaze_tokens_each_frame()
+        );
+        assert!(
+            task_loss_slider_decode_budget(0.25, BevyAutoGazeMode::Resize224)
+                > task_loss_slider_decode_budget(0.75, BevyAutoGazeMode::Resize224)
+        );
     }
 
     #[test]
