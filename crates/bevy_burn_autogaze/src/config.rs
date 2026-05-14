@@ -23,6 +23,8 @@ pub const DEFAULT_REALTIME_QUALITY_MAX_GAZE_TOKENS: usize = DEFAULT_TILED_MAX_GA
 pub const DEFAULT_BEVY_REALTIME_FRAMES_PER_CLIP: usize = 16;
 pub const DEFAULT_BEVY_STREAMING_CACHE: bool = true;
 pub const DEFAULT_BEVY_TASK_LOSS_REQUIREMENT: f32 = 0.45;
+pub const DEFAULT_BEVY_SHOW_TASK_LOSS_SLIDER: bool = true;
+pub const DEFAULT_BEVY_LIMIT_GENERATION_BUDGET: bool = true;
 pub const DEFAULT_BEVY_DECODE_CHUNK_SIZE: usize = 4;
 pub const DEFAULT_BEVY_DECODE_STRATEGY: AutoGazeDecodeStrategy =
     AutoGazeDecodeStrategy::DeviceTerminalGreedy {
@@ -43,13 +45,10 @@ pub const DEFAULT_BEVY_MASK_GEOMETRY_MODE: AutoGazeMaskGeometryMode =
 /// Viewer config sentinel for using the AutoGaze model's configured inference budget.
 ///
 /// The NVIDIA config uses a fixed inference gazing ratio of 0.75, which maps to
-/// 198 tokens for its 265-token multi-scale vocabulary. This remains available
-/// by passing `0`. The live Bevy realtime default caps generated tokens to one
-/// multi-token decoder step so fragmented fine-cell motions do not create
-/// frame-time spikes in the interactive viewer. Explicit stricter task-loss
-/// thresholds get a bounded quality budget; pass
-/// `--max-gaze-tokens-each-frame 0` when a quality run should use the full
-/// model budget.
+/// 198 tokens for its 265-token multi-scale vocabulary. The Bevy viewer defaults
+/// to bounded interactive caps so its no-arg profile matches the realtime
+/// throughput benches; pass `--max-gaze-tokens-each-frame 0` or
+/// `--limit-generation-budget=false` for full-budget quality inspection.
 pub const DEFAULT_TILED_INFERENCE_WIDTH: u32 = 1280;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -210,6 +209,7 @@ pub struct BevyBurnAutoGazeConfig {
     pub show_fps: bool,
     pub show_gaze_ratio: bool,
     pub show_psnr: bool,
+    pub show_task_loss_slider: bool,
     pub model_dir: PathBuf,
     pub config_url: String,
     pub weights_url: String,
@@ -220,6 +220,7 @@ pub struct BevyBurnAutoGazeConfig {
     pub mode: BevyAutoGazeMode,
     pub top_k: usize,
     pub max_gaze_tokens_each_frame: usize,
+    pub limit_generation_budget: bool,
     pub tile_batch_size: usize,
     pub task_loss_requirement: Option<f32>,
     pub disable_task_loss_requirement: bool,
@@ -256,6 +257,7 @@ impl Default for BevyBurnAutoGazeConfig {
             show_fps: true,
             show_gaze_ratio: true,
             show_psnr: true,
+            show_task_loss_slider: DEFAULT_BEVY_SHOW_TASK_LOSS_SLIDER,
             model_dir: PathBuf::from(DEFAULT_NATIVE_MODEL_DIR),
             config_url: DEFAULT_CONFIG_URL.to_string(),
             weights_url: DEFAULT_WEIGHTS_URL.to_string(),
@@ -265,7 +267,11 @@ impl Default for BevyBurnAutoGazeConfig {
             image_path: None,
             mode,
             top_k: default_top_k(mode),
-            max_gaze_tokens_each_frame: default_max_gaze_tokens_each_frame(mode),
+            max_gaze_tokens_each_frame: default_max_gaze_tokens_for_limit(
+                mode,
+                DEFAULT_BEVY_LIMIT_GENERATION_BUDGET,
+            ),
+            limit_generation_budget: DEFAULT_BEVY_LIMIT_GENERATION_BUDGET,
             tile_batch_size: default_tile_batch_size(mode),
             task_loss_requirement: Some(DEFAULT_BEVY_TASK_LOSS_REQUIREMENT),
             disable_task_loss_requirement: false,
@@ -316,6 +322,13 @@ impl BevyBurnAutoGazeConfig {
                 self.show_psnr = parse_bool_option(&key, value)?;
                 Ok(())
             }
+            "show-task-loss-slider"
+            | "show-quality-slider"
+            | "task-loss-slider"
+            | "quality-slider" => {
+                self.show_task_loss_slider = parse_bool_option(&key, value)?;
+                Ok(())
+            }
             "model-dir" => {
                 self.model_dir = PathBuf::from(value);
                 Ok(())
@@ -357,6 +370,12 @@ impl BevyBurnAutoGazeConfig {
             }
             "max-gaze-tokens-each-frame" => {
                 self.max_gaze_tokens_each_frame = parse_usize_option(&key, value)?;
+                Ok(())
+            }
+            "limit-generation-budget" | "limit-gaze-tokens" | "clamp-gaze-tokens" => {
+                self.limit_generation_budget = parse_bool_option(&key, value)?;
+                self.max_gaze_tokens_each_frame =
+                    default_max_gaze_tokens_for_limit(self.mode, self.limit_generation_budget);
                 Ok(())
             }
             "tile-batch-size" | "tile-batch" | "tiles-per-batch" => {
@@ -521,12 +540,14 @@ impl BevyBurnAutoGazeConfig {
         let mut saw_mode = false;
         let mut saw_frames_per_clip = false;
         let mut saw_task_loss_requirement = false;
+        let mut saw_limit_generation_budget = false;
 
         for pair in query.split('&').filter(|pair| !pair.is_empty()) {
             let (key, value) = pair.split_once('=').unwrap_or((pair, "true"));
             let key = decode_url_component(key);
             let value = decode_url_component(value);
-            match normalized_option_key(&key).as_str() {
+            let option_key = normalized_option_key(&key);
+            match option_key.as_str() {
                 "mode" => saw_mode = true,
                 "top-k" => saw_top_k = true,
                 "max-gaze-tokens-each-frame" => saw_max_gaze_tokens = true,
@@ -543,6 +564,9 @@ impl BevyBurnAutoGazeConfig {
                 | "task-psnr"
                 | "task-psnr-requirement" => saw_task_loss_requirement = true,
                 "disable-task-loss-requirement" | "disable-task-loss" => {}
+                "limit-generation-budget" | "limit-gaze-tokens" | "clamp-gaze-tokens" => {
+                    saw_limit_generation_budget = true;
+                }
                 "inference-width" | "input-width" | "source-width" | "frame-width" | "width" => {
                     saw_inference_width = true;
                 }
@@ -551,6 +575,17 @@ impl BevyBurnAutoGazeConfig {
                     saw_inference_height = true;
                 }
                 _ => {}
+            }
+            if matches!(
+                option_key.as_str(),
+                "limit-generation-budget" | "limit-gaze-tokens" | "clamp-gaze-tokens"
+            ) && saw_max_gaze_tokens
+            {
+                match parse_bool_option(&option_key, &value) {
+                    Ok(value) => self.limit_generation_budget = value,
+                    Err(err) => errors.push(err),
+                }
+                continue;
             }
             if let Err(err) = self.apply_option(&key, &value) {
                 errors.push(err);
@@ -566,12 +601,12 @@ impl BevyBurnAutoGazeConfig {
                 inference_dimensions: !saw_inference_width && !saw_inference_height,
             });
         }
-        if saw_task_loss_requirement && !saw_max_gaze_tokens {
-            self.max_gaze_tokens_each_frame = default_max_gaze_tokens_for_task_loss(
-                self.mode,
-                self.task_loss_requirement,
-                self.disable_task_loss_requirement,
-            );
+        if (saw_task_loss_requirement || saw_limit_generation_budget) && !saw_max_gaze_tokens {
+            self.max_gaze_tokens_each_frame = if saw_task_loss_requirement {
+                default_max_gaze_tokens_for_task_loss(self.mode, self.limit_generation_budget)
+            } else {
+                default_max_gaze_tokens_for_limit(self.mode, self.limit_generation_budget)
+            };
         }
         if saw_inference_width && !saw_inference_height {
             self.inference_height = None;
@@ -588,7 +623,8 @@ impl BevyBurnAutoGazeConfig {
             self.top_k = default_top_k(self.mode);
         }
         if defaults.max_gaze_tokens_each_frame {
-            self.max_gaze_tokens_each_frame = default_max_gaze_tokens_each_frame(self.mode);
+            self.max_gaze_tokens_each_frame =
+                default_max_gaze_tokens_for_limit(self.mode, self.limit_generation_budget);
         }
         if defaults.tile_batch_size {
             self.tile_batch_size = default_tile_batch_size(self.mode);
@@ -723,25 +759,30 @@ pub const fn default_max_gaze_tokens_each_frame(mode: BevyAutoGazeMode) -> usize
     }
 }
 
-pub fn default_max_gaze_tokens_for_task_loss(
+pub const fn default_model_config_max_gaze_tokens_each_frame() -> usize {
+    0
+}
+
+pub const fn default_max_gaze_tokens_for_limit(
     mode: BevyAutoGazeMode,
-    task_loss_requirement: Option<f32>,
-    disable_task_loss_requirement: bool,
+    limit_generation_budget: bool,
 ) -> usize {
-    if disable_task_loss_requirement {
-        return default_max_gaze_tokens_each_frame(mode);
+    if limit_generation_budget {
+        default_max_gaze_tokens_each_frame(mode)
+    } else {
+        default_model_config_max_gaze_tokens_each_frame()
+    }
+}
+
+pub const fn default_max_gaze_tokens_for_task_loss(
+    mode: BevyAutoGazeMode,
+    limit_generation_budget: bool,
+) -> usize {
+    if !limit_generation_budget {
+        return default_model_config_max_gaze_tokens_each_frame();
     }
     match mode {
-        BevyAutoGazeMode::Resize224 => {
-            let Some(requirement) = task_loss_requirement else {
-                return DEFAULT_REALTIME_MAX_GAZE_TOKENS;
-            };
-            if requirement.is_finite() && requirement < DEFAULT_BEVY_TASK_LOSS_REQUIREMENT {
-                DEFAULT_REALTIME_QUALITY_MAX_GAZE_TOKENS
-            } else {
-                DEFAULT_REALTIME_MAX_GAZE_TOKENS
-            }
-        }
+        BevyAutoGazeMode::Resize224 => DEFAULT_REALTIME_QUALITY_MAX_GAZE_TOKENS,
         BevyAutoGazeMode::Tile224 => DEFAULT_TILED_MAX_GAZE_TOKENS,
     }
 }
@@ -938,7 +979,7 @@ mod tests {
     fn applies_url_query_to_viewer_config() {
         let mut config = BevyBurnAutoGazeConfig::default();
         let errors = config.apply_query_string(
-            "?mode=full-res&source=synthetic-pulse&top_k=2&frames-per-clip=3&max-in-flight=2&inference-width=1920&inference-height=1080&show-fps=false&show-psnr=false&task-loss-requirement=0.65&tile-batch-size=4&config-url=%2Fconfig.json&weights-url=%2Fmodel.safetensors&load-model=false&mask-cell-scale=2.5&mask-visualization=overlay&mask-geometry=native&blend-alpha=0.5&visualization-mode=interframe&keyframe-duration=7&display-transfer=cpu&tensor-sparse-update-max-rects=8&tensor-sparse-update-max-ratio=0.05&tensor-full-frame-update-min-ratio=0.45&streaming-cache=false&decode-strategy=device:8&require-hardware-adapter=true&perf-summary-warmup-frames=2&perf-summary-frames=5&perf-summary-path=target%2Fperf.json&perf-trace-path=target%2Fperf.jsonl",
+            "?mode=full-res&source=synthetic-pulse&top_k=2&frames-per-clip=3&max-in-flight=2&inference-width=1920&inference-height=1080&show-fps=false&show-psnr=false&show-task-loss-slider=false&task-loss-requirement=0.65&limit-generation-budget=true&tile-batch-size=4&config-url=%2Fconfig.json&weights-url=%2Fmodel.safetensors&load-model=false&mask-cell-scale=2.5&mask-visualization=overlay&mask-geometry=native&blend-alpha=0.5&visualization-mode=interframe&keyframe-duration=7&display-transfer=cpu&tensor-sparse-update-max-rects=8&tensor-sparse-update-max-ratio=0.05&tensor-full-frame-update-min-ratio=0.45&streaming-cache=false&decode-strategy=device:8&require-hardware-adapter=true&perf-summary-warmup-frames=2&perf-summary-frames=5&perf-summary-path=target%2Fperf.json&perf-trace-path=target%2Fperf.jsonl",
         );
 
         assert!(errors.is_empty(), "{errors:?}");
@@ -952,8 +993,14 @@ mod tests {
         assert!(!config.show_fps);
         assert!(config.show_gaze_ratio);
         assert!(!config.show_psnr);
+        assert!(!config.show_task_loss_slider);
         assert_eq!(config.task_loss_requirement, Some(0.65));
         assert!(!config.disable_task_loss_requirement);
+        assert!(config.limit_generation_budget);
+        assert_eq!(
+            config.max_gaze_tokens_each_frame,
+            DEFAULT_TILED_MAX_GAZE_TOKENS
+        );
         assert_eq!(config.tile_batch_size, 4);
         assert_eq!(config.config_url, "/config.json");
         assert_eq!(config.weights_url, "/model.safetensors");
@@ -1185,7 +1232,7 @@ mod tests {
     }
 
     #[test]
-    fn realtime_task_loss_query_uses_quality_budget_for_stricter_thresholds() {
+    fn realtime_task_loss_query_keeps_bounded_budget_unless_full_budget_requested() {
         let mut config = BevyBurnAutoGazeConfig::default();
         let errors = config.apply_query_string("?mode=realtime&task-loss-requirement=0.3");
 
@@ -1202,8 +1249,16 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(
             config.max_gaze_tokens_each_frame,
-            DEFAULT_REALTIME_MAX_GAZE_TOKENS
+            DEFAULT_REALTIME_QUALITY_MAX_GAZE_TOKENS
         );
+
+        let mut config = BevyBurnAutoGazeConfig::default();
+        let errors = config.apply_query_string(
+            "?mode=realtime&task-loss-requirement=0.3&limit-generation-budget=false",
+        );
+
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(config.max_gaze_tokens_each_frame, 0);
 
         let mut config = BevyBurnAutoGazeConfig::default();
         let errors =
@@ -1234,6 +1289,12 @@ mod tests {
             config.visualization_mode,
             AutoGazeVisualizationMode::Interframe
         );
+
+        let mut config = BevyBurnAutoGazeConfig::default();
+        let errors = config.apply_query_string("?mode=tiled&limit-generation-budget=false");
+
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(config.max_gaze_tokens_each_frame, 0);
     }
 
     #[test]

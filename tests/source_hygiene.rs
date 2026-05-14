@@ -245,7 +245,7 @@ fn public_wasm_api_uses_async_trace_and_no_sync_tensor_readback() {
 
 #[test]
 fn model_async_greedy_selection_uses_async_readback_only() {
-    let source = include_str!("../src/model.rs");
+    let source = include_str!("../src/model/selection.rs");
     let body = function_body_after(
         source,
         "async fn greedy_select_multi_tokens_async",
@@ -261,7 +261,7 @@ fn model_async_greedy_selection_uses_async_readback_only() {
 
 #[test]
 fn greedy_selection_reads_logits_once_per_decoder_step() {
-    let source = include_str!("../src/model.rs");
+    let source = include_str!("../src/model/selection.rs");
     assert!(
         !source.contains("fn greedy_step_tensor"),
         "greedy selection should not launch/read back one tensor per multi-token slot"
@@ -280,6 +280,10 @@ fn production_pipeline_surfaces_avoid_unrecoverable_panics() {
         manifest.join("src").join("lib.rs"),
         manifest.join("src").join("metrics.rs"),
         manifest.join("src").join("model.rs"),
+        manifest.join("src").join("model").join("layout.rs"),
+        manifest.join("src").join("model").join("selection.rs"),
+        manifest.join("src").join("model").join("tensor_utils.rs"),
+        manifest.join("src").join("model").join("trace.rs"),
         manifest.join("src").join("nodes.rs"),
         manifest.join("src").join("pipeline.rs"),
         manifest.join("src").join("pyramid.rs"),
@@ -621,9 +625,9 @@ fn bevy_metrics_delegate_to_core_metric_helpers() {
 
 #[test]
 fn generated_output_decoding_stays_in_core_model_and_readout_helpers() {
-    let model = include_str!("../src/model.rs");
-    assert!(model.contains("fn generated_frame_fixations_from_layouts"));
-    assert!(model.contains("fn generated_scale_token_masks"));
+    let trace = include_str!("../src/model/trace.rs");
+    assert!(trace.contains("fn generated_frame_fixations_from_layouts"));
+    assert!(trace.contains("fn generated_scale_token_masks"));
 
     let readout = include_str!("../src/readout.rs");
     assert!(readout.contains("generated_frame_fixations(generated"));

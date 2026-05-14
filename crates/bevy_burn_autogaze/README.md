@@ -16,10 +16,11 @@ The no-arg default is the realtime camera profile:
 - `resize-224` model input.
 - 640px aspect-preserving source frames.
 - 16-frame rolling streaming cache.
-- Upstream model generation budget.
+- Bounded realtime generation budget.
 - Deduplicated mask geometry.
 - Adaptive CPU/GPU display transfer.
 - Interframe output with PSNR enabled.
+- Live quality slider for the task-loss threshold.
 - No periodic visualization keyframes.
 
 Point at local model assets with:
@@ -41,9 +42,11 @@ model.
 | `--frames-per-clip` | `16` | Number of frames in the model context window. |
 | `--streaming-cache` | `true` in realtime | Advances one frame at a time and preserves KV/cache order. |
 | `--max-in-flight` | `1` in realtime | Drops stale inference jobs instead of queueing old camera frames. |
-| `--task-loss-requirement` | `0.45` | Viewer L1 reconstruction-loss threshold. Stricter explicit values such as `0.3` use the bounded quality token budget unless `--max-gaze-tokens-each-frame` is set. |
+| `--task-loss-requirement` | `0.45` | Viewer L1 reconstruction-loss threshold. Lower values such as `0.3` ask the model for more reconstruction quality. |
 | `--task-loss-requirement-db` | unset | PSNR-like interface for the same task-loss threshold: `10^(-dB / 20)`. |
-| `--max-gaze-tokens-each-frame` | `10` realtime, `24` for stricter realtime task loss and tiled | `0` means the NVIDIA config value, currently `198`; use it for full-budget quality runs. |
+| `--show-task-loss-slider` | enabled | Bevy UI slider for live quality/threshold tuning. |
+| `--max-gaze-tokens-each-frame` | `10` realtime, `24` tiled | `0` delegates to the NVIDIA config value, currently `198`. Set a positive count for explicit capped experiments. |
+| `--limit-generation-budget` | enabled | Uses bounded generated-token caps unless `--max-gaze-tokens-each-frame` is set. Disable for full-budget quality inspection. |
 | `--top-k` | mode-specific | Number of gaze candidates considered per step. |
 | `--inference-width`, `--inference-height` | mode-specific | Source resize before inference/visualization. |
 | `--tile-batch-size` | mode-specific | Backend batch size for tiled modes. |

@@ -21,7 +21,7 @@ use bevy::{
         settings::{RenderCreation, WgpuFeatures, WgpuSettings},
     },
     tasks::{AsyncComputeTaskPool, Task, block_on, futures_lite::future},
-    ui::widget::ImageNode,
+    ui::{RelativeCursorPosition, widget::ImageNode},
     window::PrimaryWindow,
 };
 use bevy_burn::{BevyBurnBridgePlugin, BevyBurnHandle, BurnDevice};
@@ -63,17 +63,18 @@ pub mod platform;
 use config::MODEL_INPUT_SIZE;
 pub use config::{
     BevyAutoGazeMode, BevyBurnAutoGazeConfig, BevyDisplayTransfer, BevyFrameSource,
-    DEFAULT_BEVY_DECODE_CHUNK_SIZE, DEFAULT_BEVY_DECODE_STRATEGY, DEFAULT_BEVY_MASK_GEOMETRY_MODE,
-    DEFAULT_BEVY_MODE, DEFAULT_BEVY_REALTIME_FRAMES_PER_CLIP, DEFAULT_BEVY_STREAMING_CACHE,
-    DEFAULT_BEVY_TASK_LOSS_REQUIREMENT, DEFAULT_BEVY_TILED_TOP_K, DEFAULT_BIRDS_BLEND_ALPHA,
-    DEFAULT_BIRDS_FRAMES_PER_CLIP, DEFAULT_BIRDS_INFERENCE_HEIGHT, DEFAULT_BIRDS_INFERENCE_WIDTH,
-    DEFAULT_BIRDS_KEYFRAME_DURATION, DEFAULT_BIRDS_MAX_GAZE_TOKENS, DEFAULT_BIRDS_TILE_BATCH_SIZE,
-    DEFAULT_BIRDS_TOP_K, DEFAULT_CONFIG_URL, DEFAULT_NATIVE_MODEL_DIR,
-    DEFAULT_REALTIME_INFERENCE_WIDTH, DEFAULT_REALTIME_MAX_GAZE_TOKENS,
+    DEFAULT_BEVY_DECODE_CHUNK_SIZE, DEFAULT_BEVY_DECODE_STRATEGY,
+    DEFAULT_BEVY_LIMIT_GENERATION_BUDGET, DEFAULT_BEVY_MASK_GEOMETRY_MODE, DEFAULT_BEVY_MODE,
+    DEFAULT_BEVY_REALTIME_FRAMES_PER_CLIP, DEFAULT_BEVY_SHOW_TASK_LOSS_SLIDER,
+    DEFAULT_BEVY_STREAMING_CACHE, DEFAULT_BEVY_TASK_LOSS_REQUIREMENT, DEFAULT_BEVY_TILED_TOP_K,
+    DEFAULT_BIRDS_BLEND_ALPHA, DEFAULT_BIRDS_FRAMES_PER_CLIP, DEFAULT_BIRDS_INFERENCE_HEIGHT,
+    DEFAULT_BIRDS_INFERENCE_WIDTH, DEFAULT_BIRDS_KEYFRAME_DURATION, DEFAULT_BIRDS_MAX_GAZE_TOKENS,
+    DEFAULT_BIRDS_TILE_BATCH_SIZE, DEFAULT_BIRDS_TOP_K, DEFAULT_CONFIG_URL,
+    DEFAULT_NATIVE_MODEL_DIR, DEFAULT_REALTIME_INFERENCE_WIDTH, DEFAULT_REALTIME_MAX_GAZE_TOKENS,
     DEFAULT_REALTIME_QUALITY_MAX_GAZE_TOKENS, DEFAULT_TILED_INFERENCE_WIDTH, DEFAULT_WEIGHTS_URL,
     ImplicitModeDefaults, default_frames_per_clip, default_inference_dimensions,
-    default_max_gaze_tokens_each_frame, default_max_gaze_tokens_for_task_loss,
-    default_tile_batch_size, default_top_k, realtime_policy_from_config,
+    default_max_gaze_tokens_each_frame, default_max_gaze_tokens_for_limit, default_tile_batch_size,
+    default_top_k, realtime_policy_from_config,
 };
 use display::{
     AutoGazeTexture, OneShotGpuUpload, TensorPanelVisualizationData, Visualization,
@@ -97,6 +98,10 @@ const TIMING_LOG_INTERVAL_MS: f64 = 5_000.0;
 const UI_MARGIN_PX: f32 = 12.0;
 const METRIC_ROW_HEIGHT: f32 = 34.0;
 const PANEL_LABEL_ROW_HEIGHT: f32 = 38.0;
+const TASK_LOSS_SLIDER_MIN: f32 = 0.0;
+const TASK_LOSS_SLIDER_MAX: f32 = 1.0;
+const TASK_LOSS_SLIDER_STEP: f32 = 0.01;
+const TASK_LOSS_SLIDER_WIDTH: f32 = 180.0;
 const INFERENCE_FPS: DiagnosticPath = DiagnosticPath::const_new("autogaze_inference_fps");
 const AUTO_GPU_DISPLAY_MAX_PIXELS: usize = 224 * 224;
 
@@ -317,6 +322,26 @@ impl BevyVisualizationState {
     fn reset(&mut self) {
         self.cpu.reset();
         self.gpu.reset();
+    }
+}
+
+#[derive(Resource, Clone, Copy, Debug)]
+struct TaskLossSliderState {
+    value: f32,
+    pending_value: Option<f32>,
+    dragging: bool,
+}
+
+impl TaskLossSliderState {
+    fn new(config: &BevyBurnAutoGazeConfig) -> Self {
+        let value = config
+            .task_loss_requirement
+            .unwrap_or(DEFAULT_BEVY_TASK_LOSS_REQUIREMENT);
+        Self {
+            value: quantize_task_loss_slider_value(value),
+            pending_value: None,
+            dragging: false,
+        }
     }
 }
 
@@ -1183,6 +1208,7 @@ pub fn viewer_app(mut config: BevyBurnAutoGazeConfig) -> App {
     app.insert_resource(BevyStreamingGenerationState::default());
     app.insert_resource(GazeRatioStats::default());
     app.insert_resource(PsnrStats::default());
+    app.insert_resource(TaskLossSliderState::new(&config));
     app.insert_resource(InferenceTimingStats::default());
     app.insert_resource(InferenceSequencer::default());
     app.insert_resource(AutoGazeModelState {
@@ -1232,6 +1258,11 @@ pub fn viewer_app(mut config: BevyBurnAutoGazeConfig) -> App {
         app.add_systems(Update, psnr_update_system);
     }
 
+    if config.show_task_loss_slider {
+        app.add_systems(Startup, task_loss_slider_display_setup);
+        app.add_systems(Update, task_loss_slider_style_system);
+    }
+
     app.add_systems(
         Update,
         (
@@ -1239,6 +1270,7 @@ pub fn viewer_app(mut config: BevyBurnAutoGazeConfig) -> App {
             enforce_required_hardware_adapter,
             begin_model_load,
             finish_model_load,
+            task_loss_slider_update_system,
             handle_tasks,
             preview_frames,
             process_frames,
@@ -2264,6 +2296,12 @@ async fn run_autogaze_visualization(
         trace_input,
         top_k,
         use_streaming_cache,
+        should_use_device_token_readout(
+            visualization_options.display_transfer,
+            clip.width(),
+            clip.height(),
+            use_streaming_cache,
+        ),
         streaming_state,
     )
     .await?;
@@ -2275,6 +2313,7 @@ async fn run_autogaze_readout(
     trace_input: CoreAutoGazePreparedRun<AutoGazeBevyBackend>,
     top_k: usize,
     use_streaming_cache: bool,
+    use_device_tokens: bool,
     streaming_state: &mut BevyStreamingGenerationState,
 ) -> Result<FinishedReadout, String> {
     let pipeline = pipeline
@@ -2284,7 +2323,7 @@ async fn run_autogaze_readout(
     let effective_generation_budget = pipeline.effective_max_gaze_tokens_each_frame();
     let model_config = pipeline.config().clone();
     let model_start = timestamp_now();
-    let mut finished = if use_streaming_cache {
+    let mut finished = if use_streaming_cache && use_device_tokens {
         let run_output = pipeline
             .device_readout_prepared_run_async(
                 trace_input,
@@ -2296,6 +2335,18 @@ async fn run_autogaze_readout(
                 format!("failed to read AutoGaze tensor data asynchronously: {err:?}")
             })?;
         finished_readout_from_device_run_output(
+            run_output,
+            elapsed_ms(model_start),
+            effective_generation_budget,
+        )
+    } else if use_streaming_cache {
+        let run_output = pipeline
+            .readout_prepared_run_async(trace_input, top_k, Some(streaming_state.cache_mut()))
+            .await
+            .map_err(|err| {
+                format!("failed to read AutoGaze tensor data asynchronously: {err:?}")
+            })?;
+        finished_readout_from_run_output(
             run_output,
             elapsed_ms(model_start),
             effective_generation_budget,
@@ -2315,6 +2366,15 @@ async fn run_autogaze_readout(
     };
     finished.model_config = Some(model_config);
     Ok(finished)
+}
+
+fn should_use_device_token_readout(
+    display_transfer: BevyDisplayTransfer,
+    width: usize,
+    height: usize,
+    use_streaming_cache: bool,
+) -> bool {
+    use_streaming_cache && uses_tensor_display_transfer(display_transfer, width, height)
 }
 
 #[derive(Clone, Copy)]
@@ -3433,6 +3493,196 @@ fn psnr_update_system(stats: Res<PsnrStats>, mut query: Query<&mut TextSpan, Wit
     }
 }
 
+#[derive(Component)]
+struct TaskLossSliderTrack;
+
+#[derive(Component)]
+struct TaskLossSliderFill;
+
+#[derive(Component)]
+struct TaskLossSliderThumb;
+
+#[derive(Component)]
+struct TaskLossSliderValueText;
+
+fn task_loss_slider_display_setup(
+    mut commands: Commands,
+    config: Res<BevyBurnAutoGazeConfig>,
+    slider: Res<TaskLossSliderState>,
+) {
+    let row = usize::from(config.show_fps)
+        + usize::from(config.show_gaze_ratio)
+        + usize::from(config.show_psnr);
+    let top = metric_overlay_top(row);
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(top),
+                left: Val::Px(UI_MARGIN_PX),
+                height: Val::Px(METRIC_ROW_HEIGHT),
+                display: Display::Flex,
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(8.0),
+                padding: UiRect::right(Val::Px(12.0)),
+                ..default()
+            },
+            ZIndex(2),
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                Text("quality: ".to_string()),
+                TextFont {
+                    font_size: bevy::text::FontSize::Px(22.0),
+                    ..Default::default()
+                },
+                TextColor(Color::WHITE),
+            ));
+            parent.spawn((
+                TaskLossSliderValueText,
+                TextFont {
+                    font_size: bevy::text::FontSize::Px(22.0),
+                    ..Default::default()
+                },
+                TextColor(Color::srgb(1.0, 0.84, 0.0)),
+                Text(task_loss_slider_label(slider.value)),
+            ));
+            parent
+                .spawn((
+                    TaskLossSliderTrack,
+                    Button,
+                    Interaction::None,
+                    RelativeCursorPosition::default(),
+                    BackgroundColor(Color::srgba(0.95, 0.95, 0.95, 0.22)),
+                    Node {
+                        position_type: PositionType::Relative,
+                        width: Val::Px(TASK_LOSS_SLIDER_WIDTH),
+                        height: Val::Px(12.0),
+                        margin: UiRect::left(Val::Px(4.0)),
+                        ..default()
+                    },
+                ))
+                .with_children(|track| {
+                    track.spawn((
+                        TaskLossSliderFill,
+                        BackgroundColor(Color::srgba(1.0, 0.84, 0.0, 0.82)),
+                        Node {
+                            position_type: PositionType::Absolute,
+                            left: Val::Px(0.0),
+                            top: Val::Px(0.0),
+                            width: Val::Percent(task_loss_slider_percent(slider.value) * 100.0),
+                            height: Val::Percent(100.0),
+                            ..default()
+                        },
+                    ));
+                    track.spawn((
+                        TaskLossSliderThumb,
+                        BackgroundColor(Color::srgb(1.0, 0.93, 0.45)),
+                        Node {
+                            position_type: PositionType::Absolute,
+                            left: Val::Percent(task_loss_slider_percent(slider.value) * 100.0),
+                            top: Val::Px(-4.0),
+                            width: Val::Px(10.0),
+                            height: Val::Px(20.0),
+                            margin: UiRect::left(Val::Px(-5.0)),
+                            ..default()
+                        },
+                    ));
+                });
+        });
+}
+
+fn task_loss_slider_update_system(
+    buttons: Res<ButtonInput<MouseButton>>,
+    mut slider: ResMut<TaskLossSliderState>,
+    mut config: ResMut<BevyBurnAutoGazeConfig>,
+    mut model: ResMut<AutoGazeModelState>,
+    tracks: Query<(&Interaction, &RelativeCursorPosition), With<TaskLossSliderTrack>>,
+) {
+    if !config.show_task_loss_slider {
+        return;
+    }
+    if buttons.just_released(MouseButton::Left) {
+        slider.dragging = false;
+    }
+
+    let mut next_value = None;
+    for (interaction, cursor) in &tracks {
+        if matches!(*interaction, Interaction::Pressed) {
+            slider.dragging = true;
+        }
+        if slider.dragging
+            && buttons.pressed(MouseButton::Left)
+            && let Some(normalized) = cursor.normalized
+        {
+            next_value = Some(task_loss_slider_value_from_normalized_x(normalized.x));
+        }
+    }
+
+    if let Some(value) = next_value
+        && (value - slider.value).abs() >= TASK_LOSS_SLIDER_STEP * 0.5
+    {
+        slider.value = value;
+        slider.pending_value = Some(value);
+        config.task_loss_requirement = Some(value);
+        config.disable_task_loss_requirement = false;
+        model.config.task_loss_requirement = Some(value);
+        model.config.disable_task_loss_requirement = false;
+    }
+
+    if let Some(value) = slider.pending_value {
+        let Some(pipeline) = model.pipeline.as_ref() else {
+            return;
+        };
+        if let Ok(mut pipeline) = pipeline.try_lock() {
+            pipeline.set_task_loss_requirement(Some(value));
+            slider.pending_value = None;
+        }
+    }
+}
+
+fn task_loss_slider_style_system(
+    slider: Res<TaskLossSliderState>,
+    mut labels: Query<&mut Text, With<TaskLossSliderValueText>>,
+    mut fills: Query<&mut Node, (With<TaskLossSliderFill>, Without<TaskLossSliderThumb>)>,
+    mut thumbs: Query<&mut Node, (With<TaskLossSliderThumb>, Without<TaskLossSliderFill>)>,
+) {
+    if !slider.is_changed() {
+        return;
+    }
+    let percent = task_loss_slider_percent(slider.value) * 100.0;
+    for mut label in &mut labels {
+        **label = task_loss_slider_label(slider.value);
+    }
+    for mut node in &mut fills {
+        node.width = Val::Percent(percent);
+    }
+    for mut node in &mut thumbs {
+        node.left = Val::Percent(percent);
+    }
+}
+
+fn quantize_task_loss_slider_value(value: f32) -> f32 {
+    let value = value.clamp(TASK_LOSS_SLIDER_MIN, TASK_LOSS_SLIDER_MAX);
+    (value / TASK_LOSS_SLIDER_STEP).round() * TASK_LOSS_SLIDER_STEP
+}
+
+fn task_loss_slider_percent(value: f32) -> f32 {
+    ((value - TASK_LOSS_SLIDER_MIN) / (TASK_LOSS_SLIDER_MAX - TASK_LOSS_SLIDER_MIN)).clamp(0.0, 1.0)
+}
+
+fn task_loss_slider_value_from_normalized_x(normalized_x: f32) -> f32 {
+    let percent = (normalized_x + 0.5).clamp(0.0, 1.0);
+    quantize_task_loss_slider_value(
+        TASK_LOSS_SLIDER_MIN + percent * (TASK_LOSS_SLIDER_MAX - TASK_LOSS_SLIDER_MIN),
+    )
+}
+
+fn task_loss_slider_label(value: f32) -> String {
+    format!("{value:>4.2}")
+}
+
 fn stable_gaze_ratio_text(current: Option<f64>, ema: Option<f64>) -> String {
     format!(
         "{} ema {}",
@@ -3456,7 +3706,8 @@ fn metric_overlay_top(row: usize) -> f32 {
 fn metric_panel_top_reserved_height(config: &BevyBurnAutoGazeConfig) -> f32 {
     let rows = usize::from(config.show_fps)
         + usize::from(config.show_gaze_ratio)
-        + usize::from(config.show_psnr);
+        + usize::from(config.show_psnr)
+        + usize::from(config.show_task_loss_slider);
     if rows == 0 {
         UI_MARGIN_PX
     } else {
@@ -3532,7 +3783,7 @@ mod tests {
         assert_eq!(config.top_k, DEFAULT_REALTIME_TOP_K);
         assert_eq!(
             config.max_gaze_tokens_each_frame,
-            DEFAULT_REALTIME_MAX_GAZE_TOKENS
+            default_max_gaze_tokens_each_frame(config.mode)
         );
         assert_eq!(
             config.task_loss_requirement,
@@ -3556,6 +3807,7 @@ mod tests {
         assert_eq!(config.keyframe_duration, DEFAULT_BIRDS_KEYFRAME_DURATION);
         assert_eq!(config.display_transfer, BevyDisplayTransfer::Auto);
         assert!(config.show_psnr);
+        assert!(config.show_task_loss_slider);
         assert_eq!(config.max_in_flight, DEFAULT_MAX_IN_FLIGHT);
         assert!(config.streaming_cache);
         assert_eq!(config.decode_strategy, DEFAULT_BEVY_DECODE_STRATEGY);
@@ -3567,7 +3819,7 @@ mod tests {
         assert_eq!(
             pipeline_options_from_config(&config).max_gaze_tokens_each_frame(),
             Some(DEFAULT_REALTIME_MAX_GAZE_TOKENS),
-            "realtime defaults should use one decoder chunk for stable interactive frame pacing"
+            "realtime defaults should match the bounded throughput-bench profile"
         );
         assert_eq!(
             pipeline_options_from_config(&config).task_loss_requirement(),
@@ -4175,6 +4427,24 @@ mod tests {
             224,
             224
         ));
+        assert!(!should_use_device_token_readout(
+            BevyDisplayTransfer::Auto,
+            640,
+            360,
+            true
+        ));
+        assert!(should_use_device_token_readout(
+            BevyDisplayTransfer::Gpu,
+            640,
+            360,
+            true
+        ));
+        assert!(!should_use_device_token_readout(
+            BevyDisplayTransfer::Gpu,
+            640,
+            360,
+            false
+        ));
     }
 
     #[test]
@@ -4636,6 +4906,7 @@ mod tests {
             show_fps: false,
             show_gaze_ratio: false,
             show_psnr: false,
+            show_task_loss_slider: false,
             ..Default::default()
         };
         assert_eq!(metric_overlay_top(0), UI_MARGIN_PX);
@@ -4653,9 +4924,10 @@ mod tests {
 
         config.show_gaze_ratio = true;
         config.show_psnr = true;
+        config.show_task_loss_slider = true;
         assert_eq!(
             metric_panel_top_reserved_height(&config),
-            UI_MARGIN_PX * 2.0 + METRIC_ROW_HEIGHT * 3.0
+            UI_MARGIN_PX * 2.0 + METRIC_ROW_HEIGHT * 4.0
         );
     }
 

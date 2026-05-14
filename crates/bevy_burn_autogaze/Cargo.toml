@@ -52,6 +52,7 @@ features = [
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 clap = { version = "4.5", features = ["derive"] }
 nokhwa = { version = "0.10", features = ["input-native", "output-threaded"] }
+burn_autogaze = { path = "../..", default-features = false, features = ["webgpu", "autotune"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_error_panic_hook = "0.1"

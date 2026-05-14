@@ -213,7 +213,7 @@ impl TileVideoCase {
 enum TaskLossBenchSetting {
     ModelDefault,
     Disabled,
-    Threshold(f32),
+    Threshold { name: &'static str, value: f32 },
 }
 
 impl TaskLossBenchSetting {
@@ -221,7 +221,15 @@ impl TaskLossBenchSetting {
         match self {
             Self::ModelDefault => "model-default",
             Self::Disabled => "disabled",
-            Self::Threshold(_) => "threshold-0.7",
+            Self::Threshold { name, .. } => name,
+        }
+    }
+
+    fn requirement<B: Backend>(self, model: &NativeAutoGazeModel<B>) -> Option<f32> {
+        match self {
+            Self::ModelDefault => model.default_task_loss_requirement(),
+            Self::Disabled => None,
+            Self::Threshold { value, .. } => Some(value),
         }
     }
 }
@@ -443,7 +451,33 @@ const REAL_CACHE_CASES: &[CacheCase] = &[
 const REAL_TASK_LOSS_CASES: &[TaskLossBenchSetting] = &[
     TaskLossBenchSetting::ModelDefault,
     TaskLossBenchSetting::Disabled,
-    TaskLossBenchSetting::Threshold(0.7),
+    TaskLossBenchSetting::Threshold {
+        name: "threshold-0.7",
+        value: 0.7,
+    },
+];
+const REAL_KV_QUALITY_SWEEP_CASE: CacheCase = CacheCase {
+    name: "realtime-640x360-16f-full-budget",
+    width: 640,
+    height: 360,
+    frames: 16,
+    max_tokens: 0,
+};
+const REAL_KV_QUALITY_CASES: &[TaskLossBenchSetting] = &[
+    TaskLossBenchSetting::ModelDefault,
+    TaskLossBenchSetting::Disabled,
+    TaskLossBenchSetting::Threshold {
+        name: "threshold-0.7",
+        value: 0.7,
+    },
+    TaskLossBenchSetting::Threshold {
+        name: "threshold-0.45",
+        value: 0.45,
+    },
+    TaskLossBenchSetting::Threshold {
+        name: "threshold-0.3",
+        value: 0.3,
+    },
 ];
 const BLEND_ALPHA: f32 = 0.55;
 const KEYFRAME_DURATION: usize = 30;
@@ -1041,8 +1075,8 @@ fn register_real_task_loss<B>(
                 match setting {
                     TaskLossBenchSetting::ModelDefault => {}
                     TaskLossBenchSetting::Disabled => pipeline.set_task_loss_requirement(None),
-                    TaskLossBenchSetting::Threshold(threshold) => {
-                        pipeline.set_task_loss_requirement(Some(threshold));
+                    TaskLossBenchSetting::Threshold { value, .. } => {
+                        pipeline.set_task_loss_requirement(Some(value));
                     }
                 }
                 let video = deterministic_video::<B>(
@@ -1411,6 +1445,84 @@ fn register_real_kv_cache<B>(
                             None,
                         ));
                         B::sync(&device).expect("backend sync");
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+
+    register_real_kv_quality_sweep(group, backend, &model, &device);
+}
+
+fn register_real_kv_quality_sweep<B>(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    backend: &str,
+    model: &NativeAutoGazeModel<B>,
+    device: &B::Device,
+) where
+    B: Backend,
+    B::Device: Clone,
+{
+    let case = REAL_KV_QUALITY_SWEEP_CASE;
+    if should_skip_long_context_case(backend, case.frames) {
+        eprintln!(
+            "skipping {backend} real KV quality sweep {}; set AUTOGAZE_BENCH_LONG_CONTEXT=1 to include it",
+            case.name
+        );
+        return;
+    }
+
+    let max_tokens = model.default_max_gaze_tokens_each_frame();
+    let video = deterministic_video::<B>(
+        BATCH,
+        case.frames,
+        CHANNELS,
+        case.height,
+        case.width,
+        device,
+    );
+    let stream_frames = (0..case.frames)
+        .map(|frame_idx| video.clone().slice_dim(1, frame_idx..(frame_idx + 1)))
+        .collect::<Vec<_>>();
+    group.throughput(Throughput::Elements(case.frames_per_batch()));
+
+    for &setting in REAL_KV_QUALITY_CASES {
+        let task_loss_requirement = setting.requirement(model);
+        group.bench_with_input(
+            BenchmarkId::new(
+                format!(
+                    "{backend}/kv-quality-{}/model-budget-max-{max_tokens}/terminal-chunk-{REAL_DECODE_CHUNK_SIZE}",
+                    setting.name(),
+                ),
+                case.name,
+            ),
+            &case,
+            |b, _| {
+                b.iter_batched(
+                    || {
+                        (
+                            stream_frames.clone(),
+                            AutoGazeStreamingCache::new(case.frames),
+                        )
+                    },
+                    |(stream_frames, mut cache)| {
+                        for frame in stream_frames {
+                            black_box(
+                                block_on(model.generate_streaming_with_decode_strategy_async(
+                                    frame,
+                                    &mut cache,
+                                    max_tokens,
+                                    task_loss_requirement,
+                                    None,
+                                    AutoGazeDecodeStrategy::DeviceTerminalGreedy {
+                                        chunk_size: REAL_DECODE_CHUNK_SIZE,
+                                    },
+                                ))
+                                .expect("terminal device streaming quality-sweep generation"),
+                            );
+                        }
+                        B::sync(device).expect("backend sync");
                     },
                     BatchSize::SmallInput,
                 );

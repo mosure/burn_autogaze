@@ -2,9 +2,10 @@ use bevy::app::AppExit;
 #[cfg(not(target_arch = "wasm32"))]
 use bevy_burn_autogaze::{
     BevyAutoGazeMode, BevyDisplayTransfer, BevyFrameSource, DEFAULT_BEVY_DECODE_CHUNK_SIZE,
+    DEFAULT_BEVY_LIMIT_GENERATION_BUDGET, DEFAULT_BEVY_SHOW_TASK_LOSS_SLIDER,
     DEFAULT_BEVY_STREAMING_CACHE, DEFAULT_BEVY_TASK_LOSS_REQUIREMENT,
     DEFAULT_BIRDS_KEYFRAME_DURATION, DEFAULT_BLEND_ALPHA, DEFAULT_TILED_INFERENCE_WIDTH,
-    default_frames_per_clip, default_inference_dimensions, default_max_gaze_tokens_for_task_loss,
+    default_frames_per_clip, default_inference_dimensions, default_max_gaze_tokens_for_limit,
     default_tile_batch_size, default_top_k,
 };
 use bevy_burn_autogaze::{BevyBurnAutoGazeConfig, run_app};
@@ -382,7 +383,7 @@ impl FromStr for TaskLossRequirementArg {
 #[command(
     about = "native Bevy viewer for burn_autogaze",
     version,
-    long_about = "Runs the burn_autogaze video pipeline with camera or static-image input and renders Input | Mask | Output through Bevy. The default path is a continuous realtime streaming configuration: 640px source resize, 16-frame rolling KV window, bounded generated-token readout, deduplicated native mask geometry, adaptive display transfer, PSNR overlay, interframe output, and no periodic visualization keyframes. Use --mask-geometry native for exact decoded-cell diagnostics, --display-transfer gpu to force Bevy/Burn tensor interop, --streaming-cache=false for full-window comparison, --max-gaze-tokens-each-frame 0 for the model's full configured budget, or --mode tiled plus explicit 1080p/docs settings for full-resolution inspection."
+    long_about = "Runs the burn_autogaze video pipeline with camera or static-image input and renders Input | Mask | Output through Bevy. The default path is a continuous realtime streaming configuration: 640px source resize, 16-frame rolling KV window, bounded realtime generated-token budget, deduplicated native mask geometry, adaptive display transfer, PSNR overlay, interframe output, a live quality slider, and no periodic visualization keyframes. Use --max-gaze-tokens-each-frame 0 or --limit-generation-budget=false for the NVIDIA model's full configured budget, --mask-geometry native for exact decoded-cell diagnostics, --display-transfer gpu to force Bevy/Burn tensor interop, --streaming-cache=false for full-window comparison, or --mode tiled plus explicit 1080p/docs settings for full-resolution inspection."
 )]
 struct NativeArgs {
     #[arg(
@@ -416,6 +417,14 @@ struct NativeArgs {
         help = "Show PSNR between the input frame and rendered output."
     )]
     show_psnr: bool,
+
+    #[arg(
+        long,
+        default_value_t = DEFAULT_BEVY_SHOW_TASK_LOSS_SLIDER,
+        action = ArgAction::Set,
+        help = "Show a Bevy UI slider that updates the task-loss quality threshold live."
+    )]
+    show_task_loss_slider: bool,
 
     #[arg(
         long,
@@ -482,9 +491,17 @@ struct NativeArgs {
         long,
         value_name = "COUNT",
         value_parser = parse_usize,
-        help = "Model-side generated-token cap. Defaults to 10 in realtime, 24 for stricter explicit realtime task-loss thresholds, and 24 in tiled mode; pass 0 to use the model's full configured budget."
+        help = "Model-side generated-token cap. Default is 10 in realtime and 24 in tiled mode. Pass 0 to use the NVIDIA model config budget."
     )]
     max_gaze_tokens_each_frame: Option<usize>,
+
+    #[arg(
+        long,
+        default_value_t = DEFAULT_BEVY_LIMIT_GENERATION_BUDGET,
+        action = ArgAction::Set,
+        help = "Use bounded generated-token caps: 10 in realtime and 24 in tiled mode unless --max-gaze-tokens-each-frame is set. Disable for full-budget quality inspection."
+    )]
+    limit_generation_budget: bool,
 
     #[arg(
         long,
@@ -497,7 +514,7 @@ struct NativeArgs {
     #[arg(
         long,
         value_name = "FLOAT|none",
-        help = "Override viewer task-loss threshold. Default is 0.45; stricter values such as 0.3 raise the implicit realtime token cap to the bounded quality budget. Use none/off to disable, default/model for model config."
+        help = "Override viewer task-loss threshold. Default is 0.45; lower values such as 0.3 ask for more reconstruction quality without implicitly capping model output. Use none/off to disable, default/model for model config."
     )]
     task_loss_requirement: Option<TaskLossRequirementArg>,
 
@@ -738,11 +755,7 @@ impl From<NativeArgs> for BevyBurnAutoGazeConfig {
         );
         let top_k = args.top_k.unwrap_or_else(|| default_top_k(mode));
         let max_gaze_tokens_each_frame = args.max_gaze_tokens_each_frame.unwrap_or_else(|| {
-            default_max_gaze_tokens_for_task_loss(
-                mode,
-                task_loss_requirement,
-                disable_task_loss_requirement,
-            )
+            default_max_gaze_tokens_for_limit(mode, args.limit_generation_budget)
         });
         let mask_cell_scale = args.mask_cell_scale.unwrap_or(1.0);
         let tile_batch_size = args
@@ -767,6 +780,7 @@ impl From<NativeArgs> for BevyBurnAutoGazeConfig {
             show_fps: args.show_fps,
             show_gaze_ratio: args.show_gaze_ratio,
             show_psnr: args.show_psnr,
+            show_task_loss_slider: args.show_task_loss_slider,
             model_dir: args.model_dir,
             source: args.source.map(BevyFrameSource::from).unwrap_or(
                 if args.image_path.is_some() {
@@ -781,6 +795,7 @@ impl From<NativeArgs> for BevyBurnAutoGazeConfig {
             mode,
             top_k,
             max_gaze_tokens_each_frame,
+            limit_generation_budget: args.limit_generation_budget,
             tile_batch_size,
             task_loss_requirement,
             disable_task_loss_requirement,
@@ -989,10 +1004,10 @@ fn runtime_config() -> BevyBurnAutoGazeConfig {
 mod tests {
     use super::*;
     use bevy_burn_autogaze::{
-        DEFAULT_BEVY_REALTIME_FRAMES_PER_CLIP, DEFAULT_BEVY_TASK_LOSS_REQUIREMENT,
-        DEFAULT_BEVY_TILED_TOP_K, DEFAULT_REALTIME_INFERENCE_WIDTH,
-        DEFAULT_REALTIME_MAX_GAZE_TOKENS, DEFAULT_REALTIME_QUALITY_MAX_GAZE_TOKENS,
-        DEFAULT_REALTIME_TOP_K, DEFAULT_TILED_FRAMES_PER_CLIP, DEFAULT_TILED_INFERENCE_WIDTH,
+        DEFAULT_BEVY_REALTIME_FRAMES_PER_CLIP, DEFAULT_BEVY_SHOW_TASK_LOSS_SLIDER,
+        DEFAULT_BEVY_TASK_LOSS_REQUIREMENT, DEFAULT_BEVY_TILED_TOP_K,
+        DEFAULT_REALTIME_INFERENCE_WIDTH, DEFAULT_REALTIME_MAX_GAZE_TOKENS, DEFAULT_REALTIME_TOP_K,
+        DEFAULT_TILED_FRAMES_PER_CLIP, DEFAULT_TILED_INFERENCE_WIDTH,
         DEFAULT_TILED_MAX_GAZE_TOKENS, DEFAULT_TILED_TILE_BATCH_SIZE,
     };
     use clap::CommandFactory;
@@ -1032,7 +1047,7 @@ mod tests {
         );
         assert_eq!(
             config.max_gaze_tokens_each_frame,
-            DEFAULT_REALTIME_MAX_GAZE_TOKENS
+            bevy_burn_autogaze::default_max_gaze_tokens_each_frame(config.mode)
         );
         assert_eq!(
             config.frames_per_clip,
@@ -1049,18 +1064,19 @@ mod tests {
             AutoGazeMaskGeometryMode::Deduplicated
         );
         assert!(config.show_psnr);
+        assert!(config.show_task_loss_slider);
         assert!(config.warmup_model);
         assert_eq!(config.streaming_cache, DEFAULT_BEVY_STREAMING_CACHE);
     }
 
     #[test]
-    fn native_cli_task_loss_quality_default_uses_quality_budget() {
+    fn native_cli_task_loss_default_keeps_bounded_budget_unless_full_budget_requested() {
         let args = NativeArgs::parse_from(["bevy_burn_autogaze", "--task-loss-requirement", "0.3"]);
         let config = BevyBurnAutoGazeConfig::from(args);
 
         assert_eq!(
             config.max_gaze_tokens_each_frame,
-            DEFAULT_REALTIME_QUALITY_MAX_GAZE_TOKENS
+            DEFAULT_REALTIME_MAX_GAZE_TOKENS
         );
         assert_eq!(config.mask_cell_scale, 1.0);
 
@@ -1072,6 +1088,16 @@ mod tests {
             config.max_gaze_tokens_each_frame,
             DEFAULT_REALTIME_MAX_GAZE_TOKENS
         );
+
+        let args = NativeArgs::parse_from([
+            "bevy_burn_autogaze",
+            "--task-loss-requirement",
+            "0.3",
+            "--limit-generation-budget=false",
+        ]);
+        let config = BevyBurnAutoGazeConfig::from(args);
+
+        assert_eq!(config.max_gaze_tokens_each_frame, 0);
 
         let args = NativeArgs::parse_from([
             "bevy_burn_autogaze",
@@ -1095,6 +1121,7 @@ mod tests {
             show_fps: true,
             show_gaze_ratio: true,
             show_psnr: false,
+            show_task_loss_slider: DEFAULT_BEVY_SHOW_TASK_LOSS_SLIDER,
             model_dir: bevy_burn_autogaze::DEFAULT_NATIVE_MODEL_DIR.into(),
             image_path: None,
             source: None,
@@ -1104,6 +1131,7 @@ mod tests {
             mode: NativeInferenceMode::Tiled,
             top_k: None,
             max_gaze_tokens_each_frame: None,
+            limit_generation_budget: DEFAULT_BEVY_LIMIT_GENERATION_BUDGET,
             tile_batch_size: None,
             task_loss_requirement: None,
             task_loss_requirement_db: None,
@@ -1170,6 +1198,14 @@ mod tests {
             config.tensor_full_frame_update_min_ratio,
             bevy_burn_autogaze::DEFAULT_TENSOR_FULL_FRAME_UPDATE_MIN_RATIO
         );
+
+        let config = BevyBurnAutoGazeConfig::from(NativeArgs::parse_from([
+            "bevy_burn_autogaze",
+            "--mode",
+            "tiled",
+            "--limit-generation-budget=false",
+        ]));
+        assert_eq!(config.max_gaze_tokens_each_frame, 0);
     }
 
     #[test]
