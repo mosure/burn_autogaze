@@ -26,8 +26,6 @@ use bevy::{
 };
 use bevy_burn::{BevyBurnBridgePlugin, BevyBurnHandle, BurnDevice};
 use burn::tensor::Tensor;
-#[cfg(target_arch = "wasm32")]
-use burn_autogaze::patch_diff_readout_points_async;
 use burn_autogaze::{
     AutoGazeConfig, AutoGazeDeviceMask, AutoGazeDeviceReadoutRunOutput, AutoGazeDeviceTokens,
     AutoGazeGazeRatioStats, AutoGazeInferenceMode, AutoGazeInferenceSequencer,
@@ -40,7 +38,7 @@ use burn_autogaze::{
     AutoGazeTensorVisualizationState, AutoGazeVisualizationMode, AutoGazeVisualizationState,
     FixationPoint, fixation_deduplicated_sparse_update_plan, fixation_effective_sparse_update_plan,
     fixation_sparse_update_plan, format_fps, format_gaze_ratio_percent, format_psnr_db,
-    fps_from_millis, patch_diff_device_mask_async, patch_diff_readout_points,
+    fps_from_millis, patch_diff_device_mask_async, patch_diff_readout_points_async,
     prepare_rgba_clip_for_trace, resize_rgba_frame_to_dimensions, rgba_clip_to_tensor,
     should_use_streaming_cache, video_frame_tensor,
 };
@@ -166,6 +164,12 @@ impl FrameQueue {
 
     fn len(&self) -> usize {
         self.inner.len()
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+        self.latest_source_ms = 0.0;
+        self.latest_prepare_ms = 0.0;
     }
 
     fn latest_timing(&self) -> (f64, f64) {
@@ -440,6 +444,10 @@ impl GazeRatioStats {
     fn record(&mut self, ratio: f64) {
         self.0.record(ratio);
     }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
 }
 
 #[derive(Resource, Clone, Debug, Default)]
@@ -448,6 +456,10 @@ struct PsnrStats(AutoGazePsnrStats);
 impl PsnrStats {
     fn record(&mut self, psnr_db: f64) {
         self.0.record(psnr_db);
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
     }
 }
 
@@ -657,6 +669,10 @@ fn is_software_render_adapter(adapter: &RenderAdapterInfo) -> bool {
 }
 
 impl InferenceTimingStats {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
     fn set_render_adapter(&mut self, render_adapter: RenderAdapterSummary) {
         self.render_adapter = Some(render_adapter);
     }
@@ -745,8 +761,16 @@ impl InferenceTimingStats {
         }
 
         self.last_log = Some(now);
+        let (source_label, frame_fps_label) = match self
+            .run_config
+            .as_ref()
+            .map(|config| config.sparse_mask_source)
+        {
+            Some("patch-diff") => ("Patch-diff", "mask-frame fps"),
+            _ => ("AutoGaze", "model-frame fps"),
+        };
         log(&format!(
-            "AutoGaze timing: {:.1} output fps / {:.1} model-frame fps ({:.1} ms) clip={} model_frames={} budget={} generated={}/{} padded={} points={}/{} rects={} spans={} mask={:.2}% output={:.2}% {}x{}, source={:.1} ms, prepare={:.1} ms, pack={:.1} ms, input={:.1} ms, display_input={:.1} ms ({}) model={:.1} ms, trace={:.1} ms, sync={:.1} ms, visualize_cpu={:.1} ms, psnr={:.1} ms, tensor={:.1} ms, display_transfer={}, tensor_path={}, visualize={:.1} ms, display={:.1} ms, output={:.1} MiB rgba/{:.1} MiB f32",
+            "{source_label} timing: {:.1} output fps / {:.1} {frame_fps_label} ({:.1} ms) clip={} model_frames={} budget={} generated={}/{} padded={} points={}/{} rects={} spans={} mask={:.2}% output={:.2}% {}x{}, source={:.1} ms, prepare={:.1} ms, pack={:.1} ms, input={:.1} ms, display_input={:.1} ms ({}) model={:.1} ms, trace={:.1} ms, sync={:.1} ms, visualize_cpu={:.1} ms, psnr={:.1} ms, tensor={:.1} ms, display_transfer={}, tensor_path={}, visualize={:.1} ms, display={:.1} ms, output={:.1} MiB rgba/{:.1} MiB f32",
             timing.e2e_fps(),
             timing.model_frame_fps(),
             timing.total_ms,
@@ -2602,10 +2626,6 @@ async fn run_patch_diff_visualization(
         if log_pipeline_timing {
             log("patch-diff reading compact sparse points");
         }
-        #[cfg(not(target_arch = "wasm32"))]
-        let output = patch_diff_readout_points(video, config)
-            .map_err(|err| format!("failed to read patch-diff sparse mask: {err:#}"))?;
-        #[cfg(target_arch = "wasm32")]
         let output = patch_diff_readout_points_async(video, config)
             .await
             .map_err(|err| format!("failed to read patch-diff sparse mask: {err:#}"))?;
@@ -3620,9 +3640,9 @@ fn maybe_emit_perf_summary(
     }
 
     let summary = timing.summary_json(target_frames);
-    log(&format!("AutoGaze perf summary: {summary}"));
+    log(&format!("sparse mask perf summary: {summary}"));
     if let Err(err) = write_perf_summary(config.perf_summary_path.as_deref(), &summary) {
-        log(&format!("failed to write AutoGaze perf summary: {err}"));
+        log(&format!("failed to write sparse mask perf summary: {err}"));
         timing.emitted_summary = true;
         #[cfg(not(target_arch = "wasm32"))]
         exit.write(AppExit::error());
@@ -3759,10 +3779,16 @@ fn fps_update_system(
     mut query: Query<&mut TextSpan, With<FpsText>>,
 ) {
     let render_fps = diagnostic_fps(&diagnostics, &FrameTimeDiagnosticsPlugin::FPS);
-    let model_fps = diagnostic_fps(&diagnostics, &MODEL_FPS)
-        .or_else(|| timing.latest.map(|timing| timing.e2e_fps()));
+    let inference_fps = if timing.processed_frames() > 0 {
+        timing
+            .latest
+            .map(|timing| timing.e2e_fps())
+            .or_else(|| diagnostic_fps(&diagnostics, &MODEL_FPS))
+    } else {
+        None
+    };
     for mut text in &mut query {
-        **text = stable_fps_text(render_fps, model_fps);
+        **text = stable_fps_text(render_fps, inference_fps);
     }
 }
 
@@ -4035,6 +4061,7 @@ fn task_loss_slider_update_system(
 }
 
 fn mask_source_toggle_system(
+    mut commands: Commands,
     mut config: ResMut<BevyBurnAutoGazeConfig>,
     mut model: ResMut<AutoGazeModelState>,
     mut slider: ResMut<TaskLossSliderState>,
@@ -4042,6 +4069,11 @@ fn mask_source_toggle_system(
     mut visualization_state: ResMut<BevyVisualizationState>,
     mut streaming_state: ResMut<BevyStreamingGenerationState>,
     mut sequencer: ResMut<InferenceSequencer>,
+    mut frame_queue: ResMut<FrameQueue>,
+    mut gaze_ratio_stats: ResMut<GazeRatioStats>,
+    mut psnr_stats: ResMut<PsnrStats>,
+    mut timing_stats: ResMut<InferenceTimingStats>,
+    active_tasks: Query<Entity, With<ProcessAutoGaze>>,
     toggles: Query<&Interaction, (Changed<Interaction>, With<MaskSourceToggle>)>,
 ) {
     if !config.show_task_loss_slider {
@@ -4065,7 +4097,17 @@ fn mask_source_toggle_system(
         &mut visualization_state,
         &mut streaming_state,
         &mut sequencer,
+        &mut frame_queue,
+        &mut gaze_ratio_stats,
+        &mut psnr_stats,
+        &mut timing_stats,
     );
+    for entity in &active_tasks {
+        commands.entity(entity).despawn();
+    }
+    if !config.sparse_mask_source.requires_autogaze_model() {
+        model.load_task = None;
+    }
 }
 
 fn apply_mask_source_toggle(
@@ -4076,6 +4118,10 @@ fn apply_mask_source_toggle(
     visualization_state: &mut BevyVisualizationState,
     streaming_state: &mut BevyStreamingGenerationState,
     sequencer: &mut InferenceSequencer,
+    frame_queue: &mut FrameQueue,
+    gaze_ratio_stats: &mut GazeRatioStats,
+    psnr_stats: &mut PsnrStats,
+    timing_stats: &mut InferenceTimingStats,
 ) {
     config.sparse_mask_source = match config.sparse_mask_source {
         BevySparseMaskSource::AutoGaze => BevySparseMaskSource::PatchDiff,
@@ -4091,6 +4137,10 @@ fn apply_mask_source_toggle(
     visualization_state.reset();
     streaming_state.reset();
     sequencer.invalidate_pending();
+    frame_queue.reset();
+    gaze_ratio_stats.reset();
+    psnr_stats.reset();
+    timing_stats.reset();
 }
 
 fn apply_task_loss_slider_value(
@@ -4196,11 +4246,11 @@ fn quality_slider_quality_from_threshold(threshold: f32) -> f32 {
     quantize_task_loss_slider_value((TASK_LOSS_SLIDER_MAX - threshold).clamp(0.0, 1.0))
 }
 
-fn stable_fps_text(render_fps: Option<f64>, model_fps: Option<f64>) -> String {
+fn stable_fps_text(render_fps: Option<f64>, inference_fps: Option<f64>) -> String {
     format!(
-        "render {} model {}",
+        "render {} infer {}",
         format_fps(render_fps.unwrap_or(f64::NAN)),
-        format_fps(model_fps.unwrap_or(f64::NAN))
+        format_fps(inference_fps.unwrap_or(f64::NAN))
     )
 }
 
@@ -5929,9 +5979,9 @@ mod tests {
         let empty_fps = stable_fps_text(None, None);
         let mixed_fps = stable_fps_text(Some(60.0), Some(12.5));
         let saturated_fps = stable_fps_text(Some(1000.0), Some(1000.0));
-        assert_eq!(empty_fps, "render ---.- model ---.-");
-        assert_eq!(mixed_fps, "render 060.0 model 012.5");
-        assert_eq!(saturated_fps, "render 999.9 model 999.9");
+        assert_eq!(empty_fps, "render ---.- infer ---.-");
+        assert_eq!(mixed_fps, "render 060.0 infer 012.5");
+        assert_eq!(saturated_fps, "render 999.9 infer 999.9");
         assert_eq!(empty_fps.len(), mixed_fps.len());
         assert_eq!(mixed_fps.len(), saturated_fps.len());
 
@@ -6404,6 +6454,17 @@ mod tests {
         streaming_state.configure(true, 4, 4, 2);
         let mut sequencer = InferenceSequencer::default();
         let stale_sequence = sequencer.reserve();
+        let mut frame_queue = FrameQueue::default();
+        frame_queue.push(Arc::new(RgbaImage::new(2, 2)), config.frames_per_clip);
+        let mut gaze_ratio_stats = GazeRatioStats::default();
+        gaze_ratio_stats.record(0.5);
+        let mut psnr_stats = PsnrStats::default();
+        psnr_stats.record(30.0);
+        let mut timing_stats = InferenceTimingStats {
+            latest: Some(InferenceTiming::default()),
+            samples: vec![1.0],
+            ..Default::default()
+        };
 
         apply_mask_source_toggle(
             &mut config,
@@ -6413,6 +6474,10 @@ mod tests {
             &mut visualization_state,
             &mut streaming_state,
             &mut sequencer,
+            &mut frame_queue,
+            &mut gaze_ratio_stats,
+            &mut psnr_stats,
+            &mut timing_stats,
         );
 
         assert_eq!(config.sparse_mask_source, BevySparseMaskSource::PatchDiff);
@@ -6428,6 +6493,15 @@ mod tests {
             !sequencer.accept(stale_sequence),
             "in-flight AutoGaze completions from the old mode must be rejected"
         );
+        assert_eq!(
+            frame_queue.len(),
+            0,
+            "mode switches must rebuild the clip window for the target pipeline"
+        );
+        assert!(!gaze_ratio_stats.0.is_initialized());
+        assert!(!psnr_stats.0.is_initialized());
+        assert_eq!(timing_stats.processed_frames(), 0);
+        assert!(timing_stats.latest.is_none());
         let fresh_sequence = sequencer.reserve();
         assert!(sequencer.accept(fresh_sequence));
     }
