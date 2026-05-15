@@ -31,9 +31,9 @@ use burn_autogaze::{
     AutoGazeInferenceMode, AutoGazeInferenceSequencer, AutoGazeMaskGeometryMode,
     AutoGazeMaskPlanStats, AutoGazeMaskVisualizationMode, AutoGazePipeline,
     AutoGazePipelineOptions, AutoGazePreparedRun as CoreAutoGazePreparedRun, AutoGazePsnrStats,
-    AutoGazeReadoutRunOutput, AutoGazeRgbaClipShape, AutoGazeRgbaFrameClip, AutoGazeRgbaFrameQueue,
-    AutoGazeRgbaVisualizationBuffers, AutoGazeRgbaVisualizationOptions, AutoGazeStreamingCache,
-    AutoGazeTensorInterframePath, AutoGazeTensorVisualizationOptions,
+    AutoGazeReadoutRunOutput, AutoGazeRealtimePolicy, AutoGazeRgbaClipShape, AutoGazeRgbaFrameClip,
+    AutoGazeRgbaFrameQueue, AutoGazeRgbaVisualizationBuffers, AutoGazeRgbaVisualizationOptions,
+    AutoGazeStreamingCache, AutoGazeTensorInterframePath, AutoGazeTensorVisualizationOptions,
     AutoGazeTensorVisualizationState, AutoGazeVisualizationMode, AutoGazeVisualizationState,
     FixationPoint, fixation_deduplicated_sparse_update_plan, fixation_effective_sparse_update_plan,
     fixation_sparse_update_plan, format_fps, format_gaze_ratio_percent, format_psnr_db,
@@ -320,6 +320,30 @@ impl InferenceSequencer {
 
     fn accept(&mut self, sequence: u64) -> bool {
         self.0.accept(sequence)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompletedModelDisplayAction {
+    DisplayVisualization,
+    UpdateMaskOnly,
+}
+
+impl CompletedModelDisplayAction {
+    const fn displays_visualization(self) -> bool {
+        matches!(self, Self::DisplayVisualization)
+    }
+}
+
+fn completed_model_display_action(
+    policy: AutoGazeRealtimePolicy,
+    model_ready: bool,
+    active_task_count: usize,
+) -> CompletedModelDisplayAction {
+    if policy.should_draw_async_stream_preview(model_ready, active_task_count) {
+        CompletedModelDisplayAction::UpdateMaskOnly
+    } else {
+        CompletedModelDisplayAction::DisplayVisualization
     }
 }
 
@@ -1547,7 +1571,8 @@ fn process_frames(
         return;
     };
     let realtime_policy = realtime_policy_from_config(&frame_input.config);
-    if !realtime_policy.should_start_inference(active_tasks.iter().count()) {
+    let active_task_count = active_tasks.iter().count();
+    if !realtime_policy.should_start_inference(active_task_count) {
         return;
     }
     if frame_input
@@ -1604,6 +1629,8 @@ fn process_frames(
     .with_mask_geometry_mode(frame_input.config.mask_geometry_mode)
     .with_cpu_panels();
     let run_config = InferenceRunConfigSummary::from(frame_input.config.as_ref());
+    let completed_display_action =
+        completed_model_display_action(realtime_policy, true, active_task_count.saturating_add(1));
     frame_input.visualization_state.configure(
         frame_input.config.visualization_mode,
         frame_input.config.keyframe_duration,
@@ -1670,20 +1697,17 @@ fn process_frames(
                         mut timing,
                         ..
                     } = visualization;
-                    let display_start = timestamp_now();
-                    apply_visualization_to_world(world, width, height, image_data);
+                    let display_ms = apply_completed_model_visualization(
+                        world,
+                        width,
+                        height,
+                        image_data,
+                        visualization_state,
+                        completed_display_action,
+                    );
                     if let Some(ref mut timing) = timing {
-                        timing.display_ms = elapsed_ms(display_start);
+                        timing.display_ms = display_ms;
                         timing.total_ms += timing.display_ms;
-                    }
-
-                    if let Some(mut texture) = world.get_resource_mut::<AutoGazeTexture>() {
-                        texture.width = width;
-                        texture.height = height;
-                    }
-
-                    if let Some(mut state) = world.get_resource_mut::<BevyVisualizationState>() {
-                        *state = visualization_state;
                     }
 
                     if let Some(mut state) =
@@ -1697,13 +1721,15 @@ fn process_frames(
                         latest_mask.update(points);
                     }
 
-                    if !interframe_keyframe
+                    if completed_display_action.displays_visualization()
+                        && !interframe_keyframe
                         && let Some(mut stats) = world.get_resource_mut::<GazeRatioStats>()
                     {
                         stats.record(gaze_update_ratio);
                     }
 
-                    if let Some(psnr_db) = psnr_db
+                    if completed_display_action.displays_visualization()
+                        && let Some(psnr_db) = psnr_db
                         && let Some(mut stats) = world.get_resource_mut::<PsnrStats>()
                     {
                         stats.record(psnr_db);
@@ -1753,6 +1779,33 @@ fn process_frames(
     });
 
     commands.entity(task_entity).insert(ProcessAutoGaze(task));
+}
+
+fn apply_completed_model_visualization(
+    world: &mut World,
+    width: u32,
+    height: u32,
+    image_data: VisualizationImageData,
+    visualization_state: BevyVisualizationState,
+    action: CompletedModelDisplayAction,
+) -> f64 {
+    if !action.displays_visualization() {
+        return 0.0;
+    }
+
+    let display_start = timestamp_now();
+    apply_visualization_to_world(world, width, height, image_data);
+
+    if let Some(mut texture) = world.get_resource_mut::<AutoGazeTexture>() {
+        texture.width = width;
+        texture.height = height;
+    }
+
+    if let Some(mut state) = world.get_resource_mut::<BevyVisualizationState>() {
+        *state = visualization_state;
+    }
+
+    elapsed_ms(display_start)
 }
 
 fn preview_frames(
@@ -1815,9 +1868,11 @@ fn preview_frames(
             return;
         }
     };
-    frame_input
-        .gaze_ratio_stats
-        .record(visualization.gaze_update_ratio);
+    if !visualization.interframe_keyframe {
+        frame_input
+            .gaze_ratio_stats
+            .record(visualization.gaze_update_ratio);
+    }
     if let Some(psnr_db) = visualization.psnr_db {
         frame_input.psnr_stats.record(psnr_db);
     }
@@ -5005,6 +5060,34 @@ mod tests {
         rgba
     }
 
+    fn panel_visualization_payload(
+        width: usize,
+        height: usize,
+        rgba: Vec<u8>,
+    ) -> VisualizationImageData {
+        let len = width * height * 4;
+        VisualizationImageData::PanelsRgba {
+            panel_width: width as u32,
+            panel_height: height as u32,
+            input_rgba: rgba.clone(),
+            mask_rgba: vec![0; len],
+            output_rgba: rgba,
+            output_matches_input: false,
+        }
+    }
+
+    fn panel_image_data(world: &World, handle: &Handle<Image>) -> Vec<u8> {
+        world
+            .get_resource::<Assets<Image>>()
+            .expect("image assets")
+            .get(handle)
+            .expect("panel image")
+            .data
+            .as_ref()
+            .expect("panel image data")
+            .clone()
+    }
+
     fn assert_tensor_values_close(
         left: Tensor<AutoGazeBevyBackend, 5>,
         right: Tensor<AutoGazeBevyBackend, 5>,
@@ -5534,6 +5617,79 @@ mod tests {
         assert!(sequencer.accept(second));
         assert!(!sequencer.accept(first));
         assert!(sequencer.accept(second + 1));
+    }
+
+    #[test]
+    fn async_preview_owns_default_model_completion_display() {
+        let policy = AutoGazeRealtimePolicy::default();
+
+        assert_eq!(
+            completed_model_display_action(policy, true, 1),
+            CompletedModelDisplayAction::UpdateMaskOnly
+        );
+    }
+
+    #[test]
+    fn mask_only_model_completion_does_not_rewind_preview_texture() {
+        let width = 2;
+        let height = 2;
+        let latest_rgba = deterministic_test_rgba(width, height, 71);
+        let old_rgba = deterministic_test_rgba(width, height, 17);
+        let mut images = Assets::<Image>::default();
+        let texture = AutoGazeTexture {
+            image: images.add(visualization_image(1, 1, vec![0; 4])),
+            input_image: images.add(visualization_image(
+                width as u32,
+                height as u32,
+                latest_rgba.clone(),
+            )),
+            mask_image: images.add(visualization_image(
+                width as u32,
+                height as u32,
+                vec![0; latest_rgba.len()],
+            )),
+            output_image: images.add(visualization_image(
+                width as u32,
+                height as u32,
+                latest_rgba.clone(),
+            )),
+            ..AutoGazeTexture::default()
+        };
+        let input_handle = texture.input_image.clone();
+        let mut world = World::new();
+        world.insert_resource(images);
+        world.insert_resource(texture);
+        world.insert_resource(BevyVisualizationState::new(
+            AutoGazeVisualizationMode::Interframe,
+            0,
+        ));
+
+        let display_ms = apply_completed_model_visualization(
+            &mut world,
+            (width * 3) as u32,
+            height as u32,
+            panel_visualization_payload(width, height, old_rgba.clone()),
+            BevyVisualizationState::new(AutoGazeVisualizationMode::Interframe, 0),
+            CompletedModelDisplayAction::UpdateMaskOnly,
+        );
+
+        assert_eq!(display_ms, 0.0);
+        assert_eq!(
+            panel_image_data(&world, &input_handle),
+            latest_rgba,
+            "mask-only completions must not redraw older model input frames"
+        );
+
+        apply_completed_model_visualization(
+            &mut world,
+            (width * 3) as u32,
+            height as u32,
+            panel_visualization_payload(width, height, old_rgba.clone()),
+            BevyVisualizationState::new(AutoGazeVisualizationMode::Interframe, 0),
+            CompletedModelDisplayAction::DisplayVisualization,
+        );
+
+        assert_eq!(panel_image_data(&world, &input_handle), old_rgba);
     }
 
     #[test]
