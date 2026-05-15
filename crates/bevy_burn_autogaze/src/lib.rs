@@ -79,9 +79,11 @@ pub use config::{
 };
 use display::{
     AutoGazeTexture, OneShotGpuUpload, TensorPanelVisualizationData, Visualization,
-    VisualizationImageData, apply_visualization_to_texture, apply_visualization_to_world,
-    sync_texture_layout_nodes, visualization_image,
+    VisualizationImageData, apply_visualization_to_preview_display, apply_visualization_to_world,
+    visualization_image,
 };
+#[cfg(test)]
+use display::{apply_visualization_to_texture, sync_texture_layout_nodes};
 
 pub type AutoGazeBevyBackend = burn::backend::WebGpu<f32, i32>;
 pub type AutoGazeBevyDevice = burn::backend::wgpu::WgpuDevice;
@@ -1877,8 +1879,7 @@ fn preview_frames(
     if let Some(psnr_db) = visualization.psnr_db {
         frame_input.psnr_stats.record(psnr_db);
     }
-    apply_visualization_to_texture(visualization, &mut texture, &mut images);
-    sync_texture_layout_nodes(&texture, &mut nodes);
+    apply_visualization_to_preview_display(visualization, &mut texture, &mut images, &mut nodes);
 }
 
 fn handle_tasks(
@@ -4638,6 +4639,202 @@ mod tests {
         let output_data = output.data.as_ref().expect("output panel data");
         assert_eq!(output_data.len(), input_rgba.len());
         assert_eq!(output_data, &input_rgba);
+    }
+
+    #[derive(Resource, Clone)]
+    struct PreviewDisplayFixture {
+        width: usize,
+        height: usize,
+        input_rgba: Vec<u8>,
+        mask_rgba: Vec<u8>,
+        output_rgba: Vec<u8>,
+    }
+
+    #[test]
+    fn preview_display_update_writes_visible_nonblack_panels() {
+        use crate::display::AutoGazeTextureLayout;
+
+        let width = 4;
+        let height = 3;
+        let input_rgba = deterministic_test_rgba(width, height, 53);
+        let mask_rgba = deterministic_test_rgba(width, height, 59);
+        let output_rgba = deterministic_test_rgba(width, height, 61);
+        assert_ne!(input_rgba, vec![0; input_rgba.len()]);
+
+        let mut images = Assets::<Image>::default();
+        let side_by_side_rgba = vec![0; 4];
+        let texture = AutoGazeTexture {
+            image: images.add(visualization_image(1, 1, side_by_side_rgba)),
+            input_image: images.add(visualization_image(
+                width as u32,
+                height as u32,
+                vec![0; input_rgba.len()],
+            )),
+            mask_image: images.add(visualization_image(
+                width as u32,
+                height as u32,
+                vec![0; mask_rgba.len()],
+            )),
+            output_image: images.add(visualization_image(
+                width as u32,
+                height as u32,
+                vec![0; output_rgba.len()],
+            )),
+            layout: AutoGazeTextureLayout::SideBySide,
+            ..AutoGazeTexture::default()
+        };
+
+        let mut app = App::new();
+        let side_by_side_entity = app
+            .world_mut()
+            .spawn(Node {
+                display: Display::Flex,
+                ..default()
+            })
+            .id();
+        let input_entity = app
+            .world_mut()
+            .spawn(Node {
+                display: Display::None,
+                ..default()
+            })
+            .id();
+        let mask_entity = app
+            .world_mut()
+            .spawn(Node {
+                display: Display::None,
+                ..default()
+            })
+            .id();
+        let output_entity = app
+            .world_mut()
+            .spawn(Node {
+                display: Display::None,
+                ..default()
+            })
+            .id();
+
+        let mut texture = texture;
+        let input_handle = texture.input_image.clone();
+        let mask_handle = texture.mask_image.clone();
+        let output_handle = texture.output_image.clone();
+        texture.side_by_side_entity = Some(side_by_side_entity);
+        texture.input_entity = Some(input_entity);
+        texture.mask_entity = Some(mask_entity);
+        texture.output_entity = Some(output_entity);
+        app.insert_resource(images);
+        app.insert_resource(texture);
+        app.insert_resource(PreviewDisplayFixture {
+            width,
+            height,
+            input_rgba: input_rgba.clone(),
+            mask_rgba: mask_rgba.clone(),
+            output_rgba: output_rgba.clone(),
+        });
+        app.add_systems(
+            Update,
+            |fixture: Res<PreviewDisplayFixture>,
+             mut texture: ResMut<AutoGazeTexture>,
+             mut images: ResMut<Assets<Image>>,
+             mut nodes: Query<&mut Node>| {
+                let visualization = Visualization {
+                    width: (fixture.width * 3) as u32,
+                    height: fixture.height as u32,
+                    rgba: Vec::new(),
+                    tensor: None,
+                    image_data: VisualizationImageData::PanelsRgba {
+                        panel_width: fixture.width as u32,
+                        panel_height: fixture.height as u32,
+                        input_rgba: fixture.input_rgba.clone(),
+                        mask_rgba: fixture.mask_rgba.clone(),
+                        output_rgba: fixture.output_rgba.clone(),
+                        output_matches_input: false,
+                    },
+                    gaze_update_ratio: 0.25,
+                    output_update_ratio: 0.25,
+                    interframe_keyframe: false,
+                    psnr_db: Some(42.0),
+                    visualize_cpu_ms: 0.0,
+                    psnr_ms: 0.0,
+                    tensor_ms: 0.0,
+                    output_rgba_bytes: fixture.input_rgba.len() * 3,
+                    output_tensor_bytes: 0,
+                    tensor_interframe_path: None,
+                    effective_display_transfer: BevyDisplayTransfer::Cpu,
+                    mask_plan_stats: AutoGazeMaskPlanStats::default(),
+                    timing: None,
+                };
+                apply_visualization_to_preview_display(
+                    visualization,
+                    &mut texture,
+                    &mut images,
+                    &mut nodes,
+                );
+            },
+        );
+        app.update();
+
+        let texture = app.world().resource::<AutoGazeTexture>();
+        assert_eq!(texture.layout, AutoGazeTextureLayout::Panels);
+        assert_eq!(texture.width, (width * 3) as u32);
+        assert_eq!(texture.height, height as u32);
+        assert_eq!(
+            app.world()
+                .get::<Node>(side_by_side_entity)
+                .expect("side node")
+                .display,
+            Display::None
+        );
+        assert_eq!(
+            app.world()
+                .get::<Node>(input_entity)
+                .expect("input node")
+                .display,
+            Display::Flex
+        );
+        assert_eq!(
+            app.world()
+                .get::<Node>(mask_entity)
+                .expect("mask node")
+                .display,
+            Display::Flex
+        );
+        assert_eq!(
+            app.world()
+                .get::<Node>(output_entity)
+                .expect("output node")
+                .display,
+            Display::Flex
+        );
+
+        let images = app.world().resource::<Assets<Image>>();
+        assert_eq!(
+            images
+                .get(&input_handle)
+                .expect("input image")
+                .data
+                .as_ref()
+                .expect("input data"),
+            &input_rgba
+        );
+        assert_eq!(
+            images
+                .get(&mask_handle)
+                .expect("mask image")
+                .data
+                .as_ref()
+                .expect("mask data"),
+            &mask_rgba
+        );
+        assert_eq!(
+            images
+                .get(&output_handle)
+                .expect("output image")
+                .data
+                .as_ref()
+                .expect("output data"),
+            &output_rgba
+        );
     }
 
     #[test]

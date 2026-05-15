@@ -149,6 +149,16 @@ pub(crate) fn apply_visualization_to_texture(
     texture.height = height;
 }
 
+pub(crate) fn apply_visualization_to_preview_display(
+    visualization: Visualization,
+    texture: &mut AutoGazeTexture,
+    images: &mut Assets<Image>,
+    nodes: &mut Query<&mut Node>,
+) {
+    apply_visualization_to_texture(visualization, texture, images);
+    sync_texture_layout_nodes(texture, nodes);
+}
+
 pub(crate) fn sync_texture_layout_nodes(texture: &AutoGazeTexture, nodes: &mut Query<&mut Node>) {
     set_node_display_query(
         nodes,
