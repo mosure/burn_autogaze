@@ -149,6 +149,34 @@ pub(crate) fn apply_visualization_to_texture(
     texture.height = height;
 }
 
+pub(crate) fn sync_texture_layout_nodes(texture: &AutoGazeTexture, nodes: &mut Query<&mut Node>) {
+    set_node_display_query(
+        nodes,
+        texture.side_by_side_entity,
+        if texture.layout == AutoGazeTextureLayout::SideBySide {
+            Display::Flex
+        } else {
+            Display::None
+        },
+    );
+
+    for entity in [
+        texture.input_entity,
+        texture.mask_entity,
+        texture.output_entity,
+    ] {
+        set_node_display_query(
+            nodes,
+            entity,
+            if texture.layout == AutoGazeTextureLayout::Panels {
+                Display::Flex
+            } else {
+                Display::None
+            },
+        );
+    }
+}
+
 pub(crate) fn apply_visualization_to_world(
     world: &mut World,
     width: u32,
@@ -322,6 +350,14 @@ fn set_texture_layout(world: &mut World, texture: &AutoGazeTexture, layout: Auto
 fn set_node_display(world: &mut World, entity: Entity, display: Display) {
     if let Ok(mut entity) = world.get_entity_mut(entity)
         && let Some(mut node) = entity.get_mut::<Node>()
+    {
+        node.display = display;
+    }
+}
+
+fn set_node_display_query(nodes: &mut Query<&mut Node>, entity: Option<Entity>, display: Display) {
+    if let Some(entity) = entity
+        && let Ok(mut node) = nodes.get_mut(entity)
     {
         node.display = display;
     }

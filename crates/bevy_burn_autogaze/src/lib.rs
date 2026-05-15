@@ -80,7 +80,7 @@ pub use config::{
 use display::{
     AutoGazeTexture, OneShotGpuUpload, TensorPanelVisualizationData, Visualization,
     VisualizationImageData, apply_visualization_to_texture, apply_visualization_to_world,
-    visualization_image,
+    sync_texture_layout_nodes, visualization_image,
 };
 
 pub type AutoGazeBevyBackend = burn::backend::WebGpu<f32, i32>;
@@ -1814,6 +1814,7 @@ fn preview_frames(
     mut frame_input: FrameInputParams,
     active_tasks: Query<&ProcessAutoGaze>,
     mut images: ResMut<Assets<Image>>,
+    mut nodes: Query<&mut Node>,
 ) {
     let model_ready = model.pipeline.is_some();
     let realtime_policy = realtime_policy_from_config(&frame_input.config);
@@ -1877,6 +1878,7 @@ fn preview_frames(
         frame_input.psnr_stats.record(psnr_db);
     }
     apply_visualization_to_texture(visualization, &mut texture, &mut images);
+    sync_texture_layout_nodes(&texture, &mut nodes);
 }
 
 fn handle_tasks(
@@ -4636,6 +4638,119 @@ mod tests {
         let output_data = output.data.as_ref().expect("output panel data");
         assert_eq!(output_data.len(), input_rgba.len());
         assert_eq!(output_data, &input_rgba);
+    }
+
+    #[test]
+    fn preview_panel_texture_makes_panel_nodes_visible() {
+        use crate::display::AutoGazeTextureLayout;
+
+        let mut app = App::new();
+        app.add_systems(
+            Update,
+            |texture: Res<AutoGazeTexture>, mut nodes: Query<&mut Node>| {
+                sync_texture_layout_nodes(&texture, &mut nodes);
+            },
+        );
+
+        let side_by_side_entity = app
+            .world_mut()
+            .spawn(Node {
+                display: Display::Flex,
+                ..default()
+            })
+            .id();
+        let input_entity = app
+            .world_mut()
+            .spawn(Node {
+                display: Display::None,
+                ..default()
+            })
+            .id();
+        let mask_entity = app
+            .world_mut()
+            .spawn(Node {
+                display: Display::None,
+                ..default()
+            })
+            .id();
+        let output_entity = app
+            .world_mut()
+            .spawn(Node {
+                display: Display::None,
+                ..default()
+            })
+            .id();
+        app.insert_resource(AutoGazeTexture {
+            side_by_side_entity: Some(side_by_side_entity),
+            input_entity: Some(input_entity),
+            mask_entity: Some(mask_entity),
+            output_entity: Some(output_entity),
+            layout: AutoGazeTextureLayout::Panels,
+            ..AutoGazeTexture::default()
+        });
+        app.update();
+
+        assert_eq!(
+            app.world()
+                .get::<Node>(side_by_side_entity)
+                .expect("side node")
+                .display,
+            Display::None
+        );
+        assert_eq!(
+            app.world()
+                .get::<Node>(input_entity)
+                .expect("input node")
+                .display,
+            Display::Flex
+        );
+        assert_eq!(
+            app.world()
+                .get::<Node>(mask_entity)
+                .expect("mask node")
+                .display,
+            Display::Flex
+        );
+        assert_eq!(
+            app.world()
+                .get::<Node>(output_entity)
+                .expect("output node")
+                .display,
+            Display::Flex
+        );
+
+        app.world_mut().resource_mut::<AutoGazeTexture>().layout =
+            AutoGazeTextureLayout::SideBySide;
+        app.update();
+
+        assert_eq!(
+            app.world()
+                .get::<Node>(side_by_side_entity)
+                .expect("side node")
+                .display,
+            Display::Flex
+        );
+        assert_eq!(
+            app.world()
+                .get::<Node>(input_entity)
+                .expect("input node")
+                .display,
+            Display::None
+        );
+        assert_eq!(
+            app.world()
+                .get::<Node>(mask_entity)
+                .expect("mask node")
+                .display,
+            Display::None
+        );
+        assert_eq!(
+            app.world()
+                .get::<Node>(output_entity)
+                .expect("output node")
+                .display,
+            Display::None
+        );
     }
 
     #[test]
