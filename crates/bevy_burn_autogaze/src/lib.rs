@@ -71,10 +71,9 @@ pub use config::{
     DEFAULT_BIRDS_INFERENCE_WIDTH, DEFAULT_BIRDS_KEYFRAME_DURATION, DEFAULT_BIRDS_MAX_GAZE_TOKENS,
     DEFAULT_BIRDS_TILE_BATCH_SIZE, DEFAULT_BIRDS_TOP_K, DEFAULT_CONFIG_URL,
     DEFAULT_NATIVE_MODEL_DIR, DEFAULT_REALTIME_INFERENCE_WIDTH, DEFAULT_REALTIME_MAX_GAZE_TOKENS,
-    DEFAULT_REALTIME_QUALITY_MAX_GAZE_TOKENS, DEFAULT_TILED_INFERENCE_WIDTH, DEFAULT_WEIGHTS_URL,
-    ImplicitModeDefaults, default_frames_per_clip, default_inference_dimensions,
-    default_max_gaze_tokens_each_frame, default_max_gaze_tokens_for_limit,
-    default_model_config_max_gaze_tokens_each_frame, default_tile_batch_size, default_top_k,
+    DEFAULT_TILED_INFERENCE_WIDTH, DEFAULT_WEIGHTS_URL, ImplicitModeDefaults,
+    default_frames_per_clip, default_inference_dimensions, default_max_gaze_tokens_each_frame,
+    default_max_gaze_tokens_for_limit, default_tile_batch_size, default_top_k,
     realtime_policy_from_config,
 };
 use display::{
@@ -105,7 +104,6 @@ const TASK_LOSS_SLIDER_MIN: f32 = 0.0;
 const TASK_LOSS_SLIDER_MAX: f32 = 1.0;
 const TASK_LOSS_SLIDER_STEP: f32 = 0.01;
 const TASK_LOSS_SLIDER_WIDTH: f32 = 180.0;
-const TASK_LOSS_SLIDER_FULL_BUDGET_PERCENT: f32 = 0.98;
 const MODEL_FPS: DiagnosticPath = DiagnosticPath::const_new("autogaze_model_fps");
 const AUTO_GPU_DISPLAY_MAX_PIXELS: usize = 224 * 224;
 
@@ -378,7 +376,6 @@ impl BevyVisualizationState {
 struct TaskLossSliderState {
     value: f32,
     pending_value: Option<f32>,
-    pending_decode_budget: Option<usize>,
     dragging: bool,
 }
 
@@ -390,7 +387,6 @@ impl TaskLossSliderState {
         Self {
             value: quantize_task_loss_slider_value(value),
             pending_value: None,
-            pending_decode_budget: None,
             dragging: false,
         }
     }
@@ -3757,18 +3753,7 @@ fn task_loss_slider_update_system(
     if let Some(value) = next_value
         && (value - slider.value).abs() >= TASK_LOSS_SLIDER_STEP * 0.5
     {
-        let decode_budget = task_loss_slider_decode_budget(value, config.mode);
-        slider.value = value;
-        slider.pending_value = Some(value);
-        slider.pending_decode_budget = Some(decode_budget);
-        config.task_loss_requirement = Some(value);
-        config.disable_task_loss_requirement = false;
-        config.max_gaze_tokens_each_frame = decode_budget;
-        config.limit_generation_budget = decode_budget > 0;
-        model.config.task_loss_requirement = Some(value);
-        model.config.disable_task_loss_requirement = false;
-        model.config.max_gaze_tokens_each_frame = decode_budget;
-        model.config.limit_generation_budget = decode_budget > 0;
+        apply_task_loss_slider_value(&mut slider, &mut config, &mut model.config, value);
     }
 
     if let Some(value) = slider.pending_value {
@@ -3777,17 +3762,24 @@ fn task_loss_slider_update_system(
         };
         if let Ok(mut pipeline) = pipeline.try_lock() {
             pipeline.set_task_loss_requirement(Some(value));
-            if let Some(decode_budget) = slider.pending_decode_budget {
-                if decode_budget == 0 {
-                    pipeline.reset_max_gaze_tokens_each_frame();
-                } else {
-                    pipeline.set_max_gaze_tokens_each_frame(decode_budget);
-                }
-            }
             slider.pending_value = None;
-            slider.pending_decode_budget = None;
         }
     }
+}
+
+fn apply_task_loss_slider_value(
+    slider: &mut TaskLossSliderState,
+    config: &mut BevyBurnAutoGazeConfig,
+    model_config: &mut BevyBurnAutoGazeConfig,
+    value: f32,
+) {
+    let value = quantize_task_loss_slider_value(value);
+    slider.value = value;
+    slider.pending_value = Some(value);
+    config.task_loss_requirement = Some(value);
+    config.disable_task_loss_requirement = false;
+    model_config.task_loss_requirement = Some(value);
+    model_config.disable_task_loss_requirement = false;
 }
 
 fn task_loss_slider_style_system(
@@ -3825,21 +3817,6 @@ fn task_loss_slider_value_from_normalized_x(normalized_x: f32) -> f32 {
     quantize_task_loss_slider_value(
         TASK_LOSS_SLIDER_MAX - quality * (TASK_LOSS_SLIDER_MAX - TASK_LOSS_SLIDER_MIN),
     )
-}
-
-fn task_loss_slider_decode_budget(value: f32, mode: BevyAutoGazeMode) -> usize {
-    let quality = task_loss_slider_percent(value);
-    if quality >= TASK_LOSS_SLIDER_FULL_BUDGET_PERCENT {
-        return default_model_config_max_gaze_tokens_each_frame();
-    }
-    let min_budget = default_max_gaze_tokens_each_frame(mode).max(1);
-    let max_budget = match mode {
-        BevyAutoGazeMode::Resize224 => DEFAULT_REALTIME_QUALITY_MAX_GAZE_TOKENS,
-        BevyAutoGazeMode::Tile224 => DEFAULT_TILED_MAX_GAZE_TOKENS,
-    }
-    .max(min_budget);
-    let scaled = min_budget as f32 + quality * (max_budget - min_budget) as f32;
-    scaled.round().max(1.0) as usize
 }
 
 fn task_loss_slider_label(value: f32) -> String {
@@ -5531,7 +5508,7 @@ mod tests {
     }
 
     #[test]
-    fn task_loss_slider_maps_right_to_higher_quality_and_budget() {
+    fn task_loss_slider_maps_right_to_higher_quality() {
         assert_eq!(task_loss_slider_percent(TASK_LOSS_SLIDER_MAX), 0.0);
         assert_eq!(task_loss_slider_percent(TASK_LOSS_SLIDER_MIN), 1.0);
         assert_eq!(
@@ -5548,18 +5525,29 @@ mod tests {
         );
         assert_eq!(task_loss_slider_label(TASK_LOSS_SLIDER_MIN), "100.0%");
         assert_eq!(task_loss_slider_label(TASK_LOSS_SLIDER_MAX), "  0.0%");
-        assert_eq!(
-            task_loss_slider_decode_budget(TASK_LOSS_SLIDER_MAX, BevyAutoGazeMode::Resize224),
-            DEFAULT_REALTIME_MAX_GAZE_TOKENS
-        );
-        assert_eq!(
-            task_loss_slider_decode_budget(TASK_LOSS_SLIDER_MIN, BevyAutoGazeMode::Resize224),
-            default_model_config_max_gaze_tokens_each_frame()
-        );
-        assert!(
-            task_loss_slider_decode_budget(0.25, BevyAutoGazeMode::Resize224)
-                > task_loss_slider_decode_budget(0.75, BevyAutoGazeMode::Resize224)
-        );
+    }
+
+    #[test]
+    fn task_loss_slider_does_not_change_decode_budget() {
+        let mut config = BevyBurnAutoGazeConfig {
+            max_gaze_tokens_each_frame: 19,
+            limit_generation_budget: true,
+            task_loss_requirement: Some(0.56),
+            ..Default::default()
+        };
+        let mut model_config = config.clone();
+        let mut slider = TaskLossSliderState::new(&config);
+
+        apply_task_loss_slider_value(&mut slider, &mut config, &mut model_config, 0.61);
+
+        assert_eq!(slider.value, 0.61);
+        assert_eq!(slider.pending_value, Some(0.61));
+        assert_eq!(config.task_loss_requirement, Some(0.61));
+        assert_eq!(model_config.task_loss_requirement, Some(0.61));
+        assert_eq!(config.max_gaze_tokens_each_frame, 19);
+        assert_eq!(model_config.max_gaze_tokens_each_frame, 19);
+        assert!(config.limit_generation_budget);
+        assert!(model_config.limit_generation_budget);
     }
 
     #[test]
