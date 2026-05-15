@@ -323,6 +323,10 @@ impl InferenceSequencer {
     fn accept(&mut self, sequence: u64) -> bool {
         self.0.accept(sequence)
     }
+
+    fn invalidate_pending(&mut self) {
+        self.0.invalidate_pending();
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -400,6 +404,10 @@ struct LatestMaskPrediction {
 impl LatestMaskPrediction {
     fn update(&mut self, points: Vec<FixationPoint>) {
         self.points = points;
+    }
+
+    fn clear(&mut self) {
+        self.points.clear();
     }
 
     fn points(&self) -> &[FixationPoint] {
@@ -2516,7 +2524,7 @@ async fn run_patch_diff_visualization(
             .await
             .map_err(|err| format!("failed to build patch-diff device mask: {err:#}"))?;
         FinishedReadout {
-            points: Vec::new(),
+            points: output.points,
             device_tokens: None,
             device_mask: Some(output.mask),
             model_config: None,
@@ -3946,6 +3954,10 @@ fn mask_source_toggle_system(
     mut config: ResMut<BevyBurnAutoGazeConfig>,
     mut model: ResMut<AutoGazeModelState>,
     mut slider: ResMut<TaskLossSliderState>,
+    mut latest_mask: ResMut<LatestMaskPrediction>,
+    mut visualization_state: ResMut<BevyVisualizationState>,
+    mut streaming_state: ResMut<BevyStreamingGenerationState>,
+    mut sequencer: ResMut<InferenceSequencer>,
     toggles: Query<&Interaction, (Changed<Interaction>, With<MaskSourceToggle>)>,
 ) {
     if !config.show_task_loss_slider {
@@ -3961,16 +3973,40 @@ fn mask_source_toggle_system(
         return;
     }
 
+    apply_mask_source_toggle(
+        &mut config,
+        &mut model.config,
+        &mut slider,
+        &mut latest_mask,
+        &mut visualization_state,
+        &mut streaming_state,
+        &mut sequencer,
+    );
+}
+
+fn apply_mask_source_toggle(
+    config: &mut BevyBurnAutoGazeConfig,
+    model_config: &mut BevyBurnAutoGazeConfig,
+    slider: &mut TaskLossSliderState,
+    latest_mask: &mut LatestMaskPrediction,
+    visualization_state: &mut BevyVisualizationState,
+    streaming_state: &mut BevyStreamingGenerationState,
+    sequencer: &mut InferenceSequencer,
+) {
     config.sparse_mask_source = match config.sparse_mask_source {
         BevySparseMaskSource::AutoGaze => BevySparseMaskSource::PatchDiff,
         BevySparseMaskSource::PatchDiff => BevySparseMaskSource::AutoGaze,
     };
-    model.config.sparse_mask_source = config.sparse_mask_source;
+    model_config.sparse_mask_source = config.sparse_mask_source;
     let value = quality_slider_config_value(&config);
     slider.value = quantize_task_loss_slider_value(value);
     slider.pending_value =
         (config.sparse_mask_source == BevySparseMaskSource::AutoGaze).then_some(slider.value);
     slider.dragging = false;
+    latest_mask.clear();
+    visualization_state.reset();
+    streaming_state.reset();
+    sequencer.invalidate_pending();
 }
 
 fn apply_task_loss_slider_value(
@@ -4478,9 +4514,9 @@ mod tests {
     }
 
     #[test]
-    fn patch_diff_gpu_visualization_uses_device_mask_without_host_points() {
+    fn patch_diff_gpu_visualization_uses_device_mask_and_updates_host_preview_points() {
         if skip_native_wgpu_test_on_github_actions(
-            "patch_diff_gpu_visualization_uses_device_mask_without_host_points",
+            "patch_diff_gpu_visualization_uses_device_mask_and_updates_host_preview_points",
         ) {
             return;
         }
@@ -4529,9 +4565,10 @@ mod tests {
         ))
         .expect("patch-diff GPU visualization");
 
-        assert!(
-            points.is_empty(),
-            "GPU patch-diff should not materialize host points"
+        assert_eq!(
+            points.len(),
+            1,
+            "GPU patch-diff should read back the compact score grid so async preview uses patch-diff points"
         );
         assert_eq!(
             visualization.effective_display_transfer,
@@ -4546,7 +4583,7 @@ mod tests {
             DisplayInputResidency::ModelTensorReuse
         );
         assert_eq!(timing.generated_tokens, 1);
-        assert_eq!(timing.trace_points, 0);
+        assert_eq!(timing.trace_points, 1);
     }
 
     fn fixture_raw_rgba(
@@ -6249,6 +6286,48 @@ mod tests {
         assert!(sequencer.accept(second));
         assert!(!sequencer.accept(first));
         assert!(sequencer.accept(second + 1));
+    }
+
+    #[test]
+    fn mask_source_toggle_clears_stale_mask_state_and_invalidates_pending_results() {
+        let mut config = BevyBurnAutoGazeConfig::default();
+        let mut model_config = config.clone();
+        let mut slider = TaskLossSliderState::new(&config);
+        let mut latest_mask = LatestMaskPrediction {
+            points: vec![FixationPoint::with_extent(0.5, 0.5, 0.5, 0.5, 1.0)],
+        };
+        let mut visualization_state =
+            BevyVisualizationState::new(config.visualization_mode, config.keyframe_duration);
+        let mut streaming_state = BevyStreamingGenerationState::default();
+        streaming_state.configure(true, 4, 4, 2);
+        let mut sequencer = InferenceSequencer::default();
+        let stale_sequence = sequencer.reserve();
+
+        apply_mask_source_toggle(
+            &mut config,
+            &mut model_config,
+            &mut slider,
+            &mut latest_mask,
+            &mut visualization_state,
+            &mut streaming_state,
+            &mut sequencer,
+        );
+
+        assert_eq!(config.sparse_mask_source, BevySparseMaskSource::PatchDiff);
+        assert_eq!(
+            model_config.sparse_mask_source,
+            BevySparseMaskSource::PatchDiff
+        );
+        assert!(
+            latest_mask.points().is_empty(),
+            "mode switches must not keep drawing the previous AutoGaze mask"
+        );
+        assert!(
+            !sequencer.accept(stale_sequence),
+            "in-flight AutoGaze completions from the old mode must be rejected"
+        );
+        let fresh_sequence = sequencer.reserve();
+        assert!(sequencer.accept(fresh_sequence));
     }
 
     #[test]

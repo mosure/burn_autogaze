@@ -46,6 +46,11 @@ impl AutoGazeInferenceSequencer {
         true
     }
 
+    /// Reject all currently reserved but unfinished inference results.
+    pub fn invalidate_pending(&mut self) {
+        self.latest_applied_sequence = self.next_sequence;
+    }
+
     pub const fn is_stale(&self, sequence: u64) -> bool {
         sequence <= self.latest_applied_sequence
     }
@@ -135,6 +140,12 @@ mod tests {
         assert!(!sequencer.accept(first));
         assert!(sequencer.is_stale(second));
         assert!(sequencer.accept(second + 1));
+
+        let pending = sequencer.reserve();
+        sequencer.invalidate_pending();
+        assert!(!sequencer.accept(pending));
+        let fresh = sequencer.reserve();
+        assert!(sequencer.accept(fresh));
     }
 
     #[test]

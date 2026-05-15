@@ -80,6 +80,7 @@ impl AutoGazeSparseMaskSource {
 #[derive(Clone)]
 pub struct AutoGazePatchDiffDeviceMask<B: Backend> {
     pub mask: AutoGazeDeviceMask<B>,
+    pub points: Vec<Vec<Vec<FixationPoint>>>,
     pub grid_size: usize,
     pub active_cell_count: usize,
     pub frame_index: usize,
@@ -180,16 +181,19 @@ where
     );
 
     let grid_size = config.grid_size;
+    let score_values = scores
+        .clone()
+        .into_data_async()
+        .await
+        .map_err(|err| anyhow!("failed to read compact patch-diff score grid: {err:?}"))?
+        .to_vec::<f32>()
+        .map_err(|err| anyhow!("failed to decode compact patch-diff score grid: {err}"))?;
+    let readout = patch_diff_points_from_scores(score_values, batch, time, config)?;
+    let active_cell_count = readout.stats.active_generated_tokens;
     let active_grid = scores
         .greater_elem(config.threshold)
         .float()
         .reshape([batch, 1, grid_size, grid_size]);
-    let active_cell_count = active_grid
-        .clone()
-        .sum()
-        .into_scalar_async()
-        .await
-        .map_err(|err| anyhow!("failed to read patch-diff active-cell count: {err:?}"))?;
     let alpha_grid = if height.is_multiple_of(grid_size) && width.is_multiple_of(grid_size) {
         active_grid
             .reshape([batch, 1, grid_size, 1, grid_size, 1])
@@ -206,22 +210,20 @@ where
     let alpha = alpha_grid
         .slice([0..1, 0..1, 0..height, 0..width])
         .reshape([height, width, 1]);
-    let pixel_count = alpha
-        .clone()
-        .sum()
-        .into_scalar_async()
-        .await
-        .map_err(|err| anyhow!("failed to read patch-diff mask pixel count: {err:?}"))?;
-    let active_cell_count = scalar_count_to_usize(
-        f64::from(active_cell_count),
-        grid_size.saturating_mul(grid_size),
-    );
-    let pixel_count = scalar_count_to_usize(f64::from(pixel_count), height.saturating_mul(width));
-    let stats = AutoGazeReadoutStats {
-        generated_tokens: active_cell_count,
-        active_generated_tokens: active_cell_count,
-        padded_generated_tokens: 0,
+    let pixel_count = if height.is_multiple_of(grid_size) && width.is_multiple_of(grid_size) {
+        active_cell_count
+            .saturating_mul(height / grid_size)
+            .saturating_mul(width / grid_size)
+    } else {
+        let pixel_count = alpha
+            .clone()
+            .sum()
+            .into_scalar_async()
+            .await
+            .map_err(|err| anyhow!("failed to read patch-diff mask pixel count: {err:?}"))?;
+        scalar_count_to_usize(f64::from(pixel_count), height.saturating_mul(width))
     };
+    let stats = readout.stats;
 
     Ok(AutoGazePatchDiffDeviceMask {
         mask: AutoGazeDeviceMask {
@@ -232,6 +234,7 @@ where
                 pixel_count,
             },
         },
+        points: readout.points,
         grid_size,
         active_cell_count,
         frame_index: time.saturating_sub(1),
