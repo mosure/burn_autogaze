@@ -7,6 +7,9 @@ const wasmPanicNeedles = [
   "std::time::Instant",
   "condvar wait not supported",
   "cannot recursively acquire mutex",
+  "Buffer is already mapped",
+  "used in submit while mapped",
+  "Validation RenderError",
 ];
 
 function combinedOutput(consoleLines, pageErrors) {
@@ -229,6 +232,74 @@ test("synthetic wasm source does not request webcam frames", async ({ page }) =>
   }
   expect(state).toBe("running");
   expect(pageErrors).toEqual([]);
+  expectNoKnownWasmPanic(consoleLines, pageErrors);
+});
+
+test("patch-diff wasm gpu display does not reuse mapped readback buffers", async ({
+  page,
+}) => {
+  const consoleLines = [];
+  const pageErrors = [];
+
+  page.on("console", (message) => {
+    consoleLines.push(`${message.type()}: ${message.text()}`);
+  });
+  page.on("pageerror", (error) => {
+    pageErrors.push(error.message);
+  });
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: {
+        getUserMedia: async () => {
+          throw new Error("webcam should not be requested in static-source mode");
+        },
+      },
+    });
+  });
+
+  await page.goto(
+    "/?source=static&load-model=false&mask-source=patch-diff&display-transfer=gpu&show-fps=false&show-gaze-ratio=false&show-psnr=false&mode=realtime&visualization-mode=interframe&frames-per-clip=2&static-width=64&static-height=64&inference-width=64&inference-height=64&static-fps=5&perf-summary-frames=2&patch-diff-grid=64&patch-diff-threshold=0.01",
+    { waitUntil: "domcontentloaded" },
+  );
+
+  let state = "pending";
+  await expect
+    .poll(
+      async () => {
+        const output = combinedOutput(consoleLines, pageErrors);
+        if (wasmPanicNeedles.some((needle) => output.includes(needle))) {
+          state = "known-panic";
+        } else if (await page.evaluate(() => Boolean(window.__autogazePerfSummary))) {
+          state = "summary";
+        } else if (isDeviceLost(output)) {
+          state = "device-lost";
+        } else {
+          state = "pending";
+        }
+        return state;
+      },
+      { timeout: 90_000 },
+    )
+    .not.toBe("pending");
+
+  expect(state).not.toBe("known-panic");
+  if (state === "device-lost") {
+    expectNoKnownWasmPanic(consoleLines, pageErrors);
+    return;
+  }
+
+  expect(state).toBe("summary");
+  const perfSummary = await page.evaluate(
+    () => window.__autogazePerfSummary || null,
+  );
+  expect(perfSummary).not.toBeNull();
+  expect(perfSummary.sparse_mask_source).toBe("patch-diff");
+  expect(perfSummary.display_transfer).toBe("gpu");
+  expect(perfSummary.latest_effective_display_transfer).toBe("gpu");
+  expect(perfSummary.latest_width).toBe(64);
+  expect(perfSummary.latest_height).toBe(64);
+  expect(perfSummary.processed_frames).toBeGreaterThanOrEqual(2);
   expectNoKnownWasmPanic(consoleLines, pageErrors);
 });
 

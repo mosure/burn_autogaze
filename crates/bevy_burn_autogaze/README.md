@@ -11,24 +11,25 @@ cargo run -p bevy_burn_autogaze -- --image-path path/to/frame.png
 cargo run -p bevy_burn_autogaze -- --mode tiled --visualization-mode interframe
 ```
 
-The no-arg default is the realtime camera profile:
+The no-arg default is the lightweight realtime camera profile:
 
-- `resize-224` model input.
+- Patch-diff sparse mask source, so startup does not block on NVIDIA model
+  load/init.
 - 640px aspect-preserving source frames.
-- 16-frame rolling streaming cache.
-- Bounded realtime generation budget.
 - Deduplicated mask geometry.
 - Adaptive CPU/GPU display transfer.
 - Interframe output with PSNR enabled.
 - Async camera preview: new frames draw with the latest accepted mask while the
-  next decode is in flight.
-- Live quality slider for the task-loss threshold and decode budget.
+  next sparse-mask inference job is in flight.
+- Live quality slider for the active mask source threshold.
 - No periodic visualization keyframes.
 
-Point at local model assets with:
+Run the NVIDIA AutoGaze model by selecting the AutoGaze mask source and pointing
+at local model assets:
 
 ```sh
 cargo run -p bevy_burn_autogaze -- \
+  --mask-source autogaze \
   --model-dir /path/to/AutoGaze
 ```
 
@@ -40,6 +41,7 @@ model.
 | option | default | notes |
 |---|---|---|
 | `--source` | `camera` | `camera`, `static`, `synthetic-pan`, `synthetic-pulse`, or `synthetic-local-motion`; `--image-path` selects `static` automatically. |
+| `--mask-source` | `patch-diff` | `patch-diff` starts quickly and uses tensor patch differences; `autogaze` loads/runs the NVIDIA model. |
 | `--mode` | `realtime` | `realtime`, `resize-224`, `tiled`, or full-resolution tiled aliases. |
 | `--frames-per-clip` | `16` | Number of frames in the model context window. |
 | `--streaming-cache` | `true` in realtime | Advances one frame at a time and preserves KV/cache order. |

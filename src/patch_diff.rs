@@ -155,18 +155,16 @@ pub async fn patch_diff_device_mask_async<B: Backend>(
     config: AutoGazePatchDiffConfig,
     height: usize,
     width: usize,
-) -> Result<AutoGazePatchDiffDeviceMask<B>>
-where
-    f64: From<<B as burn::tensor::backend::BackendTypes>::FloatElem>,
-{
+) -> Result<AutoGazePatchDiffDeviceMask<B>> {
     let config = config.normalized();
     ensure!(
         height > 0 && width > 0,
         "patch-diff mask dimensions must be nonzero"
     );
     let [_video_batch, time, _channels, _video_height, _video_width] = video.shape().dims::<5>();
-    let scores = patch_diff_scores(video, config)?;
-    let [batch, cells] = scores.shape().dims::<2>();
+    let mask_scores = patch_diff_scores(video.clone(), config)?;
+    let readout_scores = patch_diff_scores(video, config)?;
+    let [batch, cells] = mask_scores.shape().dims::<2>();
     ensure!(
         batch == 1,
         "patch-diff device mask currently supports one visualization batch"
@@ -177,16 +175,7 @@ where
     );
 
     let grid_size = config.grid_size;
-    let score_values = scores
-        .clone()
-        .into_data_async()
-        .await
-        .map_err(|err| anyhow!("failed to read compact patch-diff score grid: {err:?}"))?
-        .to_vec::<f32>()
-        .map_err(|err| anyhow!("failed to decode compact patch-diff score grid: {err}"))?;
-    let readout = patch_diff_points_from_scores(score_values, batch, time, config)?;
-    let active_cell_count = readout.stats.active_generated_tokens;
-    let active_grid = scores
+    let active_grid = mask_scores
         .greater_elem(config.threshold)
         .float()
         .reshape([batch, 1, grid_size, grid_size]);
@@ -206,19 +195,15 @@ where
     let alpha = alpha_grid
         .slice([0..1, 0..1, 0..height, 0..width])
         .reshape([height, width, 1]);
-    let pixel_count = if height.is_multiple_of(grid_size) && width.is_multiple_of(grid_size) {
-        active_cell_count
-            .saturating_mul(height / grid_size)
-            .saturating_mul(width / grid_size)
-    } else {
-        let pixel_count = alpha
-            .clone()
-            .sum()
-            .into_scalar_async()
-            .await
-            .map_err(|err| anyhow!("failed to read patch-diff mask pixel count: {err:?}"))?;
-        scalar_count_to_usize(f64::from(pixel_count), height.saturating_mul(width))
-    };
+    let score_values = readout_scores
+        .into_data_async()
+        .await
+        .map_err(|err| anyhow!("failed to read compact patch-diff score grid: {err:?}"))?
+        .to_vec::<f32>()
+        .map_err(|err| anyhow!("failed to decode compact patch-diff score grid: {err}"))?;
+    let pixel_count = patch_diff_active_pixel_count(&score_values, config, height, width)?;
+    let readout = patch_diff_points_from_scores(score_values, batch, time, config)?;
+    let active_cell_count = readout.stats.active_generated_tokens;
     let stats = readout.stats;
 
     Ok(AutoGazePatchDiffDeviceMask {
@@ -370,11 +355,44 @@ fn patch_diff_readout_stats(
     }
 }
 
-fn scalar_count_to_usize(value: f64, max: usize) -> usize {
-    if value.is_finite() {
-        value.round().clamp(0.0, max as f64) as usize
-    } else {
+fn patch_diff_active_pixel_count(
+    score_values: &[f32],
+    config: AutoGazePatchDiffConfig,
+    height: usize,
+    width: usize,
+) -> Result<usize> {
+    let config = config.normalized();
+    let grid_size = config.grid_size;
+    ensure!(
+        score_values.len() >= grid_size.saturating_mul(grid_size),
+        "patch-diff score values must contain at least one grid"
+    );
+
+    let mut count = 0usize;
+    for row in 0..grid_size {
+        let row_pixels = nearest_resize_bin_len(row, grid_size, height);
+        for col in 0..grid_size {
+            let score = score_values[row * grid_size + col];
+            if score.is_finite() && score > config.threshold {
+                count = count.saturating_add(
+                    row_pixels.saturating_mul(nearest_resize_bin_len(col, grid_size, width)),
+                );
+            }
+        }
+    }
+    Ok(count.min(height.saturating_mul(width)))
+}
+
+fn nearest_resize_bin_len(index: usize, bins: usize, output: usize) -> usize {
+    ceil_div((index + 1).saturating_mul(output), bins)
+        .saturating_sub(ceil_div(index.saturating_mul(output), bins))
+}
+
+fn ceil_div(numerator: usize, denominator: usize) -> usize {
+    if denominator == 0 {
         0
+    } else {
+        numerator.div_ceil(denominator)
     }
 }
 
@@ -502,6 +520,37 @@ mod tests {
         assert_eq!(output.stats.active_generated_tokens, 1);
         assert_eq!(output.mask.mask_plan_stats.pixel_count, 4);
         assert_eq!(alpha.iter().filter(|value| **value > 0.0).count(), 4);
+    }
+
+    #[test]
+    fn patch_diff_device_mask_counts_non_divisible_nearest_bins_without_alpha_readback() {
+        let device = Default::default();
+        let mut values = vec![0.0; 2 * 3 * 5 * 7];
+        let frame_stride = 3 * 5 * 7;
+        for channel in 0..3 {
+            let channel_offset = frame_stride + channel * 5 * 7;
+            for y in 0..3 {
+                for x in 0..4 {
+                    values[channel_offset + y * 7 + x] = 1.0;
+                }
+            }
+        }
+        let video =
+            Tensor::<TestBackend, 5>::from_data(TensorData::new(values, [1, 2, 3, 5, 7]), &device);
+
+        let output = futures_lite::future::block_on(patch_diff_device_mask_async(
+            video,
+            AutoGazePatchDiffConfig::new(3, 0.1),
+            5,
+            7,
+        ))
+        .unwrap();
+        let alpha = output.mask.alpha.into_data().to_vec::<f32>().unwrap();
+        let active_pixels = alpha.iter().filter(|value| **value > 0.0).count();
+
+        assert_eq!(output.mask.mask_plan_stats.pixel_count, active_pixels);
+        assert!(active_pixels > 0);
+        assert!(active_pixels < 5 * 7);
     }
 
     #[test]

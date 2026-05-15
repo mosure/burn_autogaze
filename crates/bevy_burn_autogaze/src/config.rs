@@ -108,8 +108,8 @@ impl FromStr for BevyAutoGazeMode {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum BevySparseMaskSource {
-    #[default]
     AutoGaze,
+    #[default]
     PatchDiff,
 }
 
@@ -317,7 +317,7 @@ impl Default for BevyBurnAutoGazeConfig {
             warmup_model: true,
             source: BevyFrameSource::Camera,
             image_path: None,
-            sparse_mask_source: BevySparseMaskSource::AutoGaze,
+            sparse_mask_source: BevySparseMaskSource::PatchDiff,
             patch_diff_grid_size: DEFAULT_PATCH_DIFF_GRID_SIZE,
             patch_diff_threshold: DEFAULT_PATCH_DIFF_THRESHOLD,
             mode,
@@ -1147,6 +1147,7 @@ mod tests {
     fn decode_strategy_query_controls_readback_strategy() {
         let config = BevyBurnAutoGazeConfig::default();
         assert_eq!(config.decode_strategy, DEFAULT_BEVY_DECODE_STRATEGY);
+        assert_eq!(config.sparse_mask_source, BevySparseMaskSource::PatchDiff);
 
         let mut config = BevyBurnAutoGazeConfig::default();
         let errors = config.apply_query_string("?decode-strategy=host");

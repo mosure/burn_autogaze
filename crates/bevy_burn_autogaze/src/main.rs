@@ -424,7 +424,7 @@ impl FromStr for TaskLossRequirementArg {
 #[command(
     about = "native Bevy viewer for burn_autogaze",
     version,
-    long_about = "Runs the burn_autogaze video pipeline with camera or static-image input and renders Input | Mask | Output through Bevy. The default path is a continuous realtime streaming configuration: 640px source resize, 16-frame rolling KV window, bounded realtime generated-token budget, deduplicated native mask geometry, adaptive display transfer, PSNR overlay, interframe output, a live quality slider, and no periodic visualization keyframes. Camera preview frames continue with the latest accepted mask while the next model decode is in flight. Use --max-gaze-tokens-each-frame 0 or --limit-generation-budget=false for the NVIDIA model's full configured budget, --mask-geometry native for exact decoded-cell diagnostics, --display-transfer gpu to force Bevy/Burn tensor interop, --streaming-cache=false for full-window comparison, or --mode tiled plus explicit 1080p/docs settings for full-resolution inspection."
+    long_about = "Runs the burn_autogaze video pipeline with camera or static-image input and renders Input | Mask | Output through Bevy. The no-arg default starts with the lightweight patch-diff sparse mask source to avoid NVIDIA model load/init overhead, using the realtime camera profile, 640px source resize, deduplicated mask geometry, adaptive display transfer, PSNR overlay, interframe output, a live quality slider, and no periodic visualization keyframes. Camera preview frames continue with the latest accepted mask while the next sparse-mask inference job is in flight. Use --mask-source autogaze to run the NVIDIA model, --max-gaze-tokens-each-frame 0 or --limit-generation-budget=false for the NVIDIA model's full configured budget, --mask-geometry native for exact decoded-cell diagnostics, --display-transfer gpu to force Bevy/Burn tensor interop, --streaming-cache=false for full-window comparison, or --mode tiled plus explicit 1080p/docs settings for full-resolution inspection."
 )]
 struct NativeArgs {
     #[arg(
@@ -494,7 +494,7 @@ struct NativeArgs {
         alias = "sparse-mask-source",
         alias = "mask-driver",
         value_enum,
-        default_value_t = NativeSparseMaskSource::AutoGaze,
+        default_value_t = NativeSparseMaskSource::PatchDiff,
         help = "Sparse mask source. autogaze runs the NVIDIA model; patch-diff uses tensor patch differences on the latest two frames."
     )]
     sparse_mask_source: NativeSparseMaskSource,
@@ -1115,6 +1115,7 @@ mod tests {
 
         assert_eq!(config.mode, BevyAutoGazeMode::Resize224);
         assert_eq!(config.source, BevyFrameSource::Camera);
+        assert_eq!(config.sparse_mask_source, BevySparseMaskSource::PatchDiff);
         assert_eq!(config.top_k, DEFAULT_REALTIME_TOP_K);
         assert_eq!(
             config.task_loss_requirement,
@@ -1200,7 +1201,7 @@ mod tests {
             model_dir: bevy_burn_autogaze::DEFAULT_NATIVE_MODEL_DIR.into(),
             image_path: None,
             source: None,
-            sparse_mask_source: NativeSparseMaskSource::AutoGaze,
+            sparse_mask_source: NativeSparseMaskSource::PatchDiff,
             patch_diff_grid_size: DEFAULT_PATCH_DIFF_GRID_SIZE,
             patch_diff_threshold: DEFAULT_PATCH_DIFF_THRESHOLD,
             load_model: true,

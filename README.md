@@ -97,13 +97,15 @@ cargo run -p bevy_burn_autogaze -- --mode realtime
 cargo run -p bevy_burn_autogaze -- --mode tiled --visualization-mode interframe
 ```
 
-The no-arg native default is the realtime profile: resize mode, 16-frame rolling
-KV window, bounded realtime generation budget, adaptive display transfer,
+The no-arg native default starts with patch-diff sparse masks to avoid NVIDIA
+model load/init overhead: realtime camera input, adaptive display transfer,
 interframe output, PSNR overlay, a live quality slider, and no periodic
 visualization keyframes. Camera frames keep updating with the latest accepted
-mask while the next decode is in flight. Pass `--max-gaze-tokens-each-frame 0`
-for the full NVIDIA model budget. The Bevy crate selects native or wasm
-dependencies by target, so platform features are not needed for normal runs.
+mask while the next sparse-mask inference job is in flight. Pass
+`--mask-source autogaze` to run the NVIDIA model, and
+`--max-gaze-tokens-each-frame 0` for its full configured budget. The Bevy crate
+selects native or wasm dependencies by target, so platform features are not
+needed for normal runs.
 
 See [crates/bevy_burn_autogaze/README.md](./crates/bevy_burn_autogaze/README.md)
 for CLI/query parameters, static-source browser runs, performance summaries,

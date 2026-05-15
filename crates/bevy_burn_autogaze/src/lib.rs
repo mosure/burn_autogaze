@@ -3779,7 +3779,7 @@ fn fps_update_system(
     mut query: Query<&mut TextSpan, With<FpsText>>,
 ) {
     let render_fps = diagnostic_fps(&diagnostics, &FrameTimeDiagnosticsPlugin::FPS);
-    let inference_fps = if timing.processed_frames() > 0 {
+    let model_fps = if timing.processed_frames() > 0 {
         timing
             .latest
             .map(|timing| timing.e2e_fps())
@@ -3788,7 +3788,7 @@ fn fps_update_system(
         None
     };
     for mut text in &mut query {
-        **text = stable_fps_text(render_fps, inference_fps);
+        **text = stable_fps_text(render_fps, model_fps);
     }
 }
 
@@ -4246,11 +4246,11 @@ fn quality_slider_quality_from_threshold(threshold: f32) -> f32 {
     quantize_task_loss_slider_value((TASK_LOSS_SLIDER_MAX - threshold).clamp(0.0, 1.0))
 }
 
-fn stable_fps_text(render_fps: Option<f64>, inference_fps: Option<f64>) -> String {
+fn stable_fps_text(render_fps: Option<f64>, model_fps: Option<f64>) -> String {
     format!(
         "render {} infer {}",
         format_fps(render_fps.unwrap_or(f64::NAN)),
-        format_fps(inference_fps.unwrap_or(f64::NAN))
+        format_fps(model_fps.unwrap_or(f64::NAN))
     )
 }
 
@@ -6030,6 +6030,7 @@ mod tests {
     #[test]
     fn task_loss_slider_uses_clean_quality_mapping_and_unlimits_autogaze_decode() {
         let mut config = BevyBurnAutoGazeConfig {
+            sparse_mask_source: BevySparseMaskSource::AutoGaze,
             max_gaze_tokens_each_frame: 19,
             limit_generation_budget: true,
             task_loss_requirement: Some(0.56),
@@ -6442,7 +6443,10 @@ mod tests {
 
     #[test]
     fn mask_source_toggle_clears_stale_mask_state_and_invalidates_pending_results() {
-        let mut config = BevyBurnAutoGazeConfig::default();
+        let mut config = BevyBurnAutoGazeConfig {
+            sparse_mask_source: BevySparseMaskSource::AutoGaze,
+            ..Default::default()
+        };
         let mut model_config = config.clone();
         let mut slider = TaskLossSliderState::new(&config);
         let mut latest_mask = LatestMaskPrediction {
