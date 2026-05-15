@@ -4519,6 +4519,71 @@ mod tests {
     }
 
     #[test]
+    fn preview_panel_texture_materializes_output_alias_data() {
+        let width = 4;
+        let height = 3;
+        let input_rgba = deterministic_test_rgba(width, height, 41);
+        let mask_rgba = vec![0; input_rgba.len()];
+        let mut images = Assets::<Image>::default();
+        let mut texture = AutoGazeTexture {
+            image: images.add(visualization_image(1, 1, vec![0; 4])),
+            input_image: images.add(visualization_image(
+                width as u32,
+                height as u32,
+                vec![0; input_rgba.len()],
+            )),
+            mask_image: images.add(visualization_image(
+                width as u32,
+                height as u32,
+                vec![0; input_rgba.len()],
+            )),
+            output_image: images.add(visualization_image(
+                width as u32,
+                height as u32,
+                vec![255; input_rgba.len()],
+            )),
+            ..AutoGazeTexture::default()
+        };
+
+        let visualization = Visualization {
+            width: (width * 3) as u32,
+            height: height as u32,
+            rgba: Vec::new(),
+            tensor: None,
+            image_data: VisualizationImageData::PanelsRgba {
+                panel_width: width as u32,
+                panel_height: height as u32,
+                input_rgba: input_rgba.clone(),
+                mask_rgba,
+                output_rgba: Vec::new(),
+                output_matches_input: true,
+            },
+            gaze_update_ratio: 0.0,
+            output_update_ratio: 0.0,
+            interframe_keyframe: false,
+            psnr_db: None,
+            visualize_cpu_ms: 0.0,
+            psnr_ms: 0.0,
+            tensor_ms: 0.0,
+            output_rgba_bytes: input_rgba.len() * 2,
+            output_tensor_bytes: 0,
+            tensor_interframe_path: None,
+            effective_display_transfer: BevyDisplayTransfer::Cpu,
+            mask_plan_stats: AutoGazeMaskPlanStats::default(),
+            timing: None,
+        };
+
+        apply_visualization_to_texture(visualization, &mut texture, &mut images);
+
+        let output = images
+            .get(&texture.output_image)
+            .expect("output panel image");
+        let output_data = output.data.as_ref().expect("output panel data");
+        assert_eq!(output_data.len(), input_rgba.len());
+        assert_eq!(output_data, &input_rgba);
+    }
+
+    #[test]
     fn auto_display_transfer_keeps_tensor_path_for_model_sized_frames() {
         assert!(uses_tensor_display_transfer(
             BevyDisplayTransfer::Auto,

@@ -119,8 +119,16 @@ pub(crate) fn apply_visualization_to_texture(
             input_rgba,
             mask_rgba,
             output_rgba,
-            output_matches_input: _,
+            output_matches_input,
         } => {
+            // This path only owns image assets, not the UI entities that can alias
+            // the output panel handle to the input panel handle. Materialize the
+            // aliased output instead of leaving the existing output image stale.
+            let output_rgba = if output_matches_input {
+                input_rgba.clone()
+            } else {
+                output_rgba
+            };
             set_panel_visualization_images(
                 texture,
                 images,
@@ -405,9 +413,16 @@ fn set_visualization_image(
     handle: &Handle<Image>,
     width: u32,
     height: u32,
-    rgba: Vec<u8>,
+    mut rgba: Vec<u8>,
     images: &mut Assets<Image>,
 ) {
+    let width = width.max(1);
+    let height = height.max(1);
+    let expected_len = width as usize * height as usize * 4;
+    if rgba.len() != expected_len {
+        rgba.resize(expected_len, 0);
+    }
+
     if let Some(mut image) = images.get_mut(handle)
         && image.width() == width
         && image.height() == height
