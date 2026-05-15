@@ -5,7 +5,7 @@ use crate::{
 use anyhow::{Result, anyhow, ensure};
 use burn::tensor::Tensor;
 use burn::tensor::backend::Backend;
-use burn::tensor::module::interpolate;
+use burn::tensor::module::{adaptive_avg_pool2d, interpolate};
 use burn::tensor::ops::{InterpolateMode, InterpolateOptions};
 use std::cmp::Ordering;
 
@@ -146,11 +146,7 @@ pub fn patch_diff_scores<B: Backend>(
     } else {
         diff.mean_dim(1)
     };
-    let grid = interpolate(
-        channel_mean,
-        [grid_size, grid_size],
-        InterpolateOptions::new(InterpolateMode::Bilinear).with_align_corners(false),
-    );
+    let grid = adaptive_avg_pool2d(channel_mean, [grid_size, grid_size]);
     Ok(grid.reshape([batch, grid_size.saturating_mul(grid_size)]))
 }
 

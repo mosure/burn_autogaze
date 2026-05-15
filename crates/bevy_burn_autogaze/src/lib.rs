@@ -26,6 +26,8 @@ use bevy::{
 };
 use bevy_burn::{BevyBurnBridgePlugin, BevyBurnHandle, BurnDevice};
 use burn::tensor::Tensor;
+#[cfg(target_arch = "wasm32")]
+use burn_autogaze::patch_diff_readout_points_async;
 use burn_autogaze::{
     AutoGazeConfig, AutoGazeDeviceMask, AutoGazeDeviceReadoutRunOutput, AutoGazeDeviceTokens,
     AutoGazeGazeRatioStats, AutoGazeInferenceMode, AutoGazeInferenceSequencer,
@@ -38,7 +40,7 @@ use burn_autogaze::{
     AutoGazeTensorVisualizationState, AutoGazeVisualizationMode, AutoGazeVisualizationState,
     FixationPoint, fixation_deduplicated_sparse_update_plan, fixation_effective_sparse_update_plan,
     fixation_sparse_update_plan, format_fps, format_gaze_ratio_percent, format_psnr_db,
-    fps_from_millis, patch_diff_device_mask_async, patch_diff_readout_points_async,
+    fps_from_millis, patch_diff_device_mask_async, patch_diff_readout_points,
     prepare_rgba_clip_for_trace, resize_rgba_frame_to_dimensions, rgba_clip_to_tensor,
     should_use_streaming_cache, video_frame_tensor,
 };
@@ -160,6 +162,10 @@ impl FrameQueue {
 
     fn latest(&self) -> Option<&RgbaImage> {
         self.inner.latest()
+    }
+
+    fn len(&self) -> usize {
+        self.inner.len()
     }
 
     fn latest_timing(&self) -> (f64, f64) {
@@ -350,6 +356,18 @@ fn completed_model_display_action(
         CompletedModelDisplayAction::UpdateMaskOnly
     } else {
         CompletedModelDisplayAction::DisplayVisualization
+    }
+}
+
+fn completed_run_display_action(
+    policy: AutoGazeRealtimePolicy,
+    use_patch_diff: bool,
+    active_task_count: usize,
+) -> CompletedModelDisplayAction {
+    if use_patch_diff {
+        CompletedModelDisplayAction::DisplayVisualization
+    } else {
+        completed_model_display_action(policy, true, active_task_count)
     }
 }
 
@@ -1609,6 +1627,7 @@ fn process_frames(
     };
     let realtime_policy = realtime_policy_from_config(&frame_input.config);
     let active_task_count = active_tasks.iter().count();
+    let log_pipeline_timing = frame_input.config.log_pipeline_timing;
     if !realtime_policy.should_start_inference(active_task_count) {
         return;
     }
@@ -1632,6 +1651,17 @@ fn process_frames(
     } else {
         frame_input.config.frames_per_clip
     };
+    if log_pipeline_timing {
+        log(&format!(
+            "starting {} inference: active_tasks={active_task_count} queue_len={} clip_frames={clip_frames}",
+            if use_patch_diff {
+                "patch-diff"
+            } else {
+                "autogaze"
+            },
+            frame_input.frame_queue.len()
+        ));
+    }
     let mut clip = match if use_patch_diff {
         frame_input.frame_queue.build_clip(clip_frames)
     } else if use_streaming_cache {
@@ -1640,7 +1670,20 @@ fn process_frames(
         frame_input.frame_queue.build_clip(clip_frames)
     } {
         Ok(Some(clip)) => clip,
-        Ok(None) => return,
+        Ok(None) => {
+            if log_pipeline_timing {
+                log(&format!(
+                    "{} inference waiting for clip: queue_len={} clip_frames={clip_frames}",
+                    if use_patch_diff {
+                        "patch-diff"
+                    } else {
+                        "autogaze"
+                    },
+                    frame_input.frame_queue.len()
+                ));
+            }
+            return;
+        }
         Err(err) => {
             log(&format!("failed to pack AutoGaze clip: {err}"));
             return;
@@ -1652,7 +1695,6 @@ fn process_frames(
 
     let task_entity = commands.spawn_empty().id();
     let top_k = frame_input.config.top_k.max(1);
-    let log_pipeline_timing = frame_input.config.log_pipeline_timing;
     let perf_summary_warmup_frames = frame_input.config.perf_summary_warmup_frames;
     let perf_trace_path = frame_input.config.perf_trace_path.clone();
     let context_frames = clip_frames.max(1);
@@ -1676,14 +1718,22 @@ fn process_frames(
     .with_cpu_panels();
     let run_config = InferenceRunConfigSummary::from(frame_input.config.as_ref());
     let completed_display_action =
-        completed_model_display_action(realtime_policy, true, active_task_count.saturating_add(1));
+        completed_run_display_action(realtime_policy, use_patch_diff, active_task_count + 1);
     frame_input.visualization_state.configure(
         frame_input.config.visualization_mode,
         frame_input.config.keyframe_duration,
     );
     let visualization_state = frame_input.visualization_state.clone();
     if !*logged_first_inference {
-        log("AutoGaze inference started; the first native run may spend time tuning GPU kernels");
+        if use_patch_diff {
+            log(
+                "Patch-diff sparse mask inference started; the first native run may spend time tuning GPU kernels",
+            );
+        } else {
+            log(
+                "AutoGaze inference started; the first native run may spend time tuning GPU kernels",
+            );
+        }
         *logged_first_inference = true;
     }
     let sequence = frame_input.inference_sequencer.reserve();
@@ -1707,6 +1757,7 @@ fn process_frames(
             visualization_options,
             visualization_state,
             device,
+            log_pipeline_timing,
         };
 
         let result = if let Some(pipeline) = pipeline {
@@ -1887,12 +1938,10 @@ fn preview_frames(
         return;
     };
 
-    frame_input.frame_queue.push_timed(
-        frame,
-        frame_input.config.frames_per_clip,
-        source_ms,
-        prepare_ms,
-    );
+    let frame_queue_len = frame_queue_len_for_config(&frame_input.config);
+    frame_input
+        .frame_queue
+        .push_timed(frame, frame_queue_len, source_ms, prepare_ms);
     let Some(frame) = frame_input.frame_queue.latest() else {
         return;
     };
@@ -2213,6 +2262,7 @@ struct AutoGazeRunContext<'a> {
     visualization_options: VisualizationOptions,
     visualization_state: BevyVisualizationState,
     device: AutoGazeBevyDevice,
+    log_pipeline_timing: bool,
 }
 
 struct PreparedAutoGazeRun {
@@ -2492,12 +2542,16 @@ async fn run_patch_diff_visualization(
         clip,
         visualization_options,
         ref device,
+        log_pipeline_timing,
         ..
     } = context;
     let input_start = timestamp_now();
     let video = rgba_clip_to_tensor::<AutoGazeBevyBackend>(clip.rgba(), clip.shape(), device)
         .map_err(|err| format!("failed to prepare patch-diff input tensor: {err:#}"))?;
     let input_ms = elapsed_ms(input_start);
+    if log_pipeline_timing {
+        log(&format!("patch-diff input prepared in {input_ms:.3} ms"));
+    }
     let display_start = timestamp_now();
     let use_tensor_display = uses_tensor_display_transfer(
         visualization_options.display_transfer,
@@ -2518,8 +2572,16 @@ async fn run_patch_diff_visualization(
     } else {
         DisplayInputResidency::None
     };
+    if log_pipeline_timing {
+        log(&format!(
+            "patch-diff display tensor residency {display_residency:?} in {display_ms:.3} ms"
+        ));
+    }
     let model_start = timestamp_now();
     let finished = if use_tensor_display {
+        if log_pipeline_timing {
+            log("patch-diff building device mask");
+        }
         let output = patch_diff_device_mask_async(video, config, clip.height(), clip.width())
             .await
             .map_err(|err| format!("failed to build patch-diff device mask: {err:#}"))?;
@@ -2537,6 +2599,13 @@ async fn run_patch_diff_visualization(
             padded_generated_tokens: output.stats.padded_generated_tokens,
         }
     } else {
+        if log_pipeline_timing {
+            log("patch-diff reading compact sparse points");
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let output = patch_diff_readout_points(video, config)
+            .map_err(|err| format!("failed to read patch-diff sparse mask: {err:#}"))?;
+        #[cfg(target_arch = "wasm32")]
         let output = patch_diff_readout_points_async(video, config)
             .await
             .map_err(|err| format!("failed to read patch-diff sparse mask: {err:#}"))?;
@@ -2546,6 +2615,12 @@ async fn run_patch_diff_visualization(
             config.normalized().token_budget(),
         )
     };
+    if log_pipeline_timing {
+        log(&format!(
+            "patch-diff readout finished in {:.3} ms",
+            finished.model_ms
+        ));
+    }
     let prepared = PreparedVisualizationRun {
         visualization_tensor: display_tensor,
         input_ms,
@@ -3314,6 +3389,14 @@ fn next_source_frame(
     }
 }
 
+fn frame_queue_len_for_config(config: &BevyBurnAutoGazeConfig) -> usize {
+    if config.sparse_mask_source == BevySparseMaskSource::PatchDiff {
+        2
+    } else {
+        config.frames_per_clip.max(1)
+    }
+}
+
 fn load_static_frame(path: Option<&Path>, config: &BevyBurnAutoGazeConfig) -> StaticFrame {
     let Some(path) = path else {
         return StaticFrame(None);
@@ -3945,6 +4028,7 @@ fn task_loss_slider_update_system(
         };
         if let Ok(mut pipeline) = pipeline.try_lock() {
             pipeline.set_task_loss_requirement(Some(value));
+            pipeline.reset_max_gaze_tokens_each_frame();
             slider.pending_value = None;
         }
     }
@@ -3998,10 +4082,10 @@ fn apply_mask_source_toggle(
         BevySparseMaskSource::PatchDiff => BevySparseMaskSource::AutoGaze,
     };
     model_config.sparse_mask_source = config.sparse_mask_source;
-    let value = quality_slider_config_value(&config);
-    slider.value = quantize_task_loss_slider_value(value);
-    slider.pending_value =
-        (config.sparse_mask_source == BevySparseMaskSource::AutoGaze).then_some(slider.value);
+    let quality = quality_slider_config_value(&config);
+    slider.value = quantize_task_loss_slider_value(quality);
+    slider.pending_value = (config.sparse_mask_source == BevySparseMaskSource::AutoGaze)
+        .then_some(quality_slider_threshold(slider.value));
     slider.dragging = false;
     latest_mask.clear();
     visualization_state.reset();
@@ -4015,20 +4099,25 @@ fn apply_task_loss_slider_value(
     model_config: &mut BevyBurnAutoGazeConfig,
     value: f32,
 ) {
-    let value = quantize_task_loss_slider_value(value);
-    slider.value = value;
+    let quality = quantize_task_loss_slider_value(value);
+    let threshold = quality_slider_threshold(quality);
+    slider.value = quality;
     match config.sparse_mask_source {
         BevySparseMaskSource::AutoGaze => {
-            slider.pending_value = Some(value);
-            config.task_loss_requirement = Some(value);
+            slider.pending_value = Some(threshold);
+            config.task_loss_requirement = Some(threshold);
             config.disable_task_loss_requirement = false;
-            model_config.task_loss_requirement = Some(value);
+            config.limit_generation_budget = false;
+            config.max_gaze_tokens_each_frame = 0;
+            model_config.task_loss_requirement = Some(threshold);
             model_config.disable_task_loss_requirement = false;
+            model_config.limit_generation_budget = false;
+            model_config.max_gaze_tokens_each_frame = 0;
         }
         BevySparseMaskSource::PatchDiff => {
             slider.pending_value = None;
-            config.patch_diff_threshold = value;
-            model_config.patch_diff_threshold = value;
+            config.patch_diff_threshold = threshold;
+            model_config.patch_diff_threshold = threshold;
         }
     }
 }
@@ -4063,12 +4152,13 @@ fn task_loss_slider_style_system(
 }
 
 fn quality_slider_config_value(config: &BevyBurnAutoGazeConfig) -> f32 {
-    match config.sparse_mask_source {
+    let threshold = match config.sparse_mask_source {
         BevySparseMaskSource::AutoGaze => config
             .task_loss_requirement
             .unwrap_or(DEFAULT_BEVY_TASK_LOSS_REQUIREMENT),
         BevySparseMaskSource::PatchDiff => config.patch_diff_threshold,
-    }
+    };
+    quality_slider_quality_from_threshold(threshold)
 }
 
 fn mask_source_label(source: BevySparseMaskSource) -> String {
@@ -4084,18 +4174,26 @@ fn quantize_task_loss_slider_value(value: f32) -> f32 {
 }
 
 fn task_loss_slider_percent(value: f32) -> f32 {
-    ((TASK_LOSS_SLIDER_MAX - value) / (TASK_LOSS_SLIDER_MAX - TASK_LOSS_SLIDER_MIN)).clamp(0.0, 1.0)
+    ((value - TASK_LOSS_SLIDER_MIN) / (TASK_LOSS_SLIDER_MAX - TASK_LOSS_SLIDER_MIN)).clamp(0.0, 1.0)
 }
 
 fn task_loss_slider_value_from_normalized_x(normalized_x: f32) -> f32 {
     let quality = (normalized_x + 0.5).clamp(0.0, 1.0);
     quantize_task_loss_slider_value(
-        TASK_LOSS_SLIDER_MAX - quality * (TASK_LOSS_SLIDER_MAX - TASK_LOSS_SLIDER_MIN),
+        TASK_LOSS_SLIDER_MIN + quality * (TASK_LOSS_SLIDER_MAX - TASK_LOSS_SLIDER_MIN),
     )
 }
 
 fn task_loss_slider_label(value: f32) -> String {
     format!("{:>5.1}%", task_loss_slider_percent(value) * 100.0)
+}
+
+fn quality_slider_threshold(quality: f32) -> f32 {
+    (TASK_LOSS_SLIDER_MAX - quantize_task_loss_slider_value(quality)).clamp(0.0, 1.0)
+}
+
+fn quality_slider_quality_from_threshold(threshold: f32) -> f32 {
+    quantize_task_loss_slider_value((TASK_LOSS_SLIDER_MAX - threshold).clamp(0.0, 1.0))
 }
 
 fn stable_fps_text(render_fps: Option<f64>, model_fps: Option<f64>) -> String {
@@ -4557,6 +4655,7 @@ mod tests {
                 0,
             ),
             device,
+            log_pipeline_timing: false,
         };
 
         let (visualization, _state, _streaming, points) = block_on(run_patch_diff_visualization(
@@ -5857,26 +5956,29 @@ mod tests {
 
     #[test]
     fn task_loss_slider_maps_right_to_higher_quality() {
-        assert_eq!(task_loss_slider_percent(TASK_LOSS_SLIDER_MAX), 0.0);
-        assert_eq!(task_loss_slider_percent(TASK_LOSS_SLIDER_MIN), 1.0);
+        assert_eq!(task_loss_slider_percent(TASK_LOSS_SLIDER_MIN), 0.0);
+        assert_eq!(task_loss_slider_percent(TASK_LOSS_SLIDER_MAX), 1.0);
         assert_eq!(
             task_loss_slider_value_from_normalized_x(-0.5),
-            TASK_LOSS_SLIDER_MAX
+            TASK_LOSS_SLIDER_MIN
         );
         assert_eq!(
             task_loss_slider_value_from_normalized_x(0.5),
-            TASK_LOSS_SLIDER_MIN
+            TASK_LOSS_SLIDER_MAX
         );
         assert!(
             task_loss_slider_value_from_normalized_x(0.25)
-                < task_loss_slider_value_from_normalized_x(-0.25)
+                > task_loss_slider_value_from_normalized_x(-0.25)
         );
-        assert_eq!(task_loss_slider_label(TASK_LOSS_SLIDER_MIN), "100.0%");
-        assert_eq!(task_loss_slider_label(TASK_LOSS_SLIDER_MAX), "  0.0%");
+        assert_eq!(quality_slider_threshold(1.0), 0.0);
+        assert_eq!(quality_slider_threshold(0.0), 1.0);
+        assert_eq!(quality_slider_quality_from_threshold(0.45), 0.55);
+        assert_eq!(task_loss_slider_label(TASK_LOSS_SLIDER_MIN), "  0.0%");
+        assert_eq!(task_loss_slider_label(TASK_LOSS_SLIDER_MAX), "100.0%");
     }
 
     #[test]
-    fn task_loss_slider_does_not_change_decode_budget() {
+    fn task_loss_slider_uses_clean_quality_mapping_and_unlimits_autogaze_decode() {
         let mut config = BevyBurnAutoGazeConfig {
             max_gaze_tokens_each_frame: 19,
             limit_generation_budget: true,
@@ -5889,13 +5991,13 @@ mod tests {
         apply_task_loss_slider_value(&mut slider, &mut config, &mut model_config, 0.61);
 
         assert_eq!(slider.value, 0.61);
-        assert_eq!(slider.pending_value, Some(0.61));
-        assert_eq!(config.task_loss_requirement, Some(0.61));
-        assert_eq!(model_config.task_loss_requirement, Some(0.61));
-        assert_eq!(config.max_gaze_tokens_each_frame, 19);
-        assert_eq!(model_config.max_gaze_tokens_each_frame, 19);
-        assert!(config.limit_generation_budget);
-        assert!(model_config.limit_generation_budget);
+        assert_eq!(slider.pending_value, Some(0.39));
+        assert_eq!(config.task_loss_requirement, Some(0.39));
+        assert_eq!(model_config.task_loss_requirement, Some(0.39));
+        assert_eq!(config.max_gaze_tokens_each_frame, 0);
+        assert_eq!(model_config.max_gaze_tokens_each_frame, 0);
+        assert!(!config.limit_generation_budget);
+        assert!(!model_config.limit_generation_budget);
     }
 
     #[test]
@@ -5909,9 +6011,9 @@ mod tests {
         let mut model_config = config.clone();
         let mut slider = TaskLossSliderState::new(&config);
 
-        apply_task_loss_slider_value(&mut slider, &mut config, &mut model_config, 0.31);
+        apply_task_loss_slider_value(&mut slider, &mut config, &mut model_config, 0.69);
 
-        assert_eq!(slider.value, 0.31);
+        assert_eq!(slider.value, 0.69);
         assert_eq!(slider.pending_value, None);
         assert_eq!(config.patch_diff_threshold, 0.31);
         assert_eq!(model_config.patch_diff_threshold, 0.31);
@@ -6338,6 +6440,14 @@ mod tests {
             completed_model_display_action(policy, true, 1),
             CompletedModelDisplayAction::UpdateMaskOnly
         );
+        assert_eq!(
+            completed_run_display_action(policy, false, 1),
+            CompletedModelDisplayAction::UpdateMaskOnly
+        );
+        assert_eq!(
+            completed_run_display_action(policy, true, 1),
+            CompletedModelDisplayAction::DisplayVisualization
+        );
     }
 
     #[test]
@@ -6512,6 +6622,23 @@ mod tests {
         assert_eq!(clip.rgba_capacity(), capacity);
         assert_eq!(&clip.rgba()[..second.as_raw().len()], second.as_raw());
         assert_eq!(&clip.rgba()[second.as_raw().len()..], third.as_raw());
+    }
+
+    #[test]
+    fn patch_diff_preview_queue_keeps_two_frame_window() {
+        let config = BevyBurnAutoGazeConfig {
+            sparse_mask_source: BevySparseMaskSource::PatchDiff,
+            frames_per_clip: 16,
+            ..Default::default()
+        };
+        assert_eq!(frame_queue_len_for_config(&config), 2);
+
+        let config = BevyBurnAutoGazeConfig {
+            sparse_mask_source: BevySparseMaskSource::AutoGaze,
+            frames_per_clip: 16,
+            ..Default::default()
+        };
+        assert_eq!(frame_queue_len_for_config(&config), 16);
     }
 
     #[test]
