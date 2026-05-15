@@ -1,15 +1,15 @@
 use crate::model::generated_to_frame_points;
 use crate::{
     AutoGazeConfig, AutoGazeGenerateOutput, AutoGazeInferenceMode, AutoGazePipeline,
-    AutoGazeRgbaClipShape, DEFAULT_REALTIME_TOP_K, FixationPoint, FrameFixationTrace,
-    ImagePyramidLevel, ImagePyramidMaskOptions, ImagePyramidTokens, SparseVideoReadoutGrid,
-    SparseVideoReadoutOptions, SparseVideoReadoutProjection,
+    AutoGazeRgbaClipShape, AutoGazeSparseMaskSource, DEFAULT_REALTIME_TOP_K, FixationPoint,
+    FrameFixationTrace, ImagePyramidLevel, ImagePyramidMaskOptions, ImagePyramidTokens,
+    SparseVideoReadoutGrid, SparseVideoReadoutOptions, SparseVideoReadoutProjection,
     batched_video_readout_tokens_to_coords, fixation_points_to_readout_rects,
     fixation_points_to_readout_tokens, frame_fixation_masks_tensor,
     frame_readout_tokens_to_video_tokens, generated_frame_readout_rects,
-    generated_frame_readout_tokens, generated_to_video_readout_tokens,
-    rgba_clip_to_inference_tensor, rgba_clip_to_tensor, tokenize_masked_image_pyramid,
-    video_readout_coords_to_tensor,
+    generated_frame_readout_tokens, generated_to_video_readout_tokens, patch_diff_points_to_traces,
+    patch_diff_readout_points, patch_diff_readout_points_async, rgba_clip_to_inference_tensor,
+    rgba_clip_to_tensor, tokenize_masked_image_pyramid, video_readout_coords_to_tensor,
 };
 use crate::{
     SparseReadoutGrid, SparseReadoutOptions, SparseReadoutRect, trace_frame_readout_rects,
@@ -641,8 +641,10 @@ impl<B: Backend> AutoGazePipelinePacket<B> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AutoGazeTensorPipelineConfig {
+    /// Sparse mask source used by the graph.
+    pub sparse_mask_source: AutoGazeSparseMaskSource,
     /// Inference geometry used by the graph.
     pub mode: AutoGazeInferenceMode,
     /// Display/readout lower bound for generated fixation points.
@@ -666,6 +668,7 @@ pub struct AutoGazeTensorPipelineConfig {
 impl Default for AutoGazeTensorPipelineConfig {
     fn default() -> Self {
         Self {
+            sparse_mask_source: AutoGazeSparseMaskSource::AutoGaze,
             mode: AutoGazeInferenceMode::ResizeToModelInput,
             top_k: DEFAULT_REALTIME_TOP_K,
             emit_traces: false,
@@ -676,6 +679,11 @@ impl Default for AutoGazeTensorPipelineConfig {
 }
 
 impl AutoGazeTensorPipelineConfig {
+    pub const fn with_sparse_mask_source(mut self, source: AutoGazeSparseMaskSource) -> Self {
+        self.sparse_mask_source = source;
+        self
+    }
+
     pub const fn with_mode(mut self, mode: AutoGazeInferenceMode) -> Self {
         self.mode = mode;
         self
@@ -713,7 +721,9 @@ impl AutoGazeTensorPacketPlan {
     fn new(config: AutoGazeTensorPipelineConfig, model_generation_budget: usize) -> Result<Self> {
         let normalized_mode = config.mode.normalized();
         ensure!(
-            !config.emit_generated || normalized_mode == AutoGazeInferenceMode::ResizeToModelInput,
+            !config.emit_generated
+                || (config.sparse_mask_source == AutoGazeSparseMaskSource::AutoGaze
+                    && normalized_mode == AutoGazeInferenceMode::ResizeToModelInput),
             "AutoGaze generated packets are only available in resize-to-model-input mode; enable emit_readout_points or emit_traces for tiled global readout"
         );
         Ok(Self {
@@ -724,6 +734,9 @@ impl AutoGazeTensorPacketPlan {
     }
 
     fn should_generate(&self) -> bool {
+        if self.config.sparse_mask_source != AutoGazeSparseMaskSource::AutoGaze {
+            return false;
+        }
         self.normalized_mode == AutoGazeInferenceMode::ResizeToModelInput
             && (self.config.emit_generated
                 || self.config.emit_readout_points
@@ -731,7 +744,15 @@ impl AutoGazeTensorPacketPlan {
     }
 
     fn direct_readout_required(&self, generated: Option<&AutoGazeGenerateOutput>) -> bool {
-        self.config.emit_readout_points && !self.config.emit_traces && generated.is_none()
+        self.config.sparse_mask_source == AutoGazeSparseMaskSource::AutoGaze
+            && self.config.emit_readout_points
+            && !self.config.emit_traces
+            && generated.is_none()
+    }
+
+    fn should_run_patch_diff(&self) -> bool {
+        self.config.sparse_mask_source.is_patch_diff()
+            && (self.config.emit_readout_points || self.config.emit_traces)
     }
 
     fn ready_readout_points(
@@ -810,6 +831,20 @@ where
         };
         let plan = self.packet_plan()?;
         let model_config = self.pipeline.model().config.clone();
+        if plan.should_run_patch_diff()
+            && let AutoGazeSparseMaskSource::PatchDiff(config) = plan.config.sparse_mask_source
+        {
+            let readout = patch_diff_readout_points(clip.tensor().clone(), config)?;
+            let traces = if plan.config.emit_traces {
+                patch_diff_points_to_traces(&readout.points, plan.config.top_k)
+            } else {
+                Vec::new()
+            };
+            let readout_points = plan.config.emit_readout_points.then_some(readout.points);
+            self.output
+                .write(plan.packet(clip, model_config, None, traces, readout_points))?;
+            return Ok(true);
+        }
         let generated = if plan.should_generate() {
             Some(
                 self.pipeline
@@ -851,6 +886,20 @@ where
         };
         let plan = self.packet_plan()?;
         let model_config = self.pipeline.model().config.clone();
+        if plan.should_run_patch_diff()
+            && let AutoGazeSparseMaskSource::PatchDiff(config) = plan.config.sparse_mask_source
+        {
+            let readout = patch_diff_readout_points_async(clip.tensor().clone(), config).await?;
+            let traces = if plan.config.emit_traces {
+                patch_diff_points_to_traces(&readout.points, plan.config.top_k)
+            } else {
+                Vec::new()
+            };
+            let readout_points = plan.config.emit_readout_points.then_some(readout.points);
+            self.output
+                .write(plan.packet(clip, model_config, None, traces, readout_points))?;
+            return Ok(true);
+        }
         let generated = if plan.should_generate() {
             Some(
                 self.pipeline
@@ -1256,6 +1305,44 @@ mod tests {
         packet
             .frame_readout_tokens(0, SparseReadoutGrid::new(1, 1), Default::default())
             .expect("tiled readout");
+    }
+
+    #[test]
+    fn tensor_pipeline_can_emit_patch_diff_readout_points_without_model_decode() {
+        let device = Default::default();
+        let mut values = vec![0.0; 2 * 3 * 28 * 28];
+        let frame_stride = 3 * 28 * 28;
+        for channel in 0..3 {
+            let channel_offset = frame_stride + channel * 28 * 28;
+            for y in 14..28 {
+                for x in 14..28 {
+                    values[channel_offset + y * 28 + x] = 1.0;
+                }
+            }
+        }
+        let tensor = Tensor::<B, 5>::from_data(TensorData::new(values, [1, 2, 3, 28, 28]), &device);
+        let clip = AutoGazeTensorClip::new(tensor).expect("clip");
+        let input = TensorClipInput::<B>::new().with_clip(clip);
+        let output = VecOutputNode::<B>::new();
+        let pipeline = AutoGazePipeline::new(crate::NativeAutoGazeModel::new(
+            &tiny_pipeline_config(),
+            &device,
+        ));
+        let mut graph = AutoGazeTensorPipeline::new(pipeline, input, output).with_config(
+            AutoGazeTensorPipelineConfig::default()
+                .with_sparse_mask_source(AutoGazeSparseMaskSource::patch_diff(2, 0.25))
+                .with_emit_readout_points(true),
+        );
+
+        assert!(graph.run_next(&device).expect("run packet"));
+
+        let packet = graph.output.packets().first().expect("packet");
+        assert!(!packet.has_generated());
+        assert!(packet.has_readout_points());
+        let points = packet.readout_points.as_ref().expect("readout points");
+        assert_eq!(points[0][1].len(), 1);
+        assert!((points[0][1][0].x - 0.75).abs() < 1.0e-6);
+        assert!((points[0][1][0].y - 0.75).abs() < 1.0e-6);
     }
 
     #[test]

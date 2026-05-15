@@ -3,12 +3,13 @@ use burn::tensor::backend::Backend;
 use burn::tensor::{Bool, Int, Tensor, TensorData};
 use burn_autogaze::{
     AutoGazeConfig, AutoGazeDecodeStrategy, AutoGazeDeviceTokens, AutoGazeInferenceMode,
-    AutoGazePipeline, AutoGazeRgbaClipShape, AutoGazeStreamingCache,
+    AutoGazePatchDiffConfig, AutoGazePipeline, AutoGazeRgbaClipShape, AutoGazeStreamingCache,
     AutoGazeTensorVisualizationOptions, AutoGazeTensorVisualizationState,
     AutoGazeVisualizationMode, AutoGazeVisualizationState, ConnectorConfig, FixationPoint,
     GazeDecoderConfig, GazeModelConfig, NativeAutoGazeModel, SparseReadoutGrid,
     SparseReadoutOptions, SparseVideoReadoutGrid, SparseVideoReadoutOptions, VisionModelConfig,
-    fixation_points_to_readout_tokens, frame_readout_tokens_to_video_coords, scale_token_layouts,
+    fixation_points_to_readout_tokens, frame_readout_tokens_to_video_coords,
+    patch_diff_device_mask_async, patch_diff_readout_points, scale_token_layouts,
     video_readout_coords_to_tensor,
 };
 use criterion::{
@@ -684,6 +685,20 @@ fn bench_rgba_e2e_video(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_patch_diff_sparse_mask(c: &mut Criterion) {
+    let mut group = c.benchmark_group("autogaze_patch_diff_sparse_mask");
+    group.sample_size(10);
+    register_ndarray_patch_diff(&mut group);
+
+    #[cfg(feature = "webgpu")]
+    register_webgpu_patch_diff(&mut group);
+
+    #[cfg(feature = "cuda")]
+    register_cuda_patch_diff(&mut group);
+
+    group.finish();
+}
+
 fn bench_visualization(c: &mut Criterion) {
     let mut group = c.benchmark_group("autogaze_visualization");
     group.sample_size(10);
@@ -868,6 +883,17 @@ fn register_ndarray_rgba_e2e(group: &mut BenchmarkGroup<'_, WallTime>) {
 #[cfg(not(feature = "ndarray"))]
 fn register_ndarray_rgba_e2e(_group: &mut BenchmarkGroup<'_, WallTime>) {}
 
+#[cfg(feature = "ndarray")]
+fn register_ndarray_patch_diff(group: &mut BenchmarkGroup<'_, WallTime>) {
+    for &case in VIDEO_CASES {
+        let device = Default::default();
+        bench_patch_diff_case::<burn::backend::NdArray<f32>>(group, "ndarray", case, device);
+    }
+}
+
+#[cfg(not(feature = "ndarray"))]
+fn register_ndarray_patch_diff(_group: &mut BenchmarkGroup<'_, WallTime>) {}
+
 #[cfg(feature = "webgpu")]
 fn register_webgpu_embed(group: &mut BenchmarkGroup<'_, WallTime>) {
     let Some(device) = webgpu_device() else {
@@ -940,6 +966,21 @@ fn register_webgpu_rgba_e2e(group: &mut BenchmarkGroup<'_, WallTime>) {
     }
 }
 
+#[cfg(feature = "webgpu")]
+fn register_webgpu_patch_diff(group: &mut BenchmarkGroup<'_, WallTime>) {
+    let Some(device) = webgpu_device() else {
+        return;
+    };
+    for &case in VIDEO_CASES {
+        bench_patch_diff_case::<burn::backend::WebGpu<f32, i32>>(
+            group,
+            "webgpu",
+            case,
+            device.clone(),
+        );
+    }
+}
+
 #[cfg(feature = "cuda")]
 fn register_cuda_embed(group: &mut BenchmarkGroup<'_, WallTime>) {
     let device = burn::backend::cuda::CudaDevice::default();
@@ -1003,6 +1044,14 @@ fn register_cuda_rgba_e2e(group: &mut BenchmarkGroup<'_, WallTime>) {
                 }
             }
         }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn register_cuda_patch_diff(group: &mut BenchmarkGroup<'_, WallTime>) {
+    let device = burn::backend::cuda::CudaDevice::default();
+    for &case in VIDEO_CASES {
+        bench_patch_diff_case::<burn::backend::Cuda<f32, i32>>(group, "cuda", case, device.clone());
     }
 }
 
@@ -1585,6 +1634,52 @@ fn bench_trace_case<B>(
                 || video.clone(),
                 |video| {
                     black_box(pipeline.trace_video_with_mode(video, 2, mode.mode));
+                    B::sync(&device).expect("backend sync");
+                },
+                BatchSize::SmallInput,
+            );
+        },
+    );
+}
+
+fn bench_patch_diff_case<B>(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    backend: &str,
+    case: VideoCase,
+    device: B::Device,
+) where
+    B: Backend,
+    f64: From<<B as burn::tensor::backend::BackendTypes>::FloatElem>,
+{
+    let video = deterministic_video::<B>(BATCH, FRAMES, CHANNELS, case.height, case.width, &device);
+    let config = AutoGazePatchDiffConfig::new(14, 0.45);
+    group.throughput(Throughput::Elements(case.frames_per_batch()));
+    group.bench_with_input(BenchmarkId::new(backend, case.name), &case, |b, _| {
+        b.iter_batched(
+            || video.clone(),
+            |video| {
+                black_box(patch_diff_readout_points(video, config).expect("patch-diff readout"));
+                B::sync(&device).expect("backend sync");
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.bench_with_input(
+        BenchmarkId::new(format!("{backend}-device-mask"), case.name),
+        &case,
+        |b, _| {
+            b.iter_batched(
+                || video.clone(),
+                |video| {
+                    black_box(
+                        futures_lite::future::block_on(patch_diff_device_mask_async(
+                            video,
+                            config,
+                            case.height,
+                            case.width,
+                        ))
+                        .expect("patch-diff device mask"),
+                    );
                     B::sync(&device).expect("backend sync");
                 },
                 BatchSize::SmallInput,
@@ -2665,6 +2760,7 @@ criterion_group!(
     bench_real_task_loss,
     bench_real_video_file,
     bench_rgba_e2e_video,
+    bench_patch_diff_sparse_mask,
     bench_visualization,
     bench_tensor_visualization,
     bench_tensor_device_tokens,

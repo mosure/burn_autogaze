@@ -675,6 +675,12 @@ impl AutoGazeMaskPlanStats {
     }
 }
 
+#[derive(Clone)]
+pub struct AutoGazeDeviceMask<B: Backend> {
+    pub alpha: Tensor<B, 3>,
+    pub mask_plan_stats: AutoGazeMaskPlanStats,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AutoGazeTensorVisualizationOptions {
     pub width: usize,
@@ -1034,6 +1040,81 @@ impl<B: Backend> AutoGazeTensorVisualizationState<B> {
             output_rgba: output,
             mask_pixel_count,
             updated_pixel_count: pixels,
+        })
+    }
+
+    pub fn visualize_normalized_rgb_clip_device_mask_panels(
+        &mut self,
+        tensor: Tensor<B, 5>,
+        mask: AutoGazeDeviceMask<B>,
+        options: AutoGazeTensorVisualizationOptions,
+        device: &B::Device,
+    ) -> Result<AutoGazeTensorVisualizationPanels<B>> {
+        let width = options.width;
+        let height = options.height;
+        let pixels = validate_dimensions(width, height)?;
+        let input = normalized_rgb_clip_to_unit_rgba_tensor(tensor, width, height, device)?;
+        let alpha = mask.alpha;
+        let alpha_dims = alpha.shape().dims::<3>();
+        ensure!(
+            alpha_dims == [height, width, 1],
+            "device mask alpha tensor must have shape [height, width, 1]"
+        );
+        let mask_stats = AutoGazeMaskPlanStats {
+            rect_count: mask.mask_plan_stats.rect_count,
+            row_span_count: mask.mask_plan_stats.row_span_count,
+            pixel_count: mask.mask_plan_stats.pixel_count.min(pixels),
+        };
+        let mask = token_mask_panel_tensor(
+            input.clone(),
+            alpha.clone(),
+            width,
+            height,
+            options.blend_alpha,
+            options.mask_mode,
+            device,
+        );
+        let interframe_keyframe = matches!(self.mode, AutoGazeVisualizationMode::Interframe)
+            && self.is_keyframe(width, height);
+        let mut interframe_path = None;
+        let (output, updated_pixel_count) = match self.mode {
+            AutoGazeVisualizationMode::FullBlend => {
+                let blend = alpha_blend_tensor(alpha, width, height, options.blend_alpha, device);
+                let inverse = Tensor::<B, 3>::ones([height, width, 4], device).sub(blend.clone());
+                (
+                    input.clone().mul(inverse).add(blend),
+                    mask_stats.pixel_count,
+                )
+            }
+            AutoGazeVisualizationMode::Interframe => {
+                if interframe_keyframe {
+                    interframe_path = Some(AutoGazeTensorInterframePath::Keyframe);
+                    (input.clone(), pixels)
+                } else {
+                    interframe_path = Some(AutoGazeTensorInterframePath::FullFrame);
+                    let previous = self
+                        .interframe_output_rgba
+                        .clone()
+                        .unwrap_or_else(|| input.clone());
+                    (
+                        dense_interframe_update_tensor(input.clone(), previous, alpha),
+                        mask_stats.pixel_count,
+                    )
+                }
+            }
+        };
+
+        self.advance(width, height, output.clone());
+        self.last_interframe_path = interframe_path;
+        self.last_mask_plan_stats = Some(mask_stats);
+        Ok(AutoGazeTensorVisualizationPanels {
+            width,
+            height,
+            input_rgba: input,
+            mask_rgba: mask,
+            output_rgba: output,
+            mask_pixel_count: mask_stats.pixel_count,
+            updated_pixel_count,
         })
     }
 

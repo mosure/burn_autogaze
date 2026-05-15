@@ -2,6 +2,7 @@ mod config;
 mod metrics;
 mod model;
 mod nodes;
+mod patch_diff;
 mod pipeline;
 mod pyramid;
 mod readout;
@@ -32,6 +33,12 @@ pub use nodes::{
     AutoGazeRgbaFrameClip, AutoGazeRgbaFrameQueue, AutoGazeTensorClip, AutoGazeTensorClipShape,
     AutoGazeTensorPipeline, AutoGazeTensorPipelineConfig, FnOutputNode, RgbaClipInput,
     TensorClipInput, VecOutputNode,
+};
+pub use patch_diff::{
+    AutoGazePatchDiffConfig, AutoGazePatchDiffDeviceMask, AutoGazeSparseMaskSource,
+    DEFAULT_PATCH_DIFF_GRID_SIZE, DEFAULT_PATCH_DIFF_THRESHOLD, patch_diff_device_mask_async,
+    patch_diff_points_to_traces, patch_diff_readout_points, patch_diff_readout_points_async,
+    patch_diff_scores,
 };
 pub use pipeline::{
     AUTO_GAZE_IMAGE_MEAN, AUTO_GAZE_IMAGE_STD, AUTO_GAZE_PROCESSOR_SHORT_EDGE,
@@ -77,9 +84,10 @@ pub use safetensors_io::AutoGazeTraceStore;
 pub use teacher::AutoGazeTeacher;
 pub use trace::{FixationBounds, FixationPoint, FixationSet, FrameFixationTrace};
 pub use visualization::{
-    AutoGazeMaskGeometryMode, AutoGazeMaskPlanStats, AutoGazeMaskVisualizationMode,
-    AutoGazeRgbaVisualizationBuffers, AutoGazeRgbaVisualizationOptions, AutoGazeSparseUpdatePlan,
-    AutoGazeTensorInterframePath, AutoGazeTensorVisualization, AutoGazeTensorVisualizationOptions,
+    AutoGazeDeviceMask, AutoGazeMaskGeometryMode, AutoGazeMaskPlanStats,
+    AutoGazeMaskVisualizationMode, AutoGazeRgbaVisualizationBuffers,
+    AutoGazeRgbaVisualizationOptions, AutoGazeSparseUpdatePlan, AutoGazeTensorInterframePath,
+    AutoGazeTensorVisualization, AutoGazeTensorVisualizationOptions,
     AutoGazeTensorVisualizationPanels, AutoGazeTensorVisualizationState, AutoGazeVisualization,
     AutoGazeVisualizationMode, AutoGazeVisualizationPanels, AutoGazeVisualizationPanelsView,
     AutoGazeVisualizationState, DEFAULT_TENSOR_FULL_FRAME_UPDATE_MIN_RATIO,

@@ -1,18 +1,19 @@
 use bevy::app::AppExit;
 #[cfg(not(target_arch = "wasm32"))]
 use bevy_burn_autogaze::{
-    BevyAutoGazeMode, BevyDisplayTransfer, BevyFrameSource, DEFAULT_BEVY_DECODE_CHUNK_SIZE,
-    DEFAULT_BEVY_LIMIT_GENERATION_BUDGET, DEFAULT_BEVY_SHOW_TASK_LOSS_SLIDER,
-    DEFAULT_BEVY_STREAMING_CACHE, DEFAULT_BEVY_TASK_LOSS_REQUIREMENT,
-    DEFAULT_BIRDS_KEYFRAME_DURATION, DEFAULT_BLEND_ALPHA, DEFAULT_TILED_INFERENCE_WIDTH,
-    default_frames_per_clip, default_inference_dimensions, default_max_gaze_tokens_for_limit,
-    default_tile_batch_size, default_top_k,
+    BevyAutoGazeMode, BevyDisplayTransfer, BevyFrameSource, BevySparseMaskSource,
+    DEFAULT_BEVY_DECODE_CHUNK_SIZE, DEFAULT_BEVY_LIMIT_GENERATION_BUDGET,
+    DEFAULT_BEVY_SHOW_TASK_LOSS_SLIDER, DEFAULT_BEVY_STREAMING_CACHE,
+    DEFAULT_BEVY_TASK_LOSS_REQUIREMENT, DEFAULT_BIRDS_KEYFRAME_DURATION, DEFAULT_BLEND_ALPHA,
+    DEFAULT_TILED_INFERENCE_WIDTH, default_frames_per_clip, default_inference_dimensions,
+    default_max_gaze_tokens_for_limit, default_tile_batch_size, default_top_k,
 };
 use bevy_burn_autogaze::{BevyBurnAutoGazeConfig, run_app};
 #[cfg(not(target_arch = "wasm32"))]
 use burn_autogaze::{
     AutoGazeDecodeStrategy, AutoGazeMaskGeometryMode, AutoGazeMaskVisualizationMode,
-    AutoGazeVisualizationMode, task_loss_requirement_from_l1_db,
+    AutoGazeVisualizationMode, DEFAULT_PATCH_DIFF_GRID_SIZE, DEFAULT_PATCH_DIFF_THRESHOLD,
+    task_loss_requirement_from_l1_db,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -323,6 +324,46 @@ impl From<NativeFrameSource> for BevyFrameSource {
 
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum NativeSparseMaskSource {
+    #[value(
+        name = "autogaze",
+        alias = "model",
+        alias = "nvidia",
+        help = "Use NVIDIA AutoGaze autoregressive model readout."
+    )]
+    AutoGaze,
+    #[value(
+        name = "patch-diff",
+        alias = "patchdiff",
+        alias = "diff",
+        alias = "frame-diff",
+        help = "Use a single-scale tensor patch-difference mask instead of the AutoGaze model."
+    )]
+    PatchDiff,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl fmt::Display for NativeSparseMaskSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::AutoGaze => "autogaze",
+            Self::PatchDiff => "patch-diff",
+        })
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<NativeSparseMaskSource> for BevySparseMaskSource {
+    fn from(source: NativeSparseMaskSource) -> Self {
+        match source {
+            NativeSparseMaskSource::AutoGaze => Self::AutoGaze,
+            NativeSparseMaskSource::PatchDiff => Self::PatchDiff,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum NativeDisplayTransfer {
     #[value(
         name = "auto",
@@ -447,6 +488,37 @@ struct NativeArgs {
         help = "Input source. Defaults to camera, or static when --image-path is supplied. synthetic-local-motion is the most useful deterministic source for fine-cell FPS stability repros."
     )]
     source: Option<NativeFrameSource>,
+
+    #[arg(
+        long = "mask-source",
+        alias = "sparse-mask-source",
+        alias = "mask-driver",
+        value_enum,
+        default_value_t = NativeSparseMaskSource::AutoGaze,
+        help = "Sparse mask source. autogaze runs the NVIDIA model; patch-diff uses tensor patch differences on the latest two frames."
+    )]
+    sparse_mask_source: NativeSparseMaskSource,
+
+    #[arg(
+        long = "patch-diff-grid",
+        alias = "patch-grid",
+        value_name = "PATCHES",
+        value_parser = parse_nonzero_usize,
+        default_value_t = DEFAULT_PATCH_DIFF_GRID_SIZE,
+        help = "Square patch-diff grid size. 14 means a 14x14 single-scale sparse mask."
+    )]
+    patch_diff_grid_size: usize,
+
+    #[arg(
+        long = "patch-diff-threshold",
+        alias = "patch-threshold",
+        alias = "diff-threshold",
+        value_name = "FLOAT",
+        value_parser = parse_nonnegative_f32,
+        default_value_t = DEFAULT_PATCH_DIFF_THRESHOLD,
+        help = "Patch-diff score threshold. Lower values select more patches; the Bevy quality slider edits this value while patch-diff is active."
+    )]
+    patch_diff_threshold: f32,
 
     #[arg(
         long,
@@ -790,6 +862,9 @@ impl From<NativeArgs> for BevyBurnAutoGazeConfig {
                 },
             ),
             image_path: args.image_path,
+            sparse_mask_source: args.sparse_mask_source.into(),
+            patch_diff_grid_size: args.patch_diff_grid_size,
+            patch_diff_threshold: args.patch_diff_threshold,
             load_model: args.load_model && !args.no_load_model,
             warmup_model: args.warmup_model,
             mode,
@@ -1125,6 +1200,9 @@ mod tests {
             model_dir: bevy_burn_autogaze::DEFAULT_NATIVE_MODEL_DIR.into(),
             image_path: None,
             source: None,
+            sparse_mask_source: NativeSparseMaskSource::AutoGaze,
+            patch_diff_grid_size: DEFAULT_PATCH_DIFF_GRID_SIZE,
+            patch_diff_threshold: DEFAULT_PATCH_DIFF_THRESHOLD,
             load_model: true,
             no_load_model: false,
             warmup_model: true,

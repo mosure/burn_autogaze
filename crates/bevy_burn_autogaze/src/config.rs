@@ -3,12 +3,14 @@ use std::{fmt, path::PathBuf, str::FromStr};
 use bevy::prelude::Resource;
 use burn_autogaze::{
     AutoGazeDecodeStrategy, AutoGazeInferenceMode, AutoGazeMaskGeometryMode,
-    AutoGazeMaskVisualizationMode, AutoGazeRealtimePolicy, AutoGazeVisualizationMode,
-    DEFAULT_BLEND_ALPHA, DEFAULT_MAX_IN_FLIGHT, DEFAULT_MODEL_GENERATION_BUDGET,
-    DEFAULT_REALTIME_TOP_K, DEFAULT_TENSOR_FULL_FRAME_UPDATE_MIN_RATIO,
-    DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RATIO, DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RECTS,
-    DEFAULT_TILED_FRAMES_PER_CLIP, DEFAULT_TILED_MAX_GAZE_TOKENS, DEFAULT_TILED_TILE_BATCH_SIZE,
-    DEFAULT_TILED_TOP_K, should_use_streaming_cache, task_loss_requirement_from_l1_db,
+    AutoGazeMaskVisualizationMode, AutoGazePatchDiffConfig, AutoGazeRealtimePolicy,
+    AutoGazeSparseMaskSource, AutoGazeVisualizationMode, DEFAULT_BLEND_ALPHA,
+    DEFAULT_MAX_IN_FLIGHT, DEFAULT_MODEL_GENERATION_BUDGET, DEFAULT_PATCH_DIFF_GRID_SIZE,
+    DEFAULT_PATCH_DIFF_THRESHOLD, DEFAULT_REALTIME_TOP_K,
+    DEFAULT_TENSOR_FULL_FRAME_UPDATE_MIN_RATIO, DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RATIO,
+    DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RECTS, DEFAULT_TILED_FRAMES_PER_CLIP,
+    DEFAULT_TILED_MAX_GAZE_TOKENS, DEFAULT_TILED_TILE_BATCH_SIZE, DEFAULT_TILED_TOP_K,
+    should_use_streaming_cache, task_loss_requirement_from_l1_db,
 };
 
 pub const DEFAULT_NATIVE_MODEL_DIR: &str = "/home/mosure/.cache/huggingface/hub/models--nvidia--AutoGaze/snapshots/5100fae739ec1bf3f875914fa1b703846a18943a";
@@ -101,6 +103,53 @@ impl FromStr for BevyAutoGazeMode {
                 Self::valid_values().join(", ")
             )),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BevySparseMaskSource {
+    #[default]
+    AutoGaze,
+    PatchDiff,
+}
+
+impl BevySparseMaskSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AutoGaze => "autogaze",
+            Self::PatchDiff => "patch-diff",
+        }
+    }
+
+    pub const fn valid_values() -> &'static [&'static str] {
+        &["autogaze", "model", "patch-diff", "patchdiff", "diff"]
+    }
+
+    pub const fn requires_autogaze_model(self) -> bool {
+        matches!(self, Self::AutoGaze)
+    }
+}
+
+impl FromStr for BevySparseMaskSource {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "autogaze" | "auto-gaze" | "model" | "nvidia" => Ok(Self::AutoGaze),
+            "patch-diff" | "patchdiff" | "diff" | "frame-diff" | "frame-difference" => {
+                Ok(Self::PatchDiff)
+            }
+            other => Err(format!(
+                "unsupported sparse mask source `{other}` (expected one of: {})",
+                Self::valid_values().join(", ")
+            )),
+        }
+    }
+}
+
+impl fmt::Display for BevySparseMaskSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }
 
@@ -217,6 +266,9 @@ pub struct BevyBurnAutoGazeConfig {
     pub warmup_model: bool,
     pub source: BevyFrameSource,
     pub image_path: Option<PathBuf>,
+    pub sparse_mask_source: BevySparseMaskSource,
+    pub patch_diff_grid_size: usize,
+    pub patch_diff_threshold: f32,
     pub mode: BevyAutoGazeMode,
     pub top_k: usize,
     pub max_gaze_tokens_each_frame: usize,
@@ -265,6 +317,9 @@ impl Default for BevyBurnAutoGazeConfig {
             warmup_model: true,
             source: BevyFrameSource::Camera,
             image_path: None,
+            sparse_mask_source: BevySparseMaskSource::AutoGaze,
+            patch_diff_grid_size: DEFAULT_PATCH_DIFF_GRID_SIZE,
+            patch_diff_threshold: DEFAULT_PATCH_DIFF_THRESHOLD,
             mode,
             top_k: default_top_k(mode),
             max_gaze_tokens_each_frame: default_max_gaze_tokens_for_limit(
@@ -358,6 +413,18 @@ impl BevyBurnAutoGazeConfig {
             }
             "source" | "frame-source" | "input-source" => {
                 self.source = value.parse()?;
+                Ok(())
+            }
+            "sparse-mask-source" | "mask-source" | "mask-driver" | "gaze-source" => {
+                self.sparse_mask_source = value.parse()?;
+                Ok(())
+            }
+            "patch-diff-grid" | "patch-diff-grid-size" | "patch-grid" | "diff-grid" => {
+                self.patch_diff_grid_size = parse_usize_option(&key, value)?.max(1);
+                Ok(())
+            }
+            "patch-diff-threshold" | "patch-threshold" | "diff-threshold" => {
+                self.patch_diff_threshold = parse_nonnegative_f32_option(&key, value)?;
                 Ok(())
             }
             "mode" => {
@@ -652,6 +719,12 @@ impl BevyBurnAutoGazeConfig {
         if self.max_in_flight == 0 {
             self.max_in_flight = DEFAULT_MAX_IN_FLIGHT;
         }
+        if self.patch_diff_grid_size == 0 {
+            self.patch_diff_grid_size = DEFAULT_PATCH_DIFF_GRID_SIZE;
+        }
+        if !self.patch_diff_threshold.is_finite() || self.patch_diff_threshold < 0.0 {
+            self.patch_diff_threshold = DEFAULT_PATCH_DIFF_THRESHOLD;
+        }
         // A value of 0 disables periodic interframe keyframes. The first frame
         // and dimension changes still prime/reset the interframe state.
         if self.inference_width == Some(0) || self.inference_height == Some(0) {
@@ -691,6 +764,15 @@ impl BevyBurnAutoGazeConfig {
             .task_loss_requirement
             .filter(|value| value.is_finite() && *value >= 0.0);
         self.decode_strategy = self.decode_strategy.normalized();
+    }
+
+    pub fn sparse_mask_source_config(&self) -> AutoGazeSparseMaskSource {
+        match self.sparse_mask_source {
+            BevySparseMaskSource::AutoGaze => AutoGazeSparseMaskSource::AutoGaze,
+            BevySparseMaskSource::PatchDiff => AutoGazeSparseMaskSource::PatchDiff(
+                AutoGazePatchDiffConfig::new(self.patch_diff_grid_size, self.patch_diff_threshold),
+            ),
+        }
     }
 
     pub fn sanitized(mut self) -> Self {
@@ -1130,6 +1212,23 @@ mod tests {
         assert_eq!(
             config.mask_geometry_mode,
             AutoGazeMaskGeometryMode::Deduplicated
+        );
+    }
+
+    #[test]
+    fn patch_diff_query_builds_sparse_mask_source_config() {
+        let mut config = BevyBurnAutoGazeConfig::default();
+        let errors = config.apply_query_string(
+            "?mask-source=patch-diff&patch-diff-grid=14&patch-diff-threshold=0.31",
+        );
+
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(config.sparse_mask_source, BevySparseMaskSource::PatchDiff);
+        assert_eq!(config.patch_diff_grid_size, 14);
+        assert_eq!(config.patch_diff_threshold, 0.31);
+        assert_eq!(
+            config.sparse_mask_source_config(),
+            AutoGazeSparseMaskSource::PatchDiff(AutoGazePatchDiffConfig::new(14, 0.31))
         );
     }
 
