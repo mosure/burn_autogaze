@@ -184,7 +184,7 @@ fn bevy_wasm_timing_does_not_use_std_instant() {
 }
 
 #[test]
-fn bevy_wasm_model_warmup_does_not_block_on_backend_sync() {
+fn bevy_wasm_model_warmup_does_not_block_or_readback_during_load() {
     let Some(source) = bevy_source() else {
         return;
     };
@@ -195,12 +195,27 @@ fn bevy_wasm_model_warmup_does_not_block_on_backend_sync() {
         "async fn warmup_pipeline_if_enabled",
     );
     assert!(
+        warmup.contains("effective_model_warmup_enabled(config)"),
+        "warmup must route through a platform policy before any model readbacks"
+    );
+    assert!(
         warmup.contains("sync_warmup_backend(device)?"),
         "warmup should route backend sync through the platform-specific helper"
     );
     assert!(
         !warmup.contains("Backend>::sync"),
         "warmup must not call Backend::sync directly because wasm sync blocks on a condvar"
+    );
+
+    let wasm_warmup_policy = function_body_after(
+        production,
+        "#[cfg(target_arch = \"wasm32\")]\nfn effective_model_warmup_enabled",
+        "fn effective_model_warmup_enabled",
+    );
+    assert!(wasm_warmup_policy.contains("false"));
+    assert!(
+        !wasm_warmup_policy.contains("config.warmup_model"),
+        "wasm model-load warmup is disabled because repeated warmup readbacks can leave WebGPU buffers mapped"
     );
 
     let wasm_sync = function_body_after(

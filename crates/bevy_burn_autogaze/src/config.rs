@@ -6,11 +6,10 @@ use burn_autogaze::{
     AutoGazeMaskVisualizationMode, AutoGazePatchDiffConfig, AutoGazeRealtimePolicy,
     AutoGazeSparseMaskSource, AutoGazeVisualizationMode, DEFAULT_BLEND_ALPHA,
     DEFAULT_MAX_IN_FLIGHT, DEFAULT_MODEL_GENERATION_BUDGET, DEFAULT_PATCH_DIFF_GRID_SIZE,
-    DEFAULT_PATCH_DIFF_THRESHOLD, DEFAULT_REALTIME_TOP_K,
-    DEFAULT_TENSOR_FULL_FRAME_UPDATE_MIN_RATIO, DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RATIO,
-    DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RECTS, DEFAULT_TILED_FRAMES_PER_CLIP,
-    DEFAULT_TILED_MAX_GAZE_TOKENS, DEFAULT_TILED_TILE_BATCH_SIZE, DEFAULT_TILED_TOP_K,
-    should_use_streaming_cache, task_loss_requirement_from_l1_db,
+    DEFAULT_REALTIME_TOP_K, DEFAULT_TENSOR_FULL_FRAME_UPDATE_MIN_RATIO,
+    DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RATIO, DEFAULT_TENSOR_SPARSE_UPDATE_MAX_RECTS,
+    DEFAULT_TILED_FRAMES_PER_CLIP, DEFAULT_TILED_MAX_GAZE_TOKENS, DEFAULT_TILED_TILE_BATCH_SIZE,
+    DEFAULT_TILED_TOP_K, should_use_streaming_cache, task_loss_requirement_from_l1_db,
 };
 
 pub const DEFAULT_NATIVE_MODEL_DIR: &str = "/home/mosure/.cache/huggingface/hub/models--nvidia--AutoGaze/snapshots/5100fae739ec1bf3f875914fa1b703846a18943a";
@@ -24,7 +23,12 @@ pub const DEFAULT_REALTIME_MAX_GAZE_TOKENS: usize = 16;
 pub const DEFAULT_REALTIME_QUALITY_MAX_GAZE_TOKENS: usize = DEFAULT_TILED_MAX_GAZE_TOKENS;
 pub const DEFAULT_BEVY_REALTIME_FRAMES_PER_CLIP: usize = 16;
 pub const DEFAULT_BEVY_STREAMING_CACHE: bool = true;
+#[cfg(not(target_arch = "wasm32"))]
+pub const DEFAULT_BEVY_WARMUP_MODEL: bool = true;
+#[cfg(target_arch = "wasm32")]
+pub const DEFAULT_BEVY_WARMUP_MODEL: bool = false;
 pub const DEFAULT_BEVY_TASK_LOSS_REQUIREMENT: f32 = 0.45;
+pub const DEFAULT_BEVY_PATCH_DIFF_THRESHOLD: f32 = 0.15;
 pub const DEFAULT_BEVY_SHOW_TASK_LOSS_SLIDER: bool = true;
 pub const DEFAULT_BEVY_LIMIT_GENERATION_BUDGET: bool = true;
 pub const DEFAULT_BEVY_DECODE_CHUNK_SIZE: usize = 4;
@@ -314,12 +318,12 @@ impl Default for BevyBurnAutoGazeConfig {
             config_url: DEFAULT_CONFIG_URL.to_string(),
             weights_url: DEFAULT_WEIGHTS_URL.to_string(),
             load_model: true,
-            warmup_model: true,
+            warmup_model: DEFAULT_BEVY_WARMUP_MODEL,
             source: BevyFrameSource::Camera,
             image_path: None,
             sparse_mask_source: BevySparseMaskSource::PatchDiff,
             patch_diff_grid_size: DEFAULT_PATCH_DIFF_GRID_SIZE,
-            patch_diff_threshold: DEFAULT_PATCH_DIFF_THRESHOLD,
+            patch_diff_threshold: DEFAULT_BEVY_PATCH_DIFF_THRESHOLD,
             mode,
             top_k: default_top_k(mode),
             max_gaze_tokens_each_frame: default_max_gaze_tokens_for_limit(
@@ -723,7 +727,7 @@ impl BevyBurnAutoGazeConfig {
             self.patch_diff_grid_size = DEFAULT_PATCH_DIFF_GRID_SIZE;
         }
         if !self.patch_diff_threshold.is_finite() || self.patch_diff_threshold < 0.0 {
-            self.patch_diff_threshold = DEFAULT_PATCH_DIFF_THRESHOLD;
+            self.patch_diff_threshold = DEFAULT_BEVY_PATCH_DIFF_THRESHOLD;
         }
         // A value of 0 disables periodic interframe keyframes. The first frame
         // and dimension changes still prime/reset the interframe state.
@@ -1148,6 +1152,10 @@ mod tests {
         let config = BevyBurnAutoGazeConfig::default();
         assert_eq!(config.decode_strategy, DEFAULT_BEVY_DECODE_STRATEGY);
         assert_eq!(config.sparse_mask_source, BevySparseMaskSource::PatchDiff);
+        assert_eq!(
+            config.patch_diff_threshold,
+            DEFAULT_BEVY_PATCH_DIFF_THRESHOLD
+        );
 
         let mut config = BevyBurnAutoGazeConfig::default();
         let errors = config.apply_query_string("?decode-strategy=host");

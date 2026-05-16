@@ -67,8 +67,9 @@ pub use config::{
     BevyAutoGazeMode, BevyBurnAutoGazeConfig, BevyDisplayTransfer, BevyFrameSource,
     BevySparseMaskSource, DEFAULT_BEVY_DECODE_CHUNK_SIZE, DEFAULT_BEVY_DECODE_STRATEGY,
     DEFAULT_BEVY_LIMIT_GENERATION_BUDGET, DEFAULT_BEVY_MASK_GEOMETRY_MODE, DEFAULT_BEVY_MODE,
-    DEFAULT_BEVY_REALTIME_FRAMES_PER_CLIP, DEFAULT_BEVY_SHOW_TASK_LOSS_SLIDER,
-    DEFAULT_BEVY_STREAMING_CACHE, DEFAULT_BEVY_TASK_LOSS_REQUIREMENT, DEFAULT_BEVY_TILED_TOP_K,
+    DEFAULT_BEVY_PATCH_DIFF_THRESHOLD, DEFAULT_BEVY_REALTIME_FRAMES_PER_CLIP,
+    DEFAULT_BEVY_SHOW_TASK_LOSS_SLIDER, DEFAULT_BEVY_STREAMING_CACHE,
+    DEFAULT_BEVY_TASK_LOSS_REQUIREMENT, DEFAULT_BEVY_TILED_TOP_K, DEFAULT_BEVY_WARMUP_MODEL,
     DEFAULT_BIRDS_BLEND_ALPHA, DEFAULT_BIRDS_FRAMES_PER_CLIP, DEFAULT_BIRDS_INFERENCE_HEIGHT,
     DEFAULT_BIRDS_INFERENCE_WIDTH, DEFAULT_BIRDS_KEYFRAME_DURATION, DEFAULT_BIRDS_MAX_GAZE_TOKENS,
     DEFAULT_BIRDS_TILE_BATCH_SIZE, DEFAULT_BIRDS_TOP_K, DEFAULT_CONFIG_URL,
@@ -2102,7 +2103,10 @@ async fn warmup_pipeline_if_enabled(
     pipeline: &AutoGazePipeline<AutoGazeBevyBackend>,
     device: &AutoGazeBevyDevice,
 ) -> Result<(), String> {
-    if !config.warmup_model {
+    if !effective_model_warmup_enabled(config) {
+        if config.warmup_model {
+            log("AutoGaze model warmup skipped on this platform");
+        }
         return Ok(());
     }
 
@@ -2145,6 +2149,16 @@ async fn warmup_pipeline_if_enabled(
         elapsed_ms(warmup_start),
     ));
     Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn effective_model_warmup_enabled(config: &BevyBurnAutoGazeConfig) -> bool {
+    config.warmup_model
+}
+
+#[cfg(target_arch = "wasm32")]
+fn effective_model_warmup_enabled(_config: &BevyBurnAutoGazeConfig) -> bool {
+    false
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -4409,6 +4423,14 @@ mod tests {
             config.task_loss_requirement,
             Some(DEFAULT_BEVY_TASK_LOSS_REQUIREMENT)
         );
+        assert_eq!(config.warmup_model, DEFAULT_BEVY_WARMUP_MODEL);
+        assert_eq!(config.sparse_mask_source, BevySparseMaskSource::PatchDiff);
+        assert_eq!(
+            config.patch_diff_threshold,
+            DEFAULT_BEVY_PATCH_DIFF_THRESHOLD
+        );
+        let slider = TaskLossSliderState::new(&config);
+        assert!((slider.value - 0.85).abs() < f32::EPSILON);
         assert_eq!(
             config.frames_per_clip,
             DEFAULT_BEVY_REALTIME_FRAMES_PER_CLIP

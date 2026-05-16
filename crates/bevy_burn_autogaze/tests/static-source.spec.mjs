@@ -315,7 +315,7 @@ test("starts wasm model load through async wgpu setup", async ({ page }) => {
   });
 
   await page.goto(
-    "/?source=static&show-fps=false&frames-per-clip=1&static-width=64&static-height=64&static-fps=2&config-url=data%3Aapplication%2Fjson%2C%7B%7D&weights-url=data%3Aapplication%2Foctet-stream%3Bbase64%2CAA%3D%3D",
+    "/?source=static&mask-source=autogaze&show-fps=false&frames-per-clip=1&static-width=64&static-height=64&static-fps=2&warmup-model=true&config-url=data%3Aapplication%2Fjson%2C%7B%7D&weights-url=data%3Aapplication%2Foctet-stream%3Bbase64%2CAA%3D%3D",
     { waitUntil: "domcontentloaded" },
   );
 
@@ -375,7 +375,7 @@ test("runs optional real wasm inference smoke when model assets are available", 
   });
 
   await page.goto(
-    "/?source=static&show-fps=true&show-gaze-ratio=true&show-psnr=false&mode=resize-224&visualization-mode=interframe&display-transfer=gpu&frames-per-clip=2&max-in-flight=2&streaming-cache=false&static-width=224&static-height=224&inference-width=224&inference-height=224&static-fps=1&top-k=1&max-gaze-tokens-each-frame=1&disable-task-loss-requirement=true&log-pipeline-timing=true&perf-summary-frames=2&config-url=./config.json&weights-url=./model.safetensors",
+    "/?source=static&mask-source=autogaze&show-fps=true&show-gaze-ratio=true&show-psnr=false&mode=resize-224&visualization-mode=interframe&display-transfer=gpu&frames-per-clip=2&max-in-flight=2&streaming-cache=false&static-width=224&static-height=224&inference-width=224&inference-height=224&static-fps=1&top-k=1&max-gaze-tokens-each-frame=1&disable-task-loss-requirement=true&warmup-model=true&log-pipeline-timing=true&perf-summary-frames=2&config-url=./config.json&weights-url=./model.safetensors",
     { waitUntil: "domcontentloaded" },
   );
 
