@@ -234,12 +234,7 @@ pub fn patch_diff_readout_points<B: Backend>(
         .into_data()
         .to_vec::<f32>()
         .map_err(|err| anyhow!("failed to read patch-diff score tensor: {err}"))?;
-    Ok(patch_diff_points_from_scores(
-        score_values,
-        batch,
-        time,
-        config,
-    )?)
+    patch_diff_points_from_scores(score_values, batch, time, config)
 }
 
 pub async fn patch_diff_readout_points_async<B: Backend>(
@@ -291,7 +286,7 @@ fn patch_diff_points_from_scores(
     );
 
     let mut points = vec![vec![Vec::new(); time.max(1)]; batch];
-    for batch_index in 0..batch {
+    for (batch_index, frames) in points.iter_mut().enumerate() {
         let start = batch_index * scores_per_batch;
         let end = start + scores_per_batch;
         let mut selected = score_values[start..end]
@@ -308,7 +303,7 @@ fn patch_diff_points_from_scores(
                 .then_with(|| left.0.cmp(&right.0))
         });
 
-        points[batch_index][frame_index] = selected
+        frames[frame_index] = selected
             .into_iter()
             .map(|(index, score)| patch_diff_point(index, score, config))
             .collect();

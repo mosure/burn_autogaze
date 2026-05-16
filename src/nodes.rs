@@ -264,6 +264,10 @@ impl AutoGazeRgbaFrameQueue {
         self.frames.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
     pub fn build_clip(&mut self, max_len: usize) -> Result<Option<AutoGazeRgbaFrameClip>> {
         let max_len = max_len.max(1);
         if self.frames.len() != max_len {

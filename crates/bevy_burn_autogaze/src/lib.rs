@@ -1300,6 +1300,24 @@ struct FrameInputParams<'w> {
     timing_stats: Res<'w, InferenceTimingStats>,
 }
 
+#[derive(SystemParam)]
+struct MaskSourceToggleParams<'w, 's> {
+    commands: Commands<'w, 's>,
+    config: ResMut<'w, BevyBurnAutoGazeConfig>,
+    model: ResMut<'w, AutoGazeModelState>,
+    slider: ResMut<'w, TaskLossSliderState>,
+    latest_mask: ResMut<'w, LatestMaskPrediction>,
+    visualization_state: ResMut<'w, BevyVisualizationState>,
+    streaming_state: ResMut<'w, BevyStreamingGenerationState>,
+    sequencer: ResMut<'w, InferenceSequencer>,
+    frame_queue: ResMut<'w, FrameQueue>,
+    gaze_ratio_stats: ResMut<'w, GazeRatioStats>,
+    psnr_stats: ResMut<'w, PsnrStats>,
+    timing_stats: ResMut<'w, InferenceTimingStats>,
+    active_tasks: Query<'w, 's, Entity, With<ProcessAutoGaze>>,
+    toggles: Query<'w, 's, &'static Interaction, (Changed<Interaction>, With<MaskSourceToggle>)>,
+}
+
 #[derive(Component)]
 struct ProcessAutoGaze(Task<CommandQueue>);
 
@@ -2447,9 +2465,11 @@ async fn finish_autogaze_visualization(
             tensor: prepared.visualization_tensor,
         },
         &points,
-        device_tokens.as_ref(),
-        device_mask,
-        model_config.as_ref(),
+        DeviceMaskVisualInput {
+            tokens: device_tokens.as_ref(),
+            mask: device_mask,
+            model_config: model_config.as_ref(),
+        },
         visualization_options,
         &mut visualization_state,
         &device,
@@ -2794,6 +2814,23 @@ struct FrameVisualInput<'a> {
     tensor: Option<Tensor<AutoGazeBevyBackend, 5>>,
 }
 
+struct DeviceMaskVisualInput<'a> {
+    tokens: Option<&'a AutoGazeDeviceTokens<AutoGazeBevyBackend>>,
+    mask: Option<AutoGazeDeviceMask<AutoGazeBevyBackend>>,
+    model_config: Option<&'a AutoGazeConfig>,
+}
+
+#[cfg(test)]
+impl<'a> DeviceMaskVisualInput<'a> {
+    const fn empty() -> Self {
+        Self {
+            tokens: None,
+            mask: None,
+            model_config: None,
+        }
+    }
+}
+
 #[cfg(test)]
 fn visualize_frame_rgba(
     input: FrameVisualInput<'_>,
@@ -2805,9 +2842,7 @@ fn visualize_frame_rgba(
     visualize_frame_rgba_with_device_tokens(
         input,
         points,
-        None,
-        None,
-        None,
+        DeviceMaskVisualInput::empty(),
         options,
         visualization_state,
         device,
@@ -2817,9 +2852,7 @@ fn visualize_frame_rgba(
 fn visualize_frame_rgba_with_device_tokens(
     input: FrameVisualInput<'_>,
     points: &[FixationPoint],
-    device_tokens: Option<&AutoGazeDeviceTokens<AutoGazeBevyBackend>>,
-    device_mask: Option<AutoGazeDeviceMask<AutoGazeBevyBackend>>,
-    model_config: Option<&AutoGazeConfig>,
+    device_input: DeviceMaskVisualInput<'_>,
     options: VisualizationOptions,
     visualization_state: &mut BevyVisualizationState,
     device: &AutoGazeBevyDevice,
@@ -2828,9 +2861,7 @@ fn visualize_frame_rgba_with_device_tokens(
         visualize_rgba_tensor(
             input,
             points,
-            device_tokens,
-            device_mask,
-            model_config,
+            device_input,
             options,
             visualization_state,
             device,
@@ -2972,9 +3003,7 @@ async fn tensor_psnr_db(
 fn visualize_rgba_tensor(
     input: FrameVisualInput<'_>,
     points: &[FixationPoint],
-    device_tokens: Option<&AutoGazeDeviceTokens<AutoGazeBevyBackend>>,
-    device_mask: Option<AutoGazeDeviceMask<AutoGazeBevyBackend>>,
-    model_config: Option<&AutoGazeConfig>,
+    device_input: DeviceMaskVisualInput<'_>,
     options: VisualizationOptions,
     visualization_state: &mut BevyVisualizationState,
     device: &AutoGazeBevyDevice,
@@ -3011,9 +3040,9 @@ fn visualize_rgba_tensor(
         options.sparse_update_max_ratio,
     )
     .with_full_frame_update_policy(options.full_frame_update_min_ratio);
-    let used_device_tokens = device_tokens.is_some() && model_config.is_some();
-    let used_device_mask = device_mask.is_some();
-    let tensor_panels = if let Some(device_mask) = device_mask {
+    let used_device_tokens = device_input.tokens.is_some() && device_input.model_config.is_some();
+    let used_device_mask = device_input.mask.is_some();
+    let tensor_panels = if let Some(device_mask) = device_input.mask {
         visualization_state
             .gpu
             .visualize_normalized_rgb_clip_device_mask_panels(
@@ -3022,7 +3051,9 @@ fn visualize_rgba_tensor(
                 tensor_options,
                 device,
             )
-    } else if let (Some(device_tokens), Some(model_config)) = (device_tokens, model_config) {
+    } else if let (Some(device_tokens), Some(model_config)) =
+        (device_input.tokens, device_input.model_config)
+    {
         visualization_state
             .gpu
             .visualize_normalized_rgb_clip_device_tokens_panels(
@@ -4060,22 +4091,24 @@ fn task_loss_slider_update_system(
     }
 }
 
-fn mask_source_toggle_system(
-    mut commands: Commands,
-    mut config: ResMut<BevyBurnAutoGazeConfig>,
-    mut model: ResMut<AutoGazeModelState>,
-    mut slider: ResMut<TaskLossSliderState>,
-    mut latest_mask: ResMut<LatestMaskPrediction>,
-    mut visualization_state: ResMut<BevyVisualizationState>,
-    mut streaming_state: ResMut<BevyStreamingGenerationState>,
-    mut sequencer: ResMut<InferenceSequencer>,
-    mut frame_queue: ResMut<FrameQueue>,
-    mut gaze_ratio_stats: ResMut<GazeRatioStats>,
-    mut psnr_stats: ResMut<PsnrStats>,
-    mut timing_stats: ResMut<InferenceTimingStats>,
-    active_tasks: Query<Entity, With<ProcessAutoGaze>>,
-    toggles: Query<&Interaction, (Changed<Interaction>, With<MaskSourceToggle>)>,
-) {
+fn mask_source_toggle_system(params: MaskSourceToggleParams<'_, '_>) {
+    let MaskSourceToggleParams {
+        mut commands,
+        mut config,
+        mut model,
+        mut slider,
+        mut latest_mask,
+        mut visualization_state,
+        mut streaming_state,
+        mut sequencer,
+        mut frame_queue,
+        mut gaze_ratio_stats,
+        mut psnr_stats,
+        mut timing_stats,
+        active_tasks,
+        toggles,
+    } = params;
+
     if !config.show_task_loss_slider {
         return;
     }
@@ -4089,19 +4122,19 @@ fn mask_source_toggle_system(
         return;
     }
 
-    apply_mask_source_toggle(
-        &mut config,
-        &mut model.config,
-        &mut slider,
-        &mut latest_mask,
-        &mut visualization_state,
-        &mut streaming_state,
-        &mut sequencer,
-        &mut frame_queue,
-        &mut gaze_ratio_stats,
-        &mut psnr_stats,
-        &mut timing_stats,
-    );
+    apply_mask_source_toggle(MaskSourceToggleState {
+        config: &mut config,
+        model_config: &mut model.config,
+        slider: &mut slider,
+        latest_mask: &mut latest_mask,
+        visualization_state: &mut visualization_state,
+        streaming_state: &mut streaming_state,
+        sequencer: &mut sequencer,
+        frame_queue: &mut frame_queue,
+        gaze_ratio_stats: &mut gaze_ratio_stats,
+        psnr_stats: &mut psnr_stats,
+        timing_stats: &mut timing_stats,
+    });
     for entity in &active_tasks {
         commands.entity(entity).despawn();
     }
@@ -4110,25 +4143,41 @@ fn mask_source_toggle_system(
     }
 }
 
-fn apply_mask_source_toggle(
-    config: &mut BevyBurnAutoGazeConfig,
-    model_config: &mut BevyBurnAutoGazeConfig,
-    slider: &mut TaskLossSliderState,
-    latest_mask: &mut LatestMaskPrediction,
-    visualization_state: &mut BevyVisualizationState,
-    streaming_state: &mut BevyStreamingGenerationState,
-    sequencer: &mut InferenceSequencer,
-    frame_queue: &mut FrameQueue,
-    gaze_ratio_stats: &mut GazeRatioStats,
-    psnr_stats: &mut PsnrStats,
-    timing_stats: &mut InferenceTimingStats,
-) {
+struct MaskSourceToggleState<'a> {
+    config: &'a mut BevyBurnAutoGazeConfig,
+    model_config: &'a mut BevyBurnAutoGazeConfig,
+    slider: &'a mut TaskLossSliderState,
+    latest_mask: &'a mut LatestMaskPrediction,
+    visualization_state: &'a mut BevyVisualizationState,
+    streaming_state: &'a mut BevyStreamingGenerationState,
+    sequencer: &'a mut InferenceSequencer,
+    frame_queue: &'a mut FrameQueue,
+    gaze_ratio_stats: &'a mut GazeRatioStats,
+    psnr_stats: &'a mut PsnrStats,
+    timing_stats: &'a mut InferenceTimingStats,
+}
+
+fn apply_mask_source_toggle(state: MaskSourceToggleState<'_>) {
+    let MaskSourceToggleState {
+        config,
+        model_config,
+        slider,
+        latest_mask,
+        visualization_state,
+        streaming_state,
+        sequencer,
+        frame_queue,
+        gaze_ratio_stats,
+        psnr_stats,
+        timing_stats,
+    } = state;
+
     config.sparse_mask_source = match config.sparse_mask_source {
         BevySparseMaskSource::AutoGaze => BevySparseMaskSource::PatchDiff,
         BevySparseMaskSource::PatchDiff => BevySparseMaskSource::AutoGaze,
     };
     model_config.sparse_mask_source = config.sparse_mask_source;
-    let quality = quality_slider_config_value(&config);
+    let quality = quality_slider_config_value(config);
     slider.value = quantize_task_loss_slider_value(quality);
     slider.pending_value = (config.sparse_mask_source == BevySparseMaskSource::AutoGaze)
         .then_some(quality_slider_threshold(slider.value));
@@ -6470,19 +6519,19 @@ mod tests {
             ..Default::default()
         };
 
-        apply_mask_source_toggle(
-            &mut config,
-            &mut model_config,
-            &mut slider,
-            &mut latest_mask,
-            &mut visualization_state,
-            &mut streaming_state,
-            &mut sequencer,
-            &mut frame_queue,
-            &mut gaze_ratio_stats,
-            &mut psnr_stats,
-            &mut timing_stats,
-        );
+        apply_mask_source_toggle(MaskSourceToggleState {
+            config: &mut config,
+            model_config: &mut model_config,
+            slider: &mut slider,
+            latest_mask: &mut latest_mask,
+            visualization_state: &mut visualization_state,
+            streaming_state: &mut streaming_state,
+            sequencer: &mut sequencer,
+            frame_queue: &mut frame_queue,
+            gaze_ratio_stats: &mut gaze_ratio_stats,
+            psnr_stats: &mut psnr_stats,
+            timing_stats: &mut timing_stats,
+        });
 
         assert_eq!(config.sparse_mask_source, BevySparseMaskSource::PatchDiff);
         assert_eq!(
